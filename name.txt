@@ -1,0 +1,130 @@
+# Signup display names — rotated by the farm (Given Family).
+# Format: First Last   OR   First|Last (for multi-word given/family)
+# Lines starting with # are ignored.
+# Source: pejabat aktif RI (Kabinet Merah Putih & tokoh publik) ~2024–2026.
+
+# Presiden & Wakil
+Prabowo|Subianto
+Gibran|Rakabuming
+
+# Menko
+Djamari|Chaniago
+Yusril|Ihza Mahendra
+Airlangga|Hartarto
+Pratikno|Pratikno
+Hanif|Faisal Nurrofiq
+
+# Menteri / pejabat kabinet (aktif / dikenal luas)
+Sjafrie|Sjamsoeddin
+Budi|Gunawan
+Sugiono|Sugiono
+Agus|Harimurti Yudhoyono
+Bahlil|Lahadalia
+Erick|Thohir
+Purbaya|Yudhi Sadewa
+Sri|Mulyani
+Tito|Karnavian
+Budi|Arie Setiadi
+Meutya|Hafid
+Nasaruddin|Umar
+Abdul|Mu'ti
+Budi|Santoso
+Sakti|Wahyu Trenggono
+Andreas|Hugo Pareira
+Wihaji|Wihaji
+Muhaimin|Iskandar
+Yandri|Susanto
+Raja|Juli Antoni
+Zulkifli|Hasan
+Abdul|Kadir Karding
+Rudy|Salahuddin
+Nusron|Wahid
+Dody|Hanggodo
+Teuku|Riefky Harsya
+Rachmat|Pambudy
+Amran|Sulaiman
+Yuliot|Tanjung
+Donny|Ermawan
+Agus|Gumiwang Kartasasmita
+Budi|Gunadi Sadikin
+Prasetyo|Hadi
+Hasan|Nasbi
+Dudung|Abdurachman
+Jumhur|Hidayat
+Mukhtarudin|Mukhtarudin
+Ferry|Joko Yuliantono
+Mochamad|Irfan Yusuf
+Dahnil|Anzar Simanjuntak
+Brian|Yuliarto
+Fadli|Zon
+Angga|Raka Prabowo
+Muhammad|Qodari
+Sanitiar|Burhanuddin
+Muhammad|Herindra
+
+# DPR / ketua lembaga (dikenal)
+Puan|Maharani
+Sufmi|Dasco Ahmad
+Lodewijk|Freidrich Paulus
+Kahfi|Prihantoro
+Ahmad|Muzani
+Bambang|Soesatyo
+Surya|Paloh
+Sohibul|Iman
+Prananda|Prabowo
+Bobby|Nasution
+Kaesang|Pangarep
+Ridwan|Kamil
+Anies|Baswedan
+Ganjar|Pranowo
+Sandiaga|Uno
+Ahok|Basuki Tjahaja
+Tri|Rismaharini
+Khoffifah|Indar Parawansa
+Khofifah|Indar Parawansa
+Mahfud|MD
+Wiranto|Wiranto
+Luhut|Binsar Pandjaitan
+Jusuf|Kalla
+Megawati|Soekarnoputri
+Susilo|Bambang Yudhoyono
+Joko|Widodo
+Ma'ruf|Amin
+
+# Gubernur / bupati / wali kota dikenal
+Heru|Budi Hartono
+Teguh|Setyabudi
+Andra|Soni
+Ahmad|Luthfi
+Ahmad|Muhdlor
+Ipuk|Fiestiandani
+Bima|Arya
+Muhamad|Iriawan
+Deddy|Mizwar
+Olly|Dondokambey
+Isran|Noor
+Andi|Sudirman Sulaiman
+Nurdin|Abdullah
+Suharso|Monoarfa
+Airin|Rachmi Diany
+Ade|Yasin
+Bima|Arya Sugiarto
+Hendi|Rusdiana
+Yoyok|Riyo Sudibyo
+Saan|Mustopa
+Dedi|Mulyadi
+
+
+# Tokoh politik / pejabat terkait
+Gibran|Rakabuming Raka
+Siti|Nurbaya
+Retno|Marsudi
+Listyo|Sigit Prabowo
+Agus|Andrianto
+Muhammad|Syahrial
+Moeldoko|Moeldoko
+Andika|Perkasa
+Yudo|Margono
+Agus|Subiyanto
+Hadi|Tjahjanto
+Prabowo|Oni

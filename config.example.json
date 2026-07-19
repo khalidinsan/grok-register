@@ -2,13 +2,40 @@
     "run": {
         "count": 10
     },
-    "duckmail_api_base": "https://api.duckmail.sbs",
-    "duckmail_bearer": "<your_duckmail_bearer_token>",
+    "pool": {
+        "count": 10,
+        "concurrent": 2,
+        "stagger_sec": 20,
+        "display": "offscreen",
+        "proxies": []
+    },
+    "email": {
+        "domain": "yourdomain.com",
+        "imap_user": "you@gmail.com",
+        "imap_pass": "abcd efgh ijkl mnop",
+        "imap_host": "imap.gmail.com",
+        "imap_port": 993
+    },
     "proxy": "",
     "browser_proxy": "",
-    "api": {
-        "endpoint": "",
-        "token": "",
-        "append": true
+    "grok_cli": {
+        "enabled": true,
+        "base_url": "https://ai.khalid.id",
+        "password": "your-9router-dashboard-password",
+        "data_dir": "~/.9router",
+        "cli_token": ""
+    },
+    "grok2api": {
+        "enabled": false,
+        "base_url": "http://127.0.0.1:8000",
+        "username": "admin",
+        "password": "your-admin-password",
+        "tier": "auto"
+    },
+    "ninerouter": {
+        "enabled": false,
+        "base_url": "http://127.0.0.1:20127",
+        "provider": "grok-web",
+        "data_dir": "~/.9router"
     }
 }

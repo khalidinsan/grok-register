@@ -7,3 +7,7 @@ config.json
 node_modules/
 .idea/
 CLAUDE.md
+.venv/
+
+name_rr.index
+name.txt.bak
