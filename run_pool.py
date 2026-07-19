@@ -163,6 +163,16 @@ def spawn_worker_process(
         kwargs["stderr"] = subprocess.STDOUT
         kwargs["text"] = True
         kwargs["bufsize"] = 1
+        # Windows default pipe encoding is often cp1252; farm logs use Unicode (→ ✓ …)
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
+
+    # Always force UTF-8 I/O in workers (TUI pipes stdout; Windows charmap breaks prints)
+    env = dict(env)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    kwargs["env"] = env
 
     if sys.platform == "win32":
         # Kill tree via taskkill /T later

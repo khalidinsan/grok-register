@@ -12,6 +12,18 @@ import platform
 import secrets
 import sys
 
+# Windows: console/pipe often cp1252 — Unicode in print()/slog (→ ✓ …) must not crash farm
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from email_register import get_email_and_token, get_oai_code
 
 # Set by main() / run_pool.py
@@ -2298,7 +2310,7 @@ def push_sso_to_9router(accounts: list) -> None:
             )
             if resp.status_code in (200, 201):
                 conn_id = (resp.json() or {}).get("connection", {}).get("id", "")
-                print(f"[*] 9router imported → {provider} name={name} id={conn_id}")
+                print(f"[*] 9router imported -> {provider} name={name} id={conn_id}")
                 existing_names.add(name)
                 ok += 1
             else:
@@ -2616,7 +2628,7 @@ def convert_and_push_grok_cli(result: dict) -> None:
     family = str(result.get("family_name") or "").strip()
     display = f"{given} {family}".strip()
 
-    print(f"[*] Converting Web SSO → Build OAuth (email={email or '-'}) ...")
+    slog("CONVERT", f"Web SSO -> Build OAuth (email={email or '-'})")
     tokens = convert_sso_to_build(result, name_hint=email)
     push_build_tokens_to_9router(
         tokens,
@@ -2633,7 +2645,7 @@ def convert_and_push_grok_cli(result: dict) -> None:
     result["build_refresh_token"] = tokens.refresh_token
     result["build_email"] = tokens.email
     result["build_user_id"] = tokens.user_id
-    print(f"[*] grok-cli ready: email={tokens.email or email} user_id={tokens.user_id or '-'}")
+    slog("CONVERT", f"grok-cli ready email={tokens.email or email} user_id={tokens.user_id or '-'}")
 
 
 def load_run_count() -> int:
