@@ -274,23 +274,46 @@ Config `pool` in `config.json`:
 }
 ```
 
-### Display modes
+### Display modes (flash-aligned)
 
-| Mode | Focus steal | Turnstile | When to use |
-|------|-------------|-----------|-------------|
-| **`offscreen`** | Rare (window parked off-screen + macOS hide by PID) | Usually OK | **Working on Mac while farming** |
-| **`headless`** | None | Fails more often | Quiet run; switch to offscreen if stuck |
-| **`headed`** | Often steals focus on macOS | Most stable | Debug captcha / UI |
+Defaults (same idea as flash-grok-farm):
 
-CLI / env:
+| Platform | Default | Engine default |
+|----------|---------|----------------|
+| **Linux / VPS** | **`headless`** | **Camoufox** |
+| **Windows** | **`headless`** | **Camoufox** |
+| **macOS** | **`offscreen`** | **Camoufox** |
+
+| Mode | Window | Turnstile | When to use |
+|------|--------|-----------|-------------|
+| **`headless`** | None (Camoufox `headless=True`) | Usually OK with Camoufox + good proxy | **Linux/VPS farm (flash default)** |
+| **`virtual`** | Headed on **Xvfb** (Camoufox `headless='virtual'`) | Better if pure headless fails CF | Linux without GUI; needs `xvfb` |
+| **`offscreen`** | Parked off-screen + hide | Usually OK | **Mac while working** |
+| **`headed`** | Visible | Most reliable for debug | Turnstile / CF debug |
+
+CLI / env (flash-compatible):
 
 ```bash
---display offscreen|headless|headed
---offscreen
---headless
+# shortcuts
+--headless | --virtual | --offscreen | --headed
+--display headless|virtual|offscreen|headed
 
-# env (also set by run_pool)
-export GROK_DISPLAY=offscreen
+# env (same flags as flash-grok-farm)
+export GROK_HEADLESS=true          # → headless
+export GROK_HEADLESS=false         # → headed
+export GROK_DISPLAY=virtual        # Camoufox + Xvfb
+export GROK_BROWSER_ENGINE=camoufox
+
+# Linux VPS helper (auto xvfb-run when needed)
+./run_linux.sh farm_tui.py -u -c 2
+./run_linux.sh --virtual farm_tui.py -u -c 1
+GROK_HEADLESS=true ./run_linux.sh run_pool.py -n 10 -c 2
+```
+
+Mac daily farm (unchanged ergonomics):
+
+```bash
+python farm_tui.py -u -c 2 --offscreen   # or omit flags → offscreen on darwin
 ```
 
 ---

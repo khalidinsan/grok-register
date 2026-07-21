@@ -6,7 +6,7 @@
         "count": 10,
         "concurrent": 2,
         "stagger_sec": 20,
-        "display": "offscreen",
+        "display": "headless",
         "proxy_mode": "per_account",
         "proxy_file": "proxy.txt",
         "proxies": [],
@@ -27,7 +27,7 @@
     "proxy": "",
     "browser_proxy": "",
     "browser": {
-        "engine": "chromium"
+        "engine": "camoufox"
     },
     "grok_cli": {
         "enabled": true,

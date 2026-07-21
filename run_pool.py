@@ -51,7 +51,12 @@ def load_pool_config() -> dict:
         "proxy_max_ms": 4000,
         "proxy_check_timeout": 12,
         "proxy_check_workers": 10,
-        "display": "offscreen" if sys.platform == "darwin" else "headed",
+        # flash-aligned: Mac offscreen · Linux/Win headless
+        "display": (
+            "offscreen"
+            if sys.platform == "darwin"
+            else "headless"
+        ),
     }
     if not CONFIG_PATH.is_file():
         return defaults
@@ -120,10 +125,17 @@ def load_pool_config() -> dict:
             or conf.get("display")
         )
         if isinstance(display, str) and display.strip():
-            d = display.strip().lower()
-            if d in ("bg", "background", "minimized", "minimise", "minimize"):
-                d = "offscreen"
-            if d in ("headed", "offscreen", "headless"):
+            try:
+                from browser_engine import normalize_display, DISPLAY_MODES
+
+                d = normalize_display(display) or display.strip().lower()
+            except Exception:
+                d = display.strip().lower()
+                if d in ("bg", "background", "minimized", "minimise", "minimize"):
+                    d = "offscreen"
+                if d in ("xvfb", "vd"):
+                    d = "virtual"
+            if d in ("headed", "offscreen", "headless", "virtual"):
                 out["display"] = d
         return out
     except Exception as e:
@@ -423,12 +435,26 @@ def main() -> int:
     )
     parser.add_argument(
         "--display",
-        choices=["headed", "offscreen", "headless"],
-        default=cfg.get("display") or ("offscreen" if platform_is_mac() else "headed"),
-        help="headed | offscreen | headless",
+        choices=["headed", "offscreen", "headless", "virtual"],
+        default=None,
+        help=(
+            "headed | offscreen (Mac) | headless (Linux/VPS flash default) | "
+            "virtual (Camoufox Xvfb). Default: config → env → platform "
+            "(Mac=offscreen, Linux/Win=headless)"
+        ),
     )
     parser.add_argument("--headless", action="store_true", help="shortcut → headless")
     parser.add_argument("--offscreen", action="store_true", help="shortcut → offscreen")
+    parser.add_argument(
+        "--virtual",
+        action="store_true",
+        help="shortcut → virtual (Camoufox headed on Xvfb; Linux)",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="shortcut → headed (visible window; debug Turnstile)",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -468,9 +494,50 @@ def main() -> int:
             "try 2–3 first."
         )
 
-    display = "headless" if args.headless else ("offscreen" if args.offscreen else args.display)
-    if display in ("bg", "background"):
+    # Priority: CLI shortcuts > --display > config.pool.display > env > platform
+    # (same order as flash GROK_HEADLESS / --headed)
+    if getattr(args, "headed", False):
+        display = "headed"
+    elif getattr(args, "virtual", False):
+        display = "virtual"
+    elif args.headless:
+        display = "headless"
+    elif args.offscreen:
         display = "offscreen"
+    elif args.display:
+        display = args.display
+    elif cfg.get("display"):
+        display = str(cfg["display"])
+    else:
+        display = ""
+    try:
+        from browser_engine import resolve_display, normalize_display
+
+        forced = (
+            getattr(args, "headed", False)
+            or getattr(args, "virtual", False)
+            or args.headless
+            or args.offscreen
+            or bool(args.display)
+        )
+        if forced:
+            display = normalize_display(display) or display
+        else:
+            # empty explicit → GROK_DISPLAY / GROK_HEADLESS / platform
+            if display:
+                os.environ.setdefault("GROK_DISPLAY", normalize_display(display) or display)
+            display = resolve_display(display)
+    except Exception:
+        if not display or display in ("bg", "background"):
+            display = "offscreen" if platform_is_mac() else "headless"
+    os.environ["GROK_DISPLAY"] = display
+    # flash-compatible mirror
+    if display == "headless":
+        os.environ["GROK_HEADLESS"] = "true"
+    elif display == "virtual":
+        os.environ["GROK_HEADLESS"] = "virtual"
+    else:
+        os.environ["GROK_HEADLESS"] = "false"
 
     from proxy_util import encode_proxy_env, load_proxy_list, normalize_proxy
 
@@ -559,7 +626,15 @@ def main() -> int:
     if display == "headed" and platform_is_mac():
         print("  [!] headed on Mac steals focus — prefer --offscreen while working")
     if display == "headless":
-        print("  [!] headless: Turnstile may fail more; try --offscreen if stuck")
+        print(
+            "  [display] headless (flash Linux/VPS mode) — Camoufox preferred; "
+            "if Turnstile stuck: --virtual (Xvfb) or --headed / --offscreen"
+        )
+    if display == "virtual":
+        print(
+            "  [display] virtual = Camoufox headed on Xvfb "
+            "(needs xvfb + pyvirtualdisplay, or: xvfb-run -a …)"
+        )
     if not proxies and n_workers > 1:
         print(
             "  [!] no proxies — all workers share your home IP. "

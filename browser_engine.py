@@ -9,7 +9,13 @@ Both use native proxy auth (server + username + password) like flash-grok-farm.
 Env / config:
   GROK_BROWSER_ENGINE=chromium|camoufox
   GROK_BROWSER_PROXY=http://user:pass@host:port
-  GROK_DISPLAY=headed|offscreen|headless
+  GROK_DISPLAY=headed|offscreen|headless|virtual
+  GROK_HEADLESS=true|false   (flash-compatible; true → headless)
+
+Display defaults (flash-aligned):
+  macOS   → offscreen   (work-friendly; park window, no focus steal)
+  Linux   → headless    (VPS / server farm — flash default)
+  Windows → headless    (flash default; use --headed to debug)
 """
 
 from __future__ import annotations
@@ -18,12 +24,16 @@ import asyncio
 import os
 import re
 import socket
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from proxy_util import mask_proxy, playwright_proxy_dict
+
+# All accepted display tokens after normalization
+DISPLAY_MODES = ("headed", "offscreen", "headless", "virtual")
 
 
 class _ActionsProxy:
@@ -48,11 +58,113 @@ def resolve_engine(explicit: str = "") -> str:
         explicit
         or os.environ.get("GROK_BROWSER_ENGINE")
         or os.environ.get("BROWSER_ENGINE")
-        or "chromium"
+        or "camoufox"  # flash default: Camoufox (anti-detect + headless-friendly)
     ).strip().lower()
     if v in ("camoufox", "fox", "firefox", "cf"):
         return "camoufox"
-    return "chromium"
+    if v in ("chromium", "chrome", "pw", "playwright"):
+        return "chromium"
+    return "camoufox"
+
+
+def platform_default_display() -> str:
+    """
+    Flash-aligned platform defaults:
+      macOS   → offscreen  (desktop ergonomics while farming)
+      Linux   → headless   (VPS / no GUI — flash production)
+      Windows → headless   (flash production)
+    """
+    sysname = (sys.platform or "").lower()
+    if sysname == "darwin":
+        return "offscreen"
+    # linux, win32, cygwin, …
+    return "headless"
+
+
+def _truthy_headless(raw: str) -> Optional[bool]:
+    """Parse GROK_HEADLESS-style flags. None = unset / unknown."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    if s in ("1", "true", "yes", "on", "headless"):
+        return True
+    if s in ("0", "false", "no", "off", "headed"):
+        return False
+    if s in ("virtual", "xvfb", "vd"):
+        return None  # handled as display=virtual separately
+    return None
+
+
+def normalize_display(raw: str) -> str:
+    """Map aliases → headed|offscreen|headless|virtual."""
+    d = (raw or "").strip().lower()
+    if d in ("bg", "background", "minimized", "minimise", "minimize", "hidden"):
+        return "offscreen"
+    if d in ("hl", "no-window", "nowindow", "server"):
+        return "headless"
+    if d in ("xvfb", "vd", "virtual-display", "virtual_display", "vdisplay"):
+        return "virtual"
+    if d in ("gui", "window", "visible", "show"):
+        return "headed"
+    if d in DISPLAY_MODES:
+        return d
+    return ""
+
+
+def resolve_display(explicit: str = "") -> str:
+    """
+    Resolve display mode with flash-compatible precedence:
+
+      1. explicit arg / CLI
+      2. GROK_DISPLAY / DISPLAY_MODE env
+      3. GROK_HEADLESS env (true→headless, false→headed, virtual token→virtual)
+      4. platform default (Linux/Win headless, Mac offscreen)
+
+    Returns one of: headed | offscreen | headless | virtual
+    """
+    # 1) explicit
+    if explicit:
+        n = normalize_display(explicit)
+        if n:
+            return n
+
+    # 2) GROK_DISPLAY / DISPLAY_MODE
+    for key in ("GROK_DISPLAY", "DISPLAY_MODE"):
+        env_d = os.environ.get(key) or ""
+        n = normalize_display(env_d)
+        if n:
+            return n
+
+    # 3) GROK_HEADLESS (flash .env flag)
+    gh = (os.environ.get("GROK_HEADLESS") or "").strip().lower()
+    if gh in ("virtual", "xvfb", "vd"):
+        return "virtual"
+    th = _truthy_headless(gh)
+    if th is True:
+        return "headless"
+    if th is False:
+        # flash: GROK_HEADLESS=false → headed (not offscreen)
+        return "headed"
+
+    # 4) platform default
+    return platform_default_display()
+
+
+def camoufox_headless_arg(display: str) -> Union[bool, str]:
+    """
+    Map our display mode → Camoufox `headless=` kwarg.
+
+      headless  → True          (native Firefox headless — flash default)
+      virtual   → 'virtual'     (Camoufox starts Xvfb, browser headed on it)
+      offscreen → False         (headed; caller parks window if possible)
+      headed    → False
+    """
+    d = normalize_display(display) or "headless"
+    if d == "headless":
+        return True
+    if d == "virtual":
+        return "virtual"
+    return False
 
 
 @dataclass
@@ -130,7 +242,7 @@ def _wait_port(port: int, timeout: float = 15.0) -> bool:
 def launch_chromium_session(
     *,
     proxy: str = "",
-    display: str = "offscreen",
+    display: str = "",
     profile_dir: str = "",
     debug_port: int = 0,
     browser_path: str = "",
@@ -138,9 +250,11 @@ def launch_chromium_session(
 ) -> BrowserSession:
     from playwright.sync_api import sync_playwright
 
-    display = (display or "offscreen").lower()
-    headless = display == "headless"
+    display = resolve_display(display)
+    # Chromium has no Camoufox-style 'virtual'; map to real headless (or need Xvfb outside)
+    headless = display in ("headless", "virtual")
     if extension_path and os.path.isdir(extension_path) and headless:
+        # MV2/MV3 extensions generally need non-headless Chromium
         headless = False
 
     if not profile_dir:
@@ -491,11 +605,18 @@ class PwBrowserAdapter:
 def launch_camoufox_session(
     *,
     proxy: str = "",
-    display: str = "offscreen",
-    humanize: float = 0.08,
+    display: str = "",
+    humanize: Optional[float] = None,
 ) -> BrowserSession:
     """
     Camoufox (async) wrapped with a dedicated event loop for sync farm code.
+
+    Flash-aligned headless mapping:
+      display=headless  → headless=True          (Linux VPS default)
+      display=virtual   → headless='virtual'     (Camoufox Xvfb — headed on virtual X)
+      display=offscreen → headless=False         (headed; Mac park window)
+      display=headed    → headless=False
+
     Returns BrowserSession whose .page / extra['browser_adapter'] speak Drission-like API.
     """
     try:
@@ -505,15 +626,39 @@ def launch_camoufox_session(
             "camoufox not installed. Run: pip install 'camoufox[geoip]' && python -m camoufox fetch"
         ) from e
 
+    display = resolve_display(display)
+    headless = camoufox_headless_arg(display)
     proxy_cfg = playwright_proxy_dict(proxy) if proxy else None
-    # offscreen → still headed fox (better CF); only true headless when asked
-    headless = (display or "").lower() == "headless"
+
+    # humanize: env GROK_HUMANIZE wins; flash turbo uses ~0.05
+    if humanize is None:
+        try:
+            humanize = float(os.environ.get("GROK_HUMANIZE") or "0.08")
+        except (TypeError, ValueError):
+            humanize = 0.08
+
+    # geoip: flash turbo defaults off; we enable when proxy present unless forced
+    geoip_env = (os.environ.get("GROK_GEOIP") or "").strip().lower()
+    if geoip_env in ("1", "true", "yes", "on"):
+        use_geoip = True
+    elif geoip_env in ("0", "false", "no", "off"):
+        use_geoip = False
+    else:
+        use_geoip = bool(proxy_cfg)
+
+    # OS fingerprint pool like flash (random windows/macos/linux)
+    fox_os = (os.environ.get("GROK_CAMOUFOX_OS") or "").strip().lower()
+    if fox_os not in ("windows", "macos", "linux"):
+        import random
+
+        fox_os = random.choice(["windows", "macos", "linux"])
 
     kwargs: dict[str, Any] = {
         "headless": headless,
         "humanize": max(0.0, float(humanize)),
+        "os": fox_os,
         "locale": "en-US",
-        "geoip": bool(proxy_cfg),
+        "geoip": use_geoip,
         "block_webrtc": True,
     }
     if proxy_cfg:
@@ -529,7 +674,19 @@ def launch_camoufox_session(
         page.set_default_timeout(60000)
         return manager, browser, page
 
-    manager, browser, page = loop.run_until_complete(_start())
+    try:
+        manager, browser, page = loop.run_until_complete(_start())
+    except Exception as e:
+        # virtual needs Xvfb / pyvirtualdisplay — give a clear hint
+        if display == "virtual" or headless == "virtual":
+            raise RuntimeError(
+                f"Camoufox virtual display failed: {e}\n"
+                "  Linux: apt install xvfb && pip install pyvirtualdisplay\n"
+                "  or use: GROK_DISPLAY=headless / --headless (no Xvfb)\n"
+                "  or:     xvfb-run -a python farm_tui.py -u -c 2"
+            ) from e
+        raise
+
     session = BrowserSession(
         engine="camoufox",
         page=None,  # set after adapter
@@ -537,7 +694,13 @@ def launch_camoufox_session(
         display=display,
         _camoufox_manager=manager,
         _loop=loop,
-        extra={"browser": browser, "proxy_cfg": proxy_cfg, "mask": mask_proxy(proxy) if proxy else ""},
+        extra={
+            "browser": browser,
+            "proxy_cfg": proxy_cfg,
+            "mask": mask_proxy(proxy) if proxy else "",
+            "headless": headless,
+            "camoufox_os": fox_os,
+        },
     )
     adapter = PwBrowserAdapter(
         browser, page, loop=loop, is_async=True, session=session
@@ -552,12 +715,12 @@ def launch_session(
     engine: str = "",
     *,
     proxy: str = "",
-    display: str = "offscreen",
+    display: str = "",
     **kwargs: Any,
 ) -> BrowserSession:
     eng = resolve_engine(engine)
     proxy = (proxy or os.environ.get("GROK_BROWSER_PROXY") or "").strip()
-    display = (display or os.environ.get("GROK_DISPLAY") or "offscreen").strip().lower()
+    display = resolve_display(display)
     if eng == "camoufox":
         return launch_camoufox_session(proxy=proxy, display=display)
     return launch_chromium_session(proxy=proxy, display=display, **kwargs)

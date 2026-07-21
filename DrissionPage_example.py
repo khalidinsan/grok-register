@@ -442,19 +442,29 @@ page = None
 _pw = None  # Playwright instance
 _pw_context = None  # BrowserContext (persistent) or Browser
 
-# Display mode for Mac multitasking (env / CLI / config):
-#   headed    — normal windows (steals focus on macOS)
-#   offscreen — headed but parked off-screen + defocus (best balance on Mac)
-#   headless  — no window; Turnstile may fail more often
-DISPLAY_MODE = (
-    os.environ.get("GROK_DISPLAY")
-    or os.environ.get("DISPLAY_MODE")
-    or "headed"
-).strip().lower()
-if DISPLAY_MODE in ("bg", "background", "minimized", "minimise", "minimize"):
-    DISPLAY_MODE = "offscreen"
-if DISPLAY_MODE not in ("headed", "offscreen", "headless"):
-    DISPLAY_MODE = "headed"
+# Display mode (flash-aligned):
+#   headed    — normal windows (debug Turnstile / CF)
+#   offscreen — headed + park window (best on Mac while working)
+#   headless  — Camoufox/Chromium true headless (Linux/VPS flash default)
+#   virtual   — Camoufox headed on Xvfb (no pure-headless fingerprint)
+try:
+    from browser_engine import resolve_display
+
+    DISPLAY_MODE = resolve_display(
+        os.environ.get("GROK_DISPLAY") or os.environ.get("DISPLAY_MODE") or ""
+    )
+except Exception:
+    DISPLAY_MODE = (
+        os.environ.get("GROK_DISPLAY")
+        or os.environ.get("DISPLAY_MODE")
+        or ("offscreen" if sys.platform == "darwin" else "headless")
+    ).strip().lower()
+    if DISPLAY_MODE in ("bg", "background", "minimized", "minimise", "minimize"):
+        DISPLAY_MODE = "offscreen"
+    if DISPLAY_MODE in ("xvfb", "vd"):
+        DISPLAY_MODE = "virtual"
+    if DISPLAY_MODE not in ("headed", "offscreen", "headless", "virtual"):
+        DISPLAY_MODE = "offscreen" if sys.platform == "darwin" else "headless"
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
@@ -611,8 +621,9 @@ def build_chromium_options(profile_dir: str, debug_port: int) -> ChromiumOptions
     opts.set_argument("--disable-popup-blocking")
     opts.set_timeouts(base=1)
 
-    mode = (DISPLAY_MODE or "headed").lower()
-    if mode == "headless":
+    mode = (DISPLAY_MODE or "headless").lower()
+    # virtual → treat Chromium as real headless (Xvfb must be outside if needed)
+    if mode in ("headless", "virtual"):
         opts.headless(True)
         opts.set_argument("--window-size", "1280,900")
     elif mode == "offscreen":
@@ -701,8 +712,8 @@ def start_browser_playwright_proxy(profile_dir: str, debug_port: int) -> bool:
         slog("PROXY", "no chromium binary for playwright launch", level="warn")
         return False
 
-    mode = (DISPLAY_MODE or "headed").lower()
-    headless = mode == "headless"
+    mode = (DISPLAY_MODE or "headless").lower()
+    headless = mode in ("headless", "virtual")
     # Extensions need non-headless on most Chromium builds
     if os.path.isdir(EXTENSION_PATH) and headless:
         slog(
@@ -727,7 +738,7 @@ def start_browser_playwright_proxy(profile_dir: str, debug_port: int) -> bool:
                 "--window-position=-32000,-32000",
             ]
         )
-    elif mode == "headless":
+    elif mode in ("headless", "virtual"):
         args.append("--window-size=1280,900")
     else:
         args.append("--window-size=1100,800")
@@ -864,19 +875,27 @@ def _apply_window_policy(quiet: bool = True):
 
 
 def _resolve_browser_engine() -> str:
-    """chromium (default) | camoufox — from env or config.json browser.engine."""
-    env = (os.environ.get("GROK_BROWSER_ENGINE") or "").strip().lower()
-    if env in ("camoufox", "fox", "firefox", "cf", "chromium", "chrome", "pw"):
-        return "camoufox" if env in ("camoufox", "fox", "firefox", "cf") else "chromium"
+    """camoufox (flash default) | chromium — env → config → camoufox."""
+    env = (os.environ.get("GROK_BROWSER_ENGINE") or os.environ.get("BROWSER_ENGINE") or "").strip().lower()
+    cfg_engine = ""
     try:
         conf = _load_config()
         b = conf.get("browser") if isinstance(conf.get("browser"), dict) else {}
-        v = str(b.get("engine") or "").strip().lower()
-        if v in ("camoufox", "fox", "firefox", "cf"):
-            return "camoufox"
+        cfg_engine = str(b.get("engine") or "").strip().lower()
     except Exception:
         pass
-    return "chromium"
+    try:
+        from browser_engine import resolve_engine
+
+        return resolve_engine(env or cfg_engine)
+    except Exception:
+        pass
+    for v in (env, cfg_engine):
+        if v in ("camoufox", "fox", "firefox", "cf"):
+            return "camoufox"
+        if v in ("chromium", "chrome", "pw", "playwright"):
+            return "chromium"
+    return "camoufox"  # flash default
 
 
 def start_browser():
@@ -892,10 +911,17 @@ def start_browser():
         try:
             from browser_engine import launch_camoufox_session
 
+            hl = "?"
+            try:
+                from browser_engine import camoufox_headless_arg
+
+                hl = camoufox_headless_arg(DISPLAY_MODE)
+            except Exception:
+                pass
             slog(
                 "BROWSER",
                 f"engine=camoufox  proxy={_browser_proxy and 'yes' or 'direct'}  "
-                f"display={DISPLAY_MODE}",
+                f"display={DISPLAY_MODE}  headless={hl!r}",
             )
             sess = launch_camoufox_session(
                 proxy=_browser_proxy or "",
@@ -910,7 +936,9 @@ def start_browser():
             _chrome_debug_port = 0
             slog(
                 "BROWSER",
-                "camoufox ready (Playwright API + Drission-compatible adapter)",
+                f"camoufox ready  display={DISPLAY_MODE}  "
+                f"headless={sess.extra.get('headless')!r}  "
+                f"os={sess.extra.get('camoufox_os') or '?'}",
             )
             return
         except Exception as e:
@@ -3613,19 +3641,32 @@ def main():
     parser.add_argument("--worker-id", default="", help="Worker id (pool); also set via GROK_WORKER_ID")
     parser.add_argument(
         "--display",
-        choices=["headed", "offscreen", "headless"],
+        choices=["headed", "offscreen", "headless", "virtual"],
         default=None,
-        help="headed=normal windows | offscreen=hidden off-screen (Mac work-friendly) | headless=no window",
+        help=(
+            "headed=window | offscreen=Mac park | headless=Linux/VPS flash | "
+            "virtual=Camoufox+Xvfb"
+        ),
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="shortcut for --display headless",
+        help="shortcut for --display headless (flash Linux default)",
     )
     parser.add_argument(
         "--offscreen",
         action="store_true",
         help="shortcut for --display offscreen (recommended on Mac while working)",
+    )
+    parser.add_argument(
+        "--virtual",
+        action="store_true",
+        help="shortcut for --display virtual (Camoufox headed on Xvfb)",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="shortcut for --display headed (visible window; debug)",
     )
     parser.add_argument("--extract-numbers", action="store_true", help="Also extract visible numbers after signup")
     args = parser.parse_args()
@@ -3636,22 +3677,51 @@ def main():
         WORKER_ID = str(args.worker_id).strip()
         os.environ["GROK_WORKER_ID"] = WORKER_ID
 
-    # Priority: CLI flags > env GROK_DISPLAY > config > default headed
-    if args.headless:
+    # Priority: CLI shortcuts > --display > env GROK_DISPLAY/GROK_HEADLESS > config > platform
+    if getattr(args, "headed", False):
+        DISPLAY_MODE = "headed"
+    elif getattr(args, "virtual", False):
+        DISPLAY_MODE = "virtual"
+    elif args.headless:
         DISPLAY_MODE = "headless"
     elif args.offscreen:
         DISPLAY_MODE = "offscreen"
     elif args.display:
         DISPLAY_MODE = args.display
-    elif os.environ.get("GROK_DISPLAY"):
-        DISPLAY_MODE = os.environ["GROK_DISPLAY"].strip().lower()
     elif config_display:
         DISPLAY_MODE = config_display
-    if DISPLAY_MODE in ("bg", "background", "minimized", "minimise", "minimize"):
-        DISPLAY_MODE = "offscreen"
-    if DISPLAY_MODE not in ("headed", "offscreen", "headless"):
-        DISPLAY_MODE = "headed"
+    else:
+        DISPLAY_MODE = ""  # let resolve_display use env + platform default
+    try:
+        from browser_engine import resolve_display, normalize_display
+
+        forced = (
+            getattr(args, "headed", False)
+            or getattr(args, "virtual", False)
+            or args.headless
+            or args.offscreen
+            or bool(args.display)
+            or bool(config_display)
+        )
+        if forced and DISPLAY_MODE:
+            DISPLAY_MODE = normalize_display(DISPLAY_MODE) or DISPLAY_MODE
+            # still allow GROK_HEADLESS only when nothing forced — already forced path
+        else:
+            DISPLAY_MODE = resolve_display(DISPLAY_MODE)
+    except Exception:
+        if DISPLAY_MODE in ("bg", "background", "minimized", "minimise", "minimize"):
+            DISPLAY_MODE = "offscreen"
+        if DISPLAY_MODE in ("xvfb", "vd"):
+            DISPLAY_MODE = "virtual"
+        if DISPLAY_MODE not in ("headed", "offscreen", "headless", "virtual"):
+            DISPLAY_MODE = "offscreen" if sys.platform == "darwin" else "headless"
     os.environ["GROK_DISPLAY"] = DISPLAY_MODE
+    if DISPLAY_MODE == "headless":
+        os.environ["GROK_HEADLESS"] = "true"
+    elif DISPLAY_MODE == "virtual":
+        os.environ["GROK_HEADLESS"] = "virtual"
+    else:
+        os.environ["GROK_HEADLESS"] = "false"
 
     wid = WORKER_ID or f"p{os.getpid()}"
     if not args.output:

@@ -637,13 +637,49 @@ def run_tui(args_ns: argparse.Namespace) -> int:
         print("--count must be >= 0", file=sys.stderr)
         return 2
 
-    display = (
-        "headless"
-        if args_ns.headless
-        else ("offscreen" if args_ns.offscreen else args_ns.display)
-    )
-    if display in ("bg", "background"):
+    # flash-aligned: CLI shortcuts > --display > config > env > platform
+    if getattr(args_ns, "headed", False):
+        display = "headed"
+    elif getattr(args_ns, "virtual", False):
+        display = "virtual"
+    elif args_ns.headless:
+        display = "headless"
+    elif args_ns.offscreen:
         display = "offscreen"
+    elif args_ns.display:
+        display = args_ns.display
+    elif cfg.get("display"):
+        display = str(cfg["display"])
+    else:
+        display = ""
+    try:
+        from browser_engine import resolve_display, normalize_display
+
+        forced = (
+            getattr(args_ns, "headed", False)
+            or getattr(args_ns, "virtual", False)
+            or args_ns.headless
+            or args_ns.offscreen
+            or bool(args_ns.display)
+        )
+        if forced:
+            display = normalize_display(display) or display
+        else:
+            if display:
+                os.environ.setdefault(
+                    "GROK_DISPLAY", normalize_display(display) or display
+                )
+            display = resolve_display(display)
+    except Exception:
+        if not display or display in ("bg", "background"):
+            display = "offscreen" if platform_is_mac() else "headless"
+    os.environ["GROK_DISPLAY"] = display
+    if display == "headless":
+        os.environ["GROK_HEADLESS"] = "true"
+    elif display == "virtual":
+        os.environ["GROK_HEADLESS"] = "virtual"
+    else:
+        os.environ["GROK_HEADLESS"] = "false"
 
     from proxy_util import load_proxy_list, normalize_proxy
 
@@ -1160,11 +1196,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--display",
-        choices=["headed", "offscreen", "headless"],
-        default=cfg.get("display") or ("offscreen" if platform_is_mac() else "headed"),
+        choices=["headed", "offscreen", "headless", "virtual"],
+        default=None,
+        help=(
+            "headed | offscreen (Mac) | headless (Linux flash) | virtual (Xvfb). "
+            "Default: config → env → platform"
+        ),
     )
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--offscreen", action="store_true")
+    p.add_argument("--headless", action="store_true", help="shortcut → headless")
+    p.add_argument("--offscreen", action="store_true", help="shortcut → offscreen")
+    p.add_argument("--virtual", action="store_true", help="shortcut → virtual (Xvfb)")
+    p.add_argument("--headed", action="store_true", help="shortcut → headed (debug)")
     return p
 
 
