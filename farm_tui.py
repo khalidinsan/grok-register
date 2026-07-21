@@ -46,12 +46,23 @@ from run_pool import (
 
 # ── log line parser ────────────────────────────────────────────────────────
 # 14:24:01 [W1 1/40 · #1/200 · remW 40 · ✓0 ✗0] EMAIL          alias=...
+# Worker log tag forms (all must match):
+#   Finite:     [W2 3/33 · #70/100 · remW 30 · ✓2 ✗0]
+#   Unlimited:  [W2 3 · #3 · ✓2 ✗0]
+#   Legacy ∞:   [W2 #3 · ✓2 ✗0]  (still accepted)
 _SLOG_RE = re.compile(
     r"^(?P<ts>\d{2}:\d{2}:\d{2})\s+"
     r"\[W(?P<wid>[^\s·\]]+)"
-    r"(?:\s+(?P<cur>\d+)/(?P<share>\d+))?"
-    r"(?:\s*·\s*#(?P<gidx>\d+)/(?P<gtotal>\d+))?"
+    # cur with optional /share  OR  legacy "#cur"
+    r"(?:"
+    r"\s+(?P<cur>\d+)(?:/(?P<share>\d+))?"
+    r"|"
+    r"\s+#(?P<cur_legacy>\d+)"
+    r")?"
+    # global index with optional /total
+    r"(?:\s*·\s*#(?P<gidx>\d+)(?:/(?P<gtotal>\d+))?)?"
     r"(?:\s*·\s*remW\s+(?P<remw>\d+))?"
+    # success / failed counters
     r"(?:\s*·\s*✓(?P<ok>\d+)\s*✗(?P<fail>\d+))?"
     r"\]\s+"
     r"(?P<phase>\S+)\s+"
@@ -75,11 +86,17 @@ PHASE_STYLE = {
     "SETTLE": "dim yellow",
     "SSO": "green",
     "CONVERT": "green",
+    # Bot-flag live probe (cli-chat-proxy grok-4.5) — high visibility
+    "SMOKE": "bold bright_cyan",
+    "PROBE": "bold bright_cyan",
+    "SETTLE": "dim yellow",
+    "PROXY": "bold magenta",
     "PUSH": "green",
     "CREATED": "bold green",
     "DONE": "bold green",
     "OK": "bold green",
     "FAIL": "bold red",
+    "RESULT": "bold white",
     "SCORE": "dim",
     "SUMMARY": "bold",
     "STOP": "red",
@@ -128,6 +145,8 @@ class PoolState:
     max_logs: int = 800
     started_at: float = 0.0
     stopping: bool = False
+    proxy_mode: str = "per_account"
+    proxy_pool: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> int:
@@ -139,7 +158,18 @@ class PoolState:
 
     @property
     def done(self) -> int:
+        """Accounts finished (success + failed) — not only passes."""
         return self.ok + self.fail
+
+    @property
+    def success(self) -> int:
+        """Alias: accounts that passed pipeline."""
+        return self.ok
+
+    @property
+    def failed(self) -> int:
+        """Alias: accounts that failed pipeline."""
+        return self.fail
 
     @property
     def alive(self) -> int:
@@ -150,17 +180,48 @@ class PoolState:
         )
 
 
+# Loose fallback when tag form drifts — still recover W# / phase / ✓✗
+_SLOG_LOOSE_RE = re.compile(
+    r"^(?P<ts>\d{2}:\d{2}:\d{2})\s+"
+    r"\[W(?P<wid>[^\s·\]]+)[^\]]*\]\s+"
+    r"(?P<phase>\S+)\s+"
+    r"(?P<msg>.*)$"
+)
+
+
 def parse_slog_line(line: str, default_wid: str = "?") -> Optional[LogLine]:
     line = line.rstrip("\n\r")
     if not line.strip():
         return None
     m = _SLOG_RE.match(line)
+    if not m:
+        # unlimited / future tag variants still carry W# + phase
+        m = _SLOG_LOOSE_RE.match(line)
     if m:
         d = m.groupdict()
         phase = (d.get("phase") or "RUN").strip()
         msg = (d.get("msg") or "").strip()
         level = "info"
-        if phase in ("FAIL", "STOP") or "error" in msg.lower() or "failed" in msg.lower():
+        msg_u = msg.upper()
+        msg_l = msg.lower()
+        # Pass outcomes first — SCORE/RESULT embed "failed=0" which must NOT go red
+        if phase in ("OK", "DONE", "CREATED") or (
+            phase == "RESULT" and "PASS" in msg_u and "FAIL" not in msg_u.split("PASS")[0]
+        ):
+            level = "info"
+        elif phase == "RESULT" and ("FAIL" in msg_u or "✗" in msg):
+            level = "error"
+        elif phase in ("FAIL", "STOP"):
+            level = "error"
+        elif re.search(r"\berror\b", msg_l) and "→ success" not in msg_l:
+            level = "error"
+        # bare "failed" only when it's a real failure phrase, not "failed=N" tally
+        elif re.search(r"\bfailed\b(?!\s*[=:]\s*\d)", msg_l) and phase not in (
+            "SCORE",
+            "RESULT",
+            "OK",
+            "DONE",
+        ):
             level = "error"
         elif "warn" in phase.lower() or msg.startswith("…") or "still on form" in msg:
             level = "warn"
@@ -216,6 +277,30 @@ def parse_slog_line(line: str, default_wid: str = "?") -> Optional[LogLine]:
     )
 
 
+def _extract_ok_fail(text: str) -> Optional[tuple[int, int]]:
+    """
+    Pull success/failed tallies from a log line or message.
+
+    Accepts (in priority order):
+      success=3 failed=1
+      ✓3/✗1
+      ✓3 ✗1
+    """
+    if not text:
+        return None
+    ms = re.search(r"success[=:](\d+)", text, re.I)
+    mf = re.search(r"failed[=:](\d+)", text, re.I)
+    if ms and mf:
+        return int(ms.group(1)), int(mf.group(1))
+    m = re.search(r"✓(\d+)\s*/\s*✗(\d+)", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"✓(\d+)\s*✗(\d+)", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def apply_log_to_worker(state: PoolState, log: LogLine) -> None:
     w = state.workers.get(log.wid)
     if not w:
@@ -234,14 +319,38 @@ def apply_log_to_worker(state: PoolState, log: LogLine) -> None:
     m = _SLOG_RE.match(log.raw)
     if m:
         d = m.groupdict()
-        if d.get("cur"):
-            w.local_cur = int(d["cur"])
+        cur = d.get("cur") or d.get("cur_legacy")
+        if cur:
+            w.local_cur = int(cur)
         if d.get("ok") is not None:
             w.ok = int(d["ok"])
         if d.get("fail") is not None:
             w.fail = int(d["fail"])
         if d.get("share"):
-            w.share = int(d["share"])
+            try:
+                sh = int(d["share"])
+                if sh > 0:
+                    w.share = sh
+            except (TypeError, ValueError):
+                pass
+    else:
+        # Loose: recover cur from "W1 #4 · …" or "W1 4 · …" when strict tag drifts
+        mcur = re.search(
+            r"\[W[^\s·\]]+(?:\s+(?P<cur>\d+)(?:/\d+)?|\s+#(?P<cur_legacy>\d+))",
+            log.raw or "",
+        )
+        if mcur:
+            cur = mcur.group("cur") or mcur.group("cur_legacy")
+            if cur:
+                w.local_cur = int(cur)
+
+    # Fallback / belt-and-suspenders: any line may embed tallies
+    # Semantics: success=✓ pass, failed=✗ not-pass, done=success+failed
+    for blob in (log.raw or "", log.message or ""):
+        pair = _extract_ok_fail(blob)
+        if pair:
+            w.ok, w.fail = pair
+            break
 
     em = _EMAIL_IN_MSG.search(log.message or "")
     if em:
@@ -255,6 +364,11 @@ def apply_log_to_worker(state: PoolState, log: LogLine) -> None:
         w.status = "running"
     if log.phase == "SUMMARY":
         w.status = "done"
+    # Keep last outcome visible on the worker row
+    if log.phase == "OK" or (log.phase == "RESULT" and "PASS" in (log.message or "").upper()):
+        w.message = f"✓ {(log.message or '')[:70]}"
+    elif log.phase == "FAIL" or (log.phase == "RESULT" and "FAIL" in (log.message or "").upper()):
+        w.message = f"✗ {(log.message or '')[:70]}"
 
 
 # ── process manager ────────────────────────────────────────────────────────
@@ -274,6 +388,7 @@ class PoolRunner:
         display: str,
         stagger: float,
         proxies: list[str],
+        proxy_mode: str = "per_account",
     ) -> None:
         shares = split_workload(total, concurrent)
         offsets: list[int] = []
@@ -286,15 +401,22 @@ class PoolRunner:
         self.state.concurrent = len(shares)
         self.state.display = display
         self.state.stagger = stagger
+        self.state.proxy_mode = proxy_mode
+        self.state.proxy_pool = list(proxies or [])
         self.state.workers.clear()
         for i, share in enumerate(shares):
             wid = str(i + 1)
-            proxy = proxies[i % len(proxies)] if proxies else ""
+            # sticky preview only; per_account rotates inside worker
+            sticky = (
+                proxies[i % len(proxies)]
+                if proxies and proxy_mode == "per_worker"
+                else (f"pool×{len(proxies)}" if proxies else "")
+            )
             self.state.workers[wid] = WorkerState(
                 wid=wid,
                 share=share,
                 offset=offsets[i],
-                proxy=proxy,
+                proxy=sticky,
                 debug_port=9300 + int(wid) * 20,
             )
 
@@ -332,6 +454,8 @@ class PoolRunner:
                     time.sleep(0.2)
 
     def _start_one(self, python: str, w: WorkerState) -> None:
+        from proxy_util import encode_proxy_env
+
         env = os.environ.copy()
         env["GROK_WORKER_ID"] = w.wid
         env["GROK_DEBUG_PORT"] = str(w.debug_port)
@@ -339,8 +463,16 @@ class PoolRunner:
         env["GROK_WORKER_SHARE"] = str(w.share)
         env["GROK_POOL_TOTAL"] = str(self.state.total if self.state.total > 0 else 0)
         env["GROK_POOL_OFFSET"] = str(w.offset)
+        env["GROK_POOL_CONCURRENT"] = str(self.state.concurrent)
+        env["GROK_PROXY_MODE"] = getattr(self.state, "proxy_mode", None) or "per_account"
         env["PYTHONUNBUFFERED"] = "1"
-        if w.proxy:
+        pool = getattr(self.state, "proxy_pool", None) or []
+        if pool:
+            env["GROK_PROXIES"] = encode_proxy_env(pool)
+        else:
+            env.pop("GROK_PROXIES", None)
+        mode = env["GROK_PROXY_MODE"]
+        if mode == "per_worker" and w.proxy and not w.proxy.startswith("pool×"):
             env["GROK_BROWSER_PROXY"] = w.proxy
         else:
             env.pop("GROK_BROWSER_PROXY", None)
@@ -513,9 +645,70 @@ def run_tui(args_ns: argparse.Namespace) -> int:
     if display in ("bg", "background"):
         display = "offscreen"
 
-    proxies = list(args_ns.proxy) if args_ns.proxy else list(cfg["proxies"])
+    from proxy_util import load_proxy_list, normalize_proxy
+
+    if args_ns.proxy:
+        proxies = load_proxy_list(args_ns.proxy)
+    else:
+        proxies = list(cfg.get("proxies") or [])
     if args_ns.proxy_file:
         proxies = load_proxy_file(args_ns.proxy_file)
+    proxies = [normalize_proxy(p) or p for p in proxies if p]
+    proxy_mode = (
+        getattr(args_ns, "proxy_mode", None)
+        or cfg.get("proxy_mode")
+        or "per_account"
+    )
+
+    do_check = bool(getattr(args_ns, "proxy_check", cfg.get("proxy_check", True)))
+    if proxies and do_check:
+        from proxy_health import apply_proxy_check, resolve_proxy_need
+
+        need = resolve_proxy_need(
+            total_accounts=total,
+            concurrent=concurrent,
+            proxy_count=len(proxies),
+            proxy_mode=proxy_mode,
+        )
+        print(
+            f"[PROXY-CHECK] need {need} good of {len(proxies)} listed  "
+            f"(accounts={total if total > 0 else '∞'}, c={concurrent}, "
+            f"max {float(getattr(args_ns, 'proxy_max_ms', None) or cfg.get('proxy_max_ms') or 4000):.0f}ms)",
+            flush=True,
+        )
+        try:
+            proxies = apply_proxy_check(
+                proxies,
+                enabled=True,
+                target=str(
+                    getattr(args_ns, "proxy_check_url", None)
+                    or cfg.get("proxy_check_url")
+                    or "https://accounts.x.ai/"
+                ),
+                max_ms=float(
+                    getattr(args_ns, "proxy_max_ms", None)
+                    or cfg.get("proxy_max_ms")
+                    or 4000
+                ),
+                timeout=float(cfg.get("proxy_check_timeout") or 12),
+                workers=int(cfg.get("proxy_check_workers") or 10),
+                need=need,
+                total_accounts=total,
+                concurrent=concurrent,
+                proxy_mode=proxy_mode,
+                require_one=True,
+            )
+        except RuntimeError as e:
+            print(f"[proxy-check] {e}", file=sys.stderr)
+            return 2
+        try:
+            good_path = ROOT / "proxy.good.txt"
+            good_path.write_text("\n".join(proxies) + "\n", encoding="utf-8")
+            print(f"[PROXY-CHECK] kept {len(proxies)} → {good_path.name}", flush=True)
+        except Exception:
+            pass
+    elif proxies and not do_check:
+        print("[PROXY-CHECK] skipped (--no-proxy-check)", flush=True)
 
     if not SCRIPT.is_file():
         print(f"missing farm script: {SCRIPT}", file=sys.stderr)
@@ -524,7 +717,9 @@ def run_tui(args_ns: argparse.Namespace) -> int:
     event_q: queue.Queue = queue.Queue()
     state = PoolState(total=total, concurrent=concurrent, display=display, stagger=args_ns.stagger_sec)
     runner = PoolRunner(state, event_q)
-    runner.build_plan(total, concurrent, display, args_ns.stagger_sec, proxies)
+    runner.build_plan(
+        total, concurrent, display, args_ns.stagger_sec, proxies, proxy_mode=proxy_mode
+    )
 
     def _ascii_bar(done: int, total: int, width: int = 40) -> str:
         if total <= 0:
@@ -550,14 +745,15 @@ def run_tui(args_ns: argparse.Namespace) -> int:
         def render(self):
             elapsed = time.time() - state.started_at if state.started_at else 0
             tot = state.total if state.total > 0 else 0
+            # done = accounts finished (created/attempted); success/failed = pass outcome
             done = state.done
-            ok = state.ok
-            fail = state.fail
+            success = state.success
+            failed = state.failed
             pct = (done / tot * 100) if tot else 0
-            # acc/min: prefer successful accounts; else total done (early stage)
-            rate_base = ok if ok > 0 else done
+            # throughput: accounts finished per minute (done), not only passes
+            rate_base = done if done > 0 else success
             rate = (rate_base / (elapsed / 60.0)) if elapsed >= 8 and rate_base > 0 else 0.0
-            remaining = max(0, tot - (ok if ok > 0 else done)) if tot else 0
+            remaining = max(0, tot - done) if tot else 0
             eta_sec = (remaining / rate * 60.0) if rate > 0 and remaining > 0 else (
                 0.0 if tot and remaining == 0 and done > 0 else None
             )
@@ -570,14 +766,21 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 head.append("  STOPPING…", style="bold red")
 
             stats = Text()
+            # done = accounts finished (created/attempted); success/failed = pass outcome
             if tot:
-                stats.append(f"  {done}/{tot}  ", style="bold")
+                stats.append(f"  done {done}/{tot}  ", style="bold")
                 stats.append(f"({pct:.0f}%)  ", style="dim")
             else:
-                stats.append(f"  done={done}  ∞ mode  ", style="bold")
-            stats.append(f"✓{ok} ", style="bold green")
-            stats.append(f"✗{fail}  ", style="bold red")
+                stats.append(f"  done {done}  ∞  ", style="bold")
+            stats.append(f"success {success} ", style="bold green")
+            stats.append(f"failed {failed}  ", style="bold red")
             stats.append(f"alive={state.alive}/{len(state.workers)}  ", style="cyan")
+            # one-line legend so ∞ mode semantics stay obvious
+            legend = Text("  ")
+            legend.append(
+                "done=finished  success=pass  failed=not-pass",
+                style="dim",
+            )
 
             rate_line = Text("  ")
             if rate > 0:
@@ -605,7 +808,7 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             if tot:
                 bar.append(f"  {pct:.0f}%", style="dim")
 
-            return Group(head, stats, rate_line, bar)
+            return Group(head, stats, legend, rate_line, bar)
 
     class FarmApp(App):
         CSS = """
@@ -656,7 +859,15 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             yield Header(show_clock=True)
             yield SummaryPanel(id="summary")
             yield DataTable(id="workers", zebra_stripes=True)
-            yield RichLog(id="log", highlight=True, markup=True, wrap=True, max_lines=600)
+            # auto_scroll=False — we own scroll via pause_scroll + write(scroll_end=…)
+            yield RichLog(
+                id="log",
+                highlight=True,
+                markup=True,
+                wrap=True,
+                max_lines=600,
+                auto_scroll=False,
+            )
             yield Footer()
 
         def on_mount(self) -> None:
@@ -668,8 +879,8 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 ("Local", "local"),
                 ("Global", "global"),
                 ("Phase", "phase"),
-                ("✓", "ok"),
-                ("✗", "fail"),
+                ("Success", "ok"),
+                ("Failed", "fail"),
                 ("Email", "email"),
                 ("Last", "last"),
             )
@@ -724,8 +935,15 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 row_key = wid
                 try:
                     share_s = f"{w.local_cur}/{w.share}" if w.share else f"{w.local_cur}/∞"
-                    gidx = w.offset + w.local_cur if w.local_cur else w.offset + 1
-                    g_s = f"#{gidx}/{state.total}" if state.total > 0 else "—"
+                    gidx = w.offset + w.local_cur if w.local_cur else (
+                        w.offset + 1 if state.total > 0 else 0
+                    )
+                    if state.total > 0:
+                        g_s = f"#{gidx}/{state.total}"
+                    elif w.local_cur:
+                        g_s = f"#{w.local_cur}"
+                    else:
+                        g_s = "∞"
                     st_style = {
                         "running": "green",
                         "starting": "yellow",
@@ -737,10 +955,28 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                     table.update_cell(row_key, "local", share_s)
                     table.update_cell(row_key, "global", g_s)
                     table.update_cell(row_key, "phase", w.phase[:14])
-                    table.update_cell(row_key, "ok", str(w.ok))
-                    table.update_cell(row_key, "fail", str(w.fail))
+                    table.update_cell(
+                        row_key,
+                        "ok",
+                        Text(str(w.ok), style="bold green" if w.ok else "dim"),
+                    )
+                    table.update_cell(
+                        row_key,
+                        "fail",
+                        Text(str(w.fail), style="bold red" if w.fail else "dim"),
+                    )
                     table.update_cell(row_key, "email", (w.email or "")[:28])
-                    table.update_cell(row_key, "last", (w.message or "")[:40])
+                    last_msg = w.message or ""
+                    last_style = ""
+                    if last_msg.startswith("✓") or last_msg.upper().startswith("PASS"):
+                        last_style = "green"
+                    elif last_msg.startswith("✗") or "FAIL" in last_msg.upper()[:8]:
+                        last_style = "red"
+                    table.update_cell(
+                        row_key,
+                        "last",
+                        Text(last_msg[:40], style=last_style) if last_style else last_msg[:40],
+                    )
                 except Exception:
                     pass
 
@@ -765,7 +1001,15 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                         continue
 
                     style = PHASE_STYLE.get(log.phase, "white")
-                    if log.level == "error":
+                    msg_u = (log.message or "").upper()
+                    # Pass = green, fail = red (never paint PASS/OK red because of "failed=0")
+                    if log.phase in ("OK", "DONE", "CREATED") or (
+                        log.phase == "RESULT" and "PASS" in msg_u
+                    ):
+                        style = "bold green"
+                    elif log.level == "error" or log.phase in ("FAIL", "STOP") or (
+                        log.phase == "RESULT" and "FAIL" in msg_u
+                    ):
                         style = "bold red"
                     elif log.level == "warn":
                         style = "yellow"
@@ -775,27 +1019,45 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                     line.append(f"{log.ts} ", style="dim")
                     line.append(f"{wid_s:<4} ", style="bold cyan" if log.wid != "pool" else "white")
                     line.append(f"{log.phase:<12} ", style=style)
-                    line.append(log.message[:140], style=style if log.level != "info" else "")
-                    log_w.write(line)
-                    if not self.pause_scroll:
-                        log_w.scroll_end(animate=False)
+                    # color message for pass/fail/warn so PASS is green not plain
+                    msg_style = ""
+                    if style in ("bold green", "bold red", "yellow"):
+                        msg_style = style
+                    elif log.level != "info":
+                        msg_style = style
+                    line.append(log.message[:140], style=msg_style)
+                    # scroll_end only when not paused (RichLog.auto_scroll is off)
+                    log_w.write(line, scroll_end=not self.pause_scroll)
 
                 elif kind == "worker_exit":
                     self._refresh_table()
 
         def action_filter_all(self) -> None:
             self.filter_wid = None
-            self.query_one("#log", RichLog).write("[dim]filter: all workers[/]")
+            log_w = self.query_one("#log", RichLog)
+            log_w.write(
+                "[dim]filter: all workers[/]",
+                scroll_end=not self.pause_scroll,
+            )
 
         def action_filter_w(self, wid: str) -> None:
             if wid in state.workers:
                 self.filter_wid = wid
-                self.query_one("#log", RichLog).write(f"[dim]filter: W{wid} only (press a = all)[/]")
+                self.query_one("#log", RichLog).write(
+                    f"[dim]filter: W{wid} only (press a = all)[/]",
+                    scroll_end=not self.pause_scroll,
+                )
 
         def action_toggle_pause(self) -> None:
             self.pause_scroll = not self.pause_scroll
-            self.query_one("#log", RichLog).write(
-                f"[dim]auto-scroll {'paused' if self.pause_scroll else 'resumed'}[/]"
+            log_w = self.query_one("#log", RichLog)
+            # belt-and-suspenders vs RichLog default auto_scroll
+            log_w.auto_scroll = not self.pause_scroll
+            if not self.pause_scroll:
+                log_w.scroll_end(animate=False)
+            log_w.write(
+                f"[dim]auto-scroll {'paused' if self.pause_scroll else 'resumed'}[/]",
+                scroll_end=not self.pause_scroll,
             )
 
         def action_quit_stop(self) -> None:
@@ -803,7 +1065,8 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 state.stopping = True
                 try:
                     self.query_one("#log", RichLog).write(
-                        "[bold red]stopping all workers + Chromium…[/]"
+                        "[bold red]stopping all workers + Chromium…[/]",
+                        scroll_end=True,
                     )
                 except Exception:
                     pass
@@ -811,7 +1074,8 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 runner.stop_all()
                 try:
                     self.query_one("#log", RichLog).write(
-                        "[bold green]Chrome closed. Bye.[/]"
+                        "[bold green]Chrome closed. Bye.[/]",
+                        scroll_end=True,
                     )
                 except Exception:
                     pass
@@ -865,8 +1129,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="stagger_sec",
         help="seconds between starting each worker",
     )
-    p.add_argument("--proxy-file", default="", help="proxy list file")
+    p.add_argument(
+        "--proxy-file",
+        default=cfg.get("proxy_file") or "",
+        help="proxy list (URL or Webshare host:port:user:pass)",
+    )
     p.add_argument("--proxy", action="append", default=[], help="proxy URL (repeatable)")
+    p.add_argument(
+        "--proxy-mode",
+        choices=["per_account", "per_worker"],
+        default=cfg.get("proxy_mode") or "per_account",
+        help="per_account=rotate each account; per_worker=sticky",
+    )
+    p.add_argument(
+        "--proxy-check",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("proxy_check", True)),
+        help="probe proxies → accounts.x.ai; drop slow ones (default on)",
+    )
+    p.add_argument(
+        "--proxy-max-ms",
+        type=float,
+        default=float(cfg.get("proxy_max_ms") or 4000),
+        help="max latency ms to keep a proxy (default 4000)",
+    )
+    p.add_argument(
+        "--proxy-check-url",
+        default=str(cfg.get("proxy_check_url") or "https://accounts.x.ai/"),
+        help="health-check URL",
+    )
     p.add_argument(
         "--display",
         choices=["headed", "offscreen", "headless"],

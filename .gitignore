@@ -11,3 +11,8 @@ CLAUDE.md
 
 name_rr.index
 name.txt.bak
+
+# local secrets
+proxy.txt
+*.proxy.txt
+proxy.good.txt

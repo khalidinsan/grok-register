@@ -136,7 +136,9 @@ Env overrides for email: `EMAIL_DOMAIN`, `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, 
 | `pool.concurrent` | int | How many browsers in parallel. |
 | `pool.stagger_sec` | number | Delay (seconds) between starting workers. |
 | `pool.display` | string | `headed` · `offscreen` · `headless` (default `offscreen` on Mac). |
-| `pool.proxies` | string[] | Proxy URLs; assigned round-robin to workers. |
+| `pool.proxies` | string[] | Proxy URLs (or Webshare `host:port:user:pass`). |
+| `pool.proxy_file` | string | Path to proxy list file (Webshare export OK). |
+| `pool.proxy_mode` | string | `per_account` (default, 1 proxy / account rotate) or `per_worker` (sticky). |
 | `email.domain` | string | Catch-all domain → generates `random@domain`. |
 | `email.imap_user` | string | Gmail address that receives catch-all mail. |
 | `email.imap_pass` | string | Gmail App Password (not your login password). |
@@ -145,6 +147,9 @@ Env overrides for email: `EMAIL_DOMAIN`, `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, 
 | `browser_proxy` | string | Global browser proxy (overridden per worker by `GROK_BROWSER_PROXY`). |
 | `grok_cli.enabled` | bool | Convert SSO → Build OAuth and push to 9router `grok-cli`. |
 | `grok_cli.base_url` | string | 9router base URL (default `http://127.0.0.1:20127`). |
+| `grok_cli.smoke_bot_flag` | bool | If JWT has `bot_flag_source`, smoke-test before import (default `true`). |
+| `grok_cli.smoke_model` | string | Model for bot-flag smoke (default `grok-4.5`). |
+| `grok_cli.smoke_timeout_sec` | number | Smoke HTTP timeout seconds (default `45`). |
 | `grok2api.enabled` | bool | Optional import of Web SSO into grok2api. |
 | `ninerouter.enabled` | bool | Legacy grok-web cookie import (usually leave `false`). |
 
@@ -298,9 +303,15 @@ export GROK_DISPLAY=offscreen
 2. Wait for OTP via IMAP (header-only poll from x.ai when possible)
 3. Settle SSO cookies (brief wait before opening grok.com)
 4. Save SSO line under `sso/`
-5. If `grok_cli.enabled`:
-   - Device OAuth convert (`sso_to_build.py`) → access + refresh tokens
-   - `POST /api/providers` on 9router as **`grok-cli`**
+5. If `grok_cli.enabled` (flash-aligned pipeline):
+   - **SETTLE** — idle after signup (`post_signup_settle_sec`, default 12s)
+   - **CONVERT** — browser **PKCE** with `referrer=grok-build` (same session); fallback device SSO
+   - **PROBE** — chat usable on `cli-chat-proxy` (`inject_policy=usable`); **403 DENIED → no inject**
+   - **PUSH** — only if usable → `POST /api/providers` as **`grok-cli`**
+
+Browser engine (`browser.engine` / `GROK_BROWSER_ENGINE`): **`chromium`** (default) or **`camoufox`**. Both use **native proxy** `{server, username, password}` (not user:pass in `--proxy-server`).
+
+Email: `email.local_style=human` → `first.last` style aliases (not pure random).
 6. Optional grok2api Web import if enabled
 
 ### 9router notes

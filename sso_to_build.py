@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -118,9 +119,21 @@ def _decode_jwt_claims(token: str) -> Dict[str, Any]:
 
 
 class SsoBuildFlow:
-    def __init__(self, sso: str, sso_rw: str | None = None, user_agent: str = USER_AGENT):
+    def __init__(
+        self,
+        sso: str,
+        sso_rw: str | None = None,
+        user_agent: str = USER_AGENT,
+        proxy: str | None = None,
+    ):
         self.user_agent = user_agent
         self.session = requests.Session()
+        # Optional HTTP(S) proxy. Pass proxy="" to force direct.
+        if proxy is None:
+            proxy = (os.environ.get("GROK_BROWSER_PROXY") or "").strip()
+        self._proxy = (proxy or "").strip()
+        if self._proxy:
+            self.session.proxies.update({"http": self._proxy, "https": self._proxy})
         self.session.headers.update(
             {
                 "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
@@ -299,11 +312,56 @@ class SsoBuildFlow:
         raise RuntimeError("device flow poll timeout")
 
 
-def convert_sso_to_build(sso_credential: Any, name_hint: str = "") -> BuildTokens:
+def convert_sso_to_build(
+    sso_credential: Any,
+    name_hint: str = "",
+    *,
+    proxy: str | None = None,
+    fallback_direct: bool = True,
+) -> BuildTokens:
+    """
+    Convert Web SSO → Build tokens.
+
+    proxy=None → use GROK_BROWSER_PROXY env (browser account proxy).
+    proxy=""   → force direct (no proxy).
+    fallback_direct: if proxied convert hits 429 / proxy errors, retry once direct.
+    """
     sso, sso_rw = extract_sso_from_credential(sso_credential)
     if not sso:
         raise ValueError("empty SSO token")
-    return SsoBuildFlow(sso=sso, sso_rw=sso_rw).convert(name_hint=name_hint)
+
+    def _run(px: str | None) -> BuildTokens:
+        return SsoBuildFlow(sso=sso, sso_rw=sso_rw, proxy=px).convert(
+            name_hint=name_hint
+        )
+
+    try:
+        return _run(proxy)
+    except Exception as e:
+        err = str(e).lower()
+        used_proxy = (
+            (proxy if proxy is not None else os.environ.get("GROK_BROWSER_PROXY") or "")
+            .strip()
+        )
+        proxy_fail = any(
+            k in err
+            for k in (
+                "proxyerror",
+                "unable to connect to proxy",
+                "tunnel connection failed",
+                "429",
+                "too many requests",
+                "proxy connection",
+            )
+        )
+        if fallback_direct and used_proxy and proxy_fail:
+            # Datacenter proxies often 429 on auth.x.ai — browser OK, HTTP convert not.
+            print(
+                f"[*] convert via proxy failed ({e!s:.120}) — retry DIRECT (no proxy)",
+                flush=True,
+            )
+            return _run("")
+        raise
 
 
 if __name__ == "__main__":

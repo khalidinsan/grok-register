@@ -11,7 +11,7 @@ import string
 import time
 from email.header import decode_header
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
 # Config: catch-all domain + IMAP (fast, alibaba-farm style)
@@ -41,13 +41,6 @@ IMAP_PASS = _cfg("imap_pass", "IMAP_PASS")
 IMAP_HOST = _cfg("imap_host", "IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(_cfg("imap_port", "IMAP_PORT", "993") or "993")
 
-# Server-side filters — tiny result set, no full-inbox scan
-_SEARCH_CRITERIA = (
-    '(FROM "x.ai")',
-    '(FROM "SpaceXAI")',
-    '(SUBJECT "confirmation code")',
-)
-
 # ============================================================
 # Adapter for DrissionPage_example.py
 # ============================================================
@@ -55,9 +48,12 @@ _SEARCH_CRITERIA = (
 _temp_email_cache: Dict[str, str] = {}
 
 
-def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
-    """Generate catch-all alias. Returns (email, token) — token == email for IMAP."""
-    email_addr = create_temp_email()
+def get_email_and_token(
+    given: str = "",
+    family: str = "",
+) -> Tuple[Optional[str], Optional[str]]:
+    """Generate humanized catch-all alias. Returns (email, token) — token == email for IMAP."""
+    email_addr = create_temp_email(given=given, family=family)
     if email_addr:
         _temp_email_cache[email_addr] = email_addr
         return email_addr, email_addr
@@ -94,11 +90,28 @@ def _require_imap_config() -> None:
         )
 
 
-def create_temp_email() -> str:
+def create_temp_email(given: str = "", family: str = "") -> str:
+    """Catch-all alias with human-looking local-part (not pure random)."""
     _require_imap_config()
-    chars = string.ascii_lowercase + string.digits
-    local = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
-    email_addr = f"{local}@{EMAIL_DOMAIN.lstrip('@')}"
+    domain = EMAIL_DOMAIN.lstrip("@")
+    style = (
+        str(_email_conf.get("local_style") or os.environ.get("EMAIL_LOCAL_STYLE") or "human")
+        .strip()
+        .lower()
+    )
+    if style in ("random", "legacy", "garbage"):
+        chars = string.ascii_lowercase + string.digits
+        local = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
+        email_addr = f"{local}@{domain}"
+    else:
+        try:
+            from human_email import human_catchall_email
+
+            email_addr = human_catchall_email(domain, given=given, family=family)
+        except Exception:
+            chars = string.ascii_lowercase + string.digits
+            local = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
+            email_addr = f"{local}@{domain}"
     print(f"[*] Catch-all email: {email_addr}")
     return email_addr
 
@@ -169,32 +182,45 @@ def _select(mail: imaplib.IMAP4_SSL, box: str) -> bool:
     return False
 
 
-def _search_xai_ids(mail: imaplib.IMAP4_SSL) -> List[bytes]:
-    """Server-side search — only x.ai / confirmation mails."""
-    found: Set[bytes] = set()
-    for criteria in _SEARCH_CRITERIA:
-        try:
-            st, data = mail.search(None, criteria)
-            if st == "OK" and data and data[0]:
-                found.update(data[0].split())
-        except Exception:
-            continue
-    return sorted(found, key=lambda x: int(x))
-
-
-def _fetch_headers(mail: imaplib.IMAP4_SSL, mid: bytes) -> Optional[email_lib.message.Message]:
-    """Header-only — OTP lives in Subject, no body needed."""
+def _uid_search(mail: imaplib.IMAP4_SSL, criteria: str) -> List[bytes]:
     try:
-        st, data = mail.fetch(
-            mid,
+        st, data = mail.uid("search", None, criteria)
+        if st == "OK" and data and data[0]:
+            return data[0].split()
+    except Exception:
+        pass
+    return []
+
+
+def _max_uid(mail: imaplib.IMAP4_SSL) -> int:
+    """Highest UID currently in the selected mailbox (0 if empty)."""
+    uids = _uid_search(mail, "ALL")
+    if not uids:
+        return 0
+    try:
+        return int(uids[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _uid_fetch_headers(
+    mail: imaplib.IMAP4_SSL, uid: bytes
+) -> Optional[email_lib.message.Message]:
+    """Header-only by UID — OTP lives in Subject."""
+    try:
+        st, data = mail.uid(
+            "fetch",
+            uid,
             "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE DELIVERED-TO X-ORIGINAL-TO)])",
         )
-        if st != "OK" or not data or not data[0]:
+        if st != "OK" or not data:
             return None
-        raw = data[0][1]
-        if not isinstance(raw, (bytes, bytearray)):
-            return None
-        return email_lib.message_from_bytes(bytes(raw))
+        for part in data:
+            if isinstance(part, tuple) and len(part) >= 2:
+                raw = part[1]
+                if isinstance(raw, (bytes, bytearray)):
+                    return email_lib.message_from_bytes(bytes(raw))
+        return None
     except Exception:
         return None
 
@@ -210,55 +236,84 @@ def _recipient_blob(msg: email_lib.message.Message) -> str:
     ).lower()
 
 
+def _code_from_msg(
+    msg: email_lib.message.Message, target: str
+) -> Optional[Tuple[str, str]]:
+    if target not in _recipient_blob(msg):
+        return None
+    subj = _decode_header_value(msg.get("Subject", ""))
+    code = extract_verification_code(subj)
+    if code:
+        return code, subj
+    return None
+
+
 def _find_code_for_alias(
     mail: imaplib.IMAP4_SSL,
     target: str,
-    recent: int = 20,
+    baseline_uid: int = 0,
 ) -> Optional[Tuple[str, str, bytes]]:
     """
-    Among recent FROM-x.ai mails, find one addressed to `target`.
-    Returns (code, subject, msg_id) or None.
+    Find OTP for unique catch-all alias — cheap paths only:
 
-    Unique catch-all alias = no need for heavy "seen" snapshot.
+    1) UID SEARCH (TO "alias")  — Gmail indexes To (~0.5s)
+    2) UID SEARCH UID (baseline+1):* + header fetch of NEW mail only
+
+    Never re-scan / re-fetch the whole x.ai history (was ~45s/poll).
     """
-    ids = _search_xai_ids(mail)
-    if not ids:
-        return None
+    for crit in (f'(TO "{target}")', f"(TO {target})"):
+        uids = _uid_search(mail, crit)
+        if not uids:
+            continue
+        ordered = sorted(uids, key=lambda u: int(u))
+        prefer = [u for u in ordered if int(u) > baseline_uid] or ordered[-3:]
+        for uid in reversed(prefer):
+            msg = _uid_fetch_headers(mail, uid)
+            if not msg:
+                continue
+            hit = _code_from_msg(msg, target)
+            if hit:
+                return hit[0], hit[1], uid
 
-    for mid in reversed(ids[-recent:]):
-        msg = _fetch_headers(mail, mid)
+    if baseline_uid > 0:
+        raw = _uid_search(mail, f"UID {baseline_uid + 1}:*")
+        new_uids = [u for u in raw if int(u) > baseline_uid]
+    else:
+        new_uids = _uid_search(mail, "ALL")[-5:]
+
+    for uid in reversed(new_uids):
+        msg = _uid_fetch_headers(mail, uid)
         if not msg:
             continue
-        if target not in _recipient_blob(msg):
-            continue
-        subj = _decode_header_value(msg.get("Subject", ""))
-        code = extract_verification_code(subj)
-        if code:
-            return code, subj, mid
+        hit = _code_from_msg(msg, target)
+        if hit:
+            return hit[0], hit[1], uid
     return None
 
 
 def wait_for_verification_code(target_email: str, timeout: int = 120) -> Optional[str]:
     """
-    Fast poll:
-    - keep one IMAP connection
-    - SEARCH FROM x.ai only (not full inbox / not All Mail)
-    - header-only fetch; parse OTP from Subject
-    - match unique alias in To (no slow snapshot that can race-skip new mail)
+    Fast poll (UID watermark + TO search):
+    - one IMAP connection
+    - snapshot max UID at start → only inspect newer mail
+    - Gmail TO-search for unique alias (no full-inbox / no 20-header scan)
+    - poll ~0.5s when idle
     """
     _require_imap_config()
     target = target_email.lower().strip()
     print(f"[IMAP] Waiting for OTP to {target_email} (timeout={timeout}s)...")
-    print(f"[IMAP] {IMAP_USER} @ {IMAP_HOST} — fast search FROM x.ai")
+    print(f"[IMAP] {IMAP_USER} @ {IMAP_HOST} — UID watermark + TO search")
 
     start = time.time()
     poll = 0
     mail = _open_imap()
+    baseline_uid = 0
 
     try:
         if not _select(mail, "INBOX"):
             raise Exception("Cannot select INBOX")
-        print("[IMAP] Connected, polling every 2s...")
+        baseline_uid = _max_uid(mail)
+        print(f"[IMAP] Connected  baseline_uid={baseline_uid}  poll≈0.5s")
 
         spam_checked = False
 
@@ -268,7 +323,8 @@ def wait_for_verification_code(target_email: str, timeout: int = 120) -> Optiona
 
             try:
                 try:
-                    mail.noop()
+                    if poll == 1 or poll % 10 == 0:
+                        mail.noop()
                 except Exception:
                     try:
                         mail.logout()
@@ -277,34 +333,36 @@ def wait_for_verification_code(target_email: str, timeout: int = 120) -> Optiona
                     mail = _open_imap()
                     _select(mail, "INBOX")
 
-                hit = _find_code_for_alias(mail, target)
+                hit = _find_code_for_alias(mail, target, baseline_uid=baseline_uid)
                 if hit:
-                    code, subj, mid = hit
+                    code, subj, uid = hit
                     print(
                         f"[IMAP] Found OTP: {code} for {target_email} "
                         f"(Subj={subj!r}) in {elapsed}s"
                     )
                     try:
-                        mail.store(mid, "+FLAGS", "\\Seen")
+                        mail.uid("store", uid, "+FLAGS", "\\Seen")
                     except Exception:
                         pass
                     return code
 
-                # One-time Spam peek if still empty after 25s
-                if not spam_checked and elapsed >= 25:
+                if not spam_checked and elapsed >= 15:
                     spam_checked = True
                     for spam_box in ("[Gmail]/Spam", "[Gmail]/Junk"):
                         if not _select(mail, spam_box):
                             continue
-                        hit = _find_code_for_alias(mail, target, recent=10)
+                        hit = _find_code_for_alias(mail, target, baseline_uid=0)
                         _select(mail, "INBOX")
                         if hit:
-                            code, subj, mid = hit
-                            print(f"[IMAP] Found OTP in Spam: {code} (Subj={subj!r})")
+                            code, subj, uid = hit
+                            print(
+                                f"[IMAP] Found OTP in Spam: {code} "
+                                f"(Subj={subj!r}) in {elapsed}s"
+                            )
                             return code
                         break
 
-                if poll == 1 or poll % 5 == 0:
+                if poll == 1 or poll % 10 == 0:
                     print(f"[IMAP] waiting... {elapsed}s/{timeout}s")
 
             except Exception as e:
@@ -313,14 +371,14 @@ def wait_for_verification_code(target_email: str, timeout: int = 120) -> Optiona
                     mail.logout()
                 except Exception:
                     pass
-                time.sleep(1)
+                time.sleep(0.5)
                 try:
                     mail = _open_imap()
                     _select(mail, "INBOX")
                 except Exception as e2:
                     print(f"[IMAP] Reconnect failed: {e2}")
 
-            time.sleep(2)
+            time.sleep(0.5)
 
     finally:
         try:

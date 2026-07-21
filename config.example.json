@@ -7,23 +7,44 @@
         "concurrent": 2,
         "stagger_sec": 20,
         "display": "offscreen",
-        "proxies": []
+        "proxy_mode": "per_account",
+        "proxy_file": "proxy.txt",
+        "proxies": [],
+        "proxy_check": true,
+        "proxy_check_url": "https://accounts.x.ai/",
+        "proxy_max_ms": 4000,
+        "proxy_check_timeout": 12,
+        "proxy_check_workers": 10
     },
     "email": {
         "domain": "yourdomain.com",
         "imap_user": "you@gmail.com",
         "imap_pass": "abcd efgh ijkl mnop",
         "imap_host": "imap.gmail.com",
-        "imap_port": 993
+        "imap_port": 993,
+        "local_style": "human"
     },
     "proxy": "",
     "browser_proxy": "",
+    "browser": {
+        "engine": "chromium"
+    },
     "grok_cli": {
         "enabled": true,
         "base_url": "https://ai.khalid.id",
         "password": "your-9router-dashboard-password",
         "data_dir": "~/.9router",
-        "cli_token": ""
+        "cli_token": "",
+        "oauth_mode": "pkce",
+        "oauth_referrer": "grok-build",
+        "post_signup_settle_sec": 12,
+        "inject_policy": "usable",
+        "jwt_reject_bot_flag": false,
+        "jwt_enforce_referrer": true,
+        "chat_probe_model": "grok-4.5",
+        "smoke_bot_flag": true,
+        "smoke_model": "grok-4.5",
+        "smoke_timeout_sec": 45
     },
     "grok2api": {
         "enabled": false,

@@ -3,6 +3,7 @@ from DrissionPage.errors import PageDisconnectedError
 import argparse
 import json
 import shutil
+import signal
 import tempfile
 import datetime
 import logging
@@ -67,15 +68,14 @@ run_logger: logging.Logger = None
 
 def _progress_tag() -> str:
     """
-    Compact multi-worker tag, easy to scan when 3–5 workers interleave:
+    Compact multi-worker tag — MUST stay parseable by farm_tui._SLOG_RE.
 
+    Finite:
       W2 3/33 · #70/100 · remW 30 · ✓2 ✗0
-
-    Meaning:
-      W2 3/33     worker 2, account 3 of this worker's share (33)
-      #70/100     global account index / pool total
-      remW 30     remaining on THIS worker (incl. current)
-      ✓2 ✗0       success / fail counts for this worker so far
+    Unlimited (∞):
+      W2 3 · #3 · ✓2 ✗0
+        cur without /share is intentional; TUI accepts both forms.
+        ✓ = success (pass)   ✗ = failed   done = ✓+✗ (accounts finished)
     """
     wid = WORKER_ID or "?"
     cur = _progress_current
@@ -84,18 +84,24 @@ def _progress_tag() -> str:
         local = f"W{wid} {cur}/{wtot}"
         rem_w = max(0, wtot - cur + 1)
     elif cur > 0:
-        local = f"W{wid} #{cur}"
+        # unlimited: "W2 3" so TUI can read cur=3 (not "W2 #3" which broke parsing)
+        local = f"W{wid} {cur}"
         rem_w = None
     else:
         local = f"W{wid}"
         rem_w = wtot if wtot > 0 else None
 
     parts = [local]
-    if POOL_TOTAL > 0 and cur > 0:
-        gidx = POOL_OFFSET + cur
-        parts.append(f"#{gidx}/{POOL_TOTAL}")
+    if cur > 0:
+        gidx = (POOL_OFFSET + cur) if POOL_TOTAL > 0 else cur
+        if POOL_TOTAL > 0:
+            parts.append(f"#{gidx}/{POOL_TOTAL}")
+        else:
+            # unlimited global index (no total)
+            parts.append(f"#{gidx}")
     if rem_w is not None:
         parts.append(f"remW {rem_w}")
+    # success / failed (done is derived as sum in TUI)
     parts.append(f"✓{_progress_ok} ✗{_progress_fail}")
     return " · ".join(parts)
 
@@ -134,23 +140,56 @@ def progress_begin_account(index: int) -> None:
 
 
 def progress_end_account(ok: bool, detail: str = "") -> None:
+    """
+    Close one account attempt and bump counters.
+
+    Semantics (TUI):
+      done     = accounts finished (success + failed) — "berapa acc dibuat/dicoba"
+      success  = ✓ pass (imported / pipeline OK)
+      failed   = ✗ fail (not pass)
+    """
     global _progress_ok, _progress_fail
     elapsed = (time.time() - _account_t0) if _account_t0 else 0
     elapsed_s = f"{elapsed:.0f}s" if elapsed else "?"
     if ok:
         _progress_ok += 1
-        slog("OK", f"done in {elapsed_s}  {detail}".strip())
+        slog(
+            "OK",
+            f"SUCCESS in {elapsed_s}  {detail}".strip()
+            + "  → success+1",
+        )
     else:
         _progress_fail += 1
-        slog("FAIL", f"failed after {elapsed_s}  {detail}".strip(), level="error")
-    # Quick worker scoreboard after each account
+        slog(
+            "FAIL",
+            f"FAILED after {elapsed_s}  {detail}".strip()
+            + "  → failed+1",
+            level="error",
+        )
+    # done = accounts finished (always grows in unlimited)
     wtot = WORKER_TOTAL or 0
     done = _progress_ok + _progress_fail
-    left = max(0, wtot - done) if wtot else "?"
+    if wtot > 0:
+        left = max(0, wtot - done)
+        left_s = f"  left≈{left}/{wtot}"
+        done_s = f"done={done}/{wtot}"
+    else:
+        left_s = "  left=∞"
+        done_s = f"done={done}"
     slog(
         "SCORE",
-        f"worker tally  ✓{_progress_ok}  ✗{_progress_fail}  "
-        f"done {done}" + (f"/{wtot}" if wtot else "") + f"  left≈{left}",
+        f"worker tally  done={done}  success={_progress_ok}  failed={_progress_fail}"
+        f"  ✓{_progress_ok} ✗{_progress_fail}  {done_s}{left_s}",
+    )
+    # Explicit RESULT line for easy grepping / TUI scan
+    slog(
+        "RESULT",
+        ("PASS ✓" if ok else "FAIL ✗")
+        + f"  account#{_progress_current}"
+        + f"  done={done} success={_progress_ok} failed={_progress_fail}"
+        + f"  ✓{_progress_ok}/✗{_progress_fail}"
+        + (f"  {detail}" if detail else ""),
+        level="info" if ok else "error",
     )
 
 
@@ -208,24 +247,189 @@ import socket
 # turnstile extension
 EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
 
-# Browser proxy: env (per-worker pool) overrides config.json
-_browser_proxy = (
-    os.environ.get("GROK_BROWSER_PROXY")
-    or os.environ.get("BROWSER_PROXY")
-    or ""
-).strip()
-if not _browser_proxy:
+# Browser proxy pool — env (pool/TUI) overrides config.json
+#   GROK_PROXIES     = newline-separated full list (per_account rotate)
+#   GROK_BROWSER_PROXY = single sticky proxy (per_worker or legacy)
+#   GROK_PROXY_MODE  = per_account | per_worker
+_browser_proxy = ""
+_proxy_pool: list = []
+_proxy_mode = (os.environ.get("GROK_PROXY_MODE") or "per_account").strip().lower()
+if _proxy_mode in ("rotate", "account"):
+    _proxy_mode = "per_account"
+elif _proxy_mode in ("worker", "sticky"):
+    _proxy_mode = "per_worker"
+
+
+def _init_proxy_pool() -> None:
+    """Load proxy list once (called at import and safe to re-call)."""
+    global _browser_proxy, _proxy_pool, _proxy_mode
     try:
-        import json as _json_mod
-        _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
-        if os.path.isfile(_cfg_path):
-            with open(_cfg_path, "r") as _f:
-                _cfg = _json_mod.load(_f)
-            _browser_proxy = str(_cfg.get("browser_proxy", "") or _cfg.get("proxy", "") or "")
+        from proxy_util import (
+            decode_proxy_env,
+            load_proxy_file,
+            load_proxy_list,
+            mask_proxy,
+            normalize_proxy,
+        )
     except Exception:
-        pass
-if _browser_proxy:
-    print(f"[*] Browser proxy: {_browser_proxy}")
+        decode_proxy_env = None  # type: ignore
+        load_proxy_file = None  # type: ignore
+        load_proxy_list = None  # type: ignore
+        mask_proxy = lambda u: u  # type: ignore
+        normalize_proxy = lambda s: (s or "").strip()  # type: ignore
+
+    pool: list = []
+    env_list = (os.environ.get("GROK_PROXIES") or "").strip()
+    if env_list and decode_proxy_env:
+        pool = decode_proxy_env(env_list)
+    if not pool:
+        single = (
+            os.environ.get("GROK_BROWSER_PROXY")
+            or os.environ.get("BROWSER_PROXY")
+            or ""
+        ).strip()
+        if single:
+            n = normalize_proxy(single)
+            pool = [n] if n else [single]
+    if not pool:
+        try:
+            import json as _json_mod
+
+            _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+            if os.path.isfile(_cfg_path):
+                with open(_cfg_path, "r") as _f:
+                    _cfg = _json_mod.load(_f)
+                pool_cfg = _cfg.get("pool") if isinstance(_cfg.get("pool"), dict) else {}
+                mode = str(pool_cfg.get("proxy_mode") or _proxy_mode).strip().lower()
+                if mode in ("per_account", "rotate", "account"):
+                    _proxy_mode = "per_account"
+                elif mode in ("per_worker", "worker", "sticky"):
+                    _proxy_mode = "per_worker"
+                pf = str(pool_cfg.get("proxy_file") or _cfg.get("proxy_file") or "").strip()
+                if pf and load_proxy_file:
+                    try:
+                        pool = load_proxy_file(pf)
+                    except Exception as e:
+                        print(f"[Warn] proxy_file: {e}")
+                if not pool and load_proxy_list:
+                    pool = load_proxy_list(
+                        pool_cfg.get("proxies") or pool_cfg.get("proxy_list") or []
+                    )
+                if not pool:
+                    single = str(
+                        _cfg.get("browser_proxy", "") or _cfg.get("proxy", "") or ""
+                    ).strip()
+                    if single:
+                        n = normalize_proxy(single)
+                        pool = [n] if n else [single]
+        except Exception:
+            pass
+
+    _proxy_pool = pool
+    if _proxy_mode == "per_worker" and pool:
+        _browser_proxy = pool[0]
+    elif len(pool) == 1:
+        _browser_proxy = pool[0]
+    else:
+        _browser_proxy = ""  # set per account
+
+    if pool:
+        print(
+            f"[*] Proxy pool: {len(pool)}  mode={_proxy_mode}  "
+            f"first={mask_proxy(pool[0]) if pool else '-'}",
+            flush=True,
+        )
+
+
+_init_proxy_pool()
+
+
+def current_proxy_url() -> str:
+    """Active proxy for browser + HTTP (convert/smoke)."""
+    return (_browser_proxy or os.environ.get("GROK_BROWSER_PROXY") or "").strip()
+
+
+def select_proxy_for_account(account_index: int) -> str:
+    """
+    Pick proxy for this account (1-based local index).
+
+    Finite pool: global index = POOL_OFFSET + account_index.
+    Unlimited / no pool total: interleave by worker id so concurrent workers
+    don't both grab proxies[0] on their local account #1.
+    """
+    if not _proxy_pool:
+        return current_proxy_url()
+    try:
+        wid = int(WORKER_ID) if str(WORKER_ID).isdigit() else 1
+    except Exception:
+        wid = 1
+    wid = max(1, wid)
+    if _proxy_mode == "per_worker":
+        return _proxy_pool[(wid - 1) % len(_proxy_pool)]
+    # per_account
+    if POOL_TOTAL > 0 and account_index > 0:
+        gidx = POOL_OFFSET + account_index  # 1-based global
+    else:
+        # ∞ mode: worker-major interleave
+        # W1#1→1, W2#1→2, W1#2→3, W2#2→4, …
+        try:
+            n_workers = int(os.environ.get("GROK_POOL_CONCURRENT") or "1") or 1
+        except Exception:
+            n_workers = 1
+        n_workers = max(1, n_workers)
+        local = max(1, account_index)
+        gidx = (local - 1) * n_workers + wid
+    if gidx <= 0:
+        gidx = 1
+    return _proxy_pool[(gidx - 1) % len(_proxy_pool)]
+
+
+def ensure_browser_proxy_for_account(account_index: int) -> str:
+    """
+    Switch browser to the proxy for this account.
+    Full restart only when proxy URL changes (can't hot-swap).
+    """
+    global _browser_proxy
+    try:
+        from proxy_util import mask_proxy
+    except Exception:
+        mask_proxy = lambda u: (u[:32] + "…") if u and len(u) > 32 else (u or "")  # type: ignore
+
+    nxt = select_proxy_for_account(account_index)
+    prev = _browser_proxy
+    if browser is not None and nxt == prev:
+        slog(
+            "PROXY",
+            f"reuse  #{account_index}  {mask_proxy(nxt) if nxt else '(direct)'}",
+        )
+        return nxt
+
+    _browser_proxy = nxt
+    if nxt:
+        os.environ["GROK_BROWSER_PROXY"] = nxt
+    else:
+        os.environ.pop("GROK_BROWSER_PROXY", None)
+        os.environ.pop("BROWSER_PROXY", None)
+
+    slot = ""
+    if _proxy_pool and nxt in _proxy_pool:
+        slot = f"  slot={_proxy_pool.index(nxt) + 1}/{len(_proxy_pool)}"
+    need_restart = browser is not None and prev != nxt
+    slog(
+        "PROXY",
+        f"account#{account_index} → {mask_proxy(nxt) if nxt else '(direct)'}{slot}"
+        + (
+            "  [full browser restart]"
+            if need_restart
+            else ("  [start]" if browser is None else "  [same]")
+        ),
+    )
+    if browser is None:
+        start_browser()
+    elif prev != nxt:
+        stop_browser()
+        start_browser()
+    return nxt
 
 # Global browser handles — options rebuilt per start_browser() for multi-worker isolation.
 co = None
@@ -233,6 +437,10 @@ _chrome_temp_dir: str = ""
 _chrome_debug_port: int = 0
 browser = None
 page = None
+# Playwright owns Chromium when using native proxy auth (grok-farm style).
+# DrissionPage attaches via CDP existing_only — no local bridge required.
+_pw = None  # Playwright instance
+_pw_context = None  # BrowserContext (persistent) or Browser
 
 # Display mode for Mac multitasking (env / CLI / config):
 #   headed    — normal windows (steals focus on macOS)
@@ -362,16 +570,35 @@ def _worker_port_base() -> int:
     return 9400 + (os.getpid() % 500)
 
 
+def _proxy_driver() -> str:
+    """
+    playwright (default) — same as grok-farm: server + username/password native.
+    bridge — legacy local CONNECT forwarder (flaky on auth.grokipedia.com).
+    """
+    v = (os.environ.get("GROK_PROXY_DRIVER") or "playwright").strip().lower()
+    if v in ("bridge", "local", "legacy"):
+        return "bridge"
+    return "playwright"
+
+
+def _wait_cdp_port(port: int, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            try:
+                s.connect(("127.0.0.1", port))
+                return True
+            except OSError:
+                time.sleep(0.1)
+    return False
+
+
 def build_chromium_options(profile_dir: str, debug_port: int) -> ChromiumOptions:
     """
-    Fresh ChromiumOptions per browser start.
-
-    IMPORTANT: do NOT use co.auto_port() for concurrent workers.
-    DrissionPage PortFinder cleans ~/tmp/DrissionPage/autoPortData and can
-    rmtree another worker's profile if the port check races — that kills worker 1
-    when worker 2 starts. Use explicit set_local_port + unique user-data-dir.
+    Options for DrissionPage when it LAUNCHES Chromium itself (no-proxy path
+    or bridge fallback). Prefer start_browser_playwright_proxy() when auth proxy.
     """
-    # read_file=False → ignore package configs.ini (default address 127.0.0.1:9222)
     opts = ChromiumOptions(read_file=False)
     opts.set_local_port(debug_port)
     opts.set_user_data_path(profile_dir)
@@ -386,16 +613,12 @@ def build_chromium_options(profile_dir: str, debug_port: int) -> ChromiumOptions
 
     mode = (DISPLAY_MODE or "headed").lower()
     if mode == "headless":
-        # True headless — no Dock focus, but Turnstile/captcha harder.
         opts.headless(True)
         opts.set_argument("--window-size", "1280,900")
     elif mode == "offscreen":
-        # Headed engine (better for Turnstile) but park window off-screen.
-        # On macOS still may flash once; we defocus/hide process right after start.
         opts.set_argument("--window-size", "1100,800")
-        # Far off primary display — user won't see it while working.
         opts.set_argument("--window-position", "-32000,-32000")
-        opts.set_argument("--start-maximized", False)  # remove if set
+        opts.set_argument("--start-maximized", False)
     else:
         opts.set_argument("--window-size", "1100,800")
 
@@ -406,14 +629,192 @@ def build_chromium_options(profile_dir: str, debug_port: int) -> ChromiumOptions
         print(
             "[Warn] Playwright Chromium not found. Run: "
             "pip install playwright && playwright install chromium\n"
-            "       Or set GROK_BROWSER_PATH=/path/to/chromium. "
-            "Refusing to use daily Google Chrome unless GROK_ALLOW_SYSTEM_CHROME=1."
+            "       Or set GROK_BROWSER_PATH=/path/to/chromium."
         )
     if os.path.isdir(EXTENSION_PATH):
         opts.add_extension(EXTENSION_PATH)
-    if _browser_proxy:
-        opts.set_proxy(_browser_proxy)
+
+    # Bridge fallback only (legacy). Prefer Playwright native auth.
+    if _browser_proxy and _proxy_driver() == "bridge":
+        try:
+            from proxy_bridge import ensure_local_bridge
+            from proxy_util import mask_proxy, parse_proxy
+        except Exception as e:
+            slog("PROXY", f"bridge import failed: {e}", level="error")
+            parse_proxy = None  # type: ignore
+            ensure_local_bridge = None  # type: ignore
+            mask_proxy = lambda u: u  # type: ignore
+
+        info = parse_proxy(_browser_proxy) if parse_proxy else None
+        if info and info.get("host") and info.get("port") and ensure_local_bridge:
+            if info.get("has_auth"):
+                chrome_server = ensure_local_bridge(
+                    info["host"],
+                    int(info["port"]),
+                    info.get("user") or "",
+                    info.get("password") or "",
+                    scheme=info.get("scheme") or "http",
+                )
+                opts.set_argument("--proxy-server", chrome_server)
+                slog(
+                    "PROXY",
+                    f"LEGACY bridge chrome→{chrome_server} upstream="
+                    f"{info['host']}:{info['port']}  "
+                    f"{mask_proxy(info.get('url') or '')}",
+                    level="warn",
+                )
+            else:
+                server = info.get("chrome_server") or (
+                    f"http://{info['host']}:{info['port']}"
+                )
+                opts.set_argument("--proxy-server", server)
+        elif info and info.get("chrome_server"):
+            opts.set_argument("--proxy-server", info["chrome_server"])
     return opts
+
+
+def start_browser_playwright_proxy(profile_dir: str, debug_port: int) -> bool:
+    """
+    Launch Chromium via Playwright with native proxy auth (grok-farm style),
+    then attach DrissionPage over CDP.
+
+    Returns True if browser+page ready, False to fall back to DrissionPage launch.
+    """
+    global browser, page, co, _pw, _pw_context
+
+    if not _browser_proxy:
+        return False
+
+    try:
+        from playwright.sync_api import sync_playwright
+        from proxy_util import mask_proxy, playwright_proxy_dict
+    except Exception as e:
+        slog("PROXY", f"playwright unavailable ({e}) — fallback", level="warn")
+        return False
+
+    proxy_cfg = playwright_proxy_dict(_browser_proxy)
+    if not proxy_cfg:
+        return False
+
+    browser_path = _resolve_browser_path()
+    if not browser_path:
+        slog("PROXY", "no chromium binary for playwright launch", level="warn")
+        return False
+
+    mode = (DISPLAY_MODE or "headed").lower()
+    headless = mode == "headless"
+    # Extensions need non-headless on most Chromium builds
+    if os.path.isdir(EXTENSION_PATH) and headless:
+        slog(
+            "PROXY",
+            "turnstile extension needs headed/offscreen — using headless=False",
+            level="warn",
+        )
+        headless = False
+
+    args = [
+        f"--remote-debugging-port={debug_port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-popup-blocking",
+    ]
+    if mode == "offscreen":
+        args.extend(
+            [
+                "--window-size=1100,800",
+                "--window-position=-32000,-32000",
+            ]
+        )
+    elif mode == "headless":
+        args.append("--window-size=1280,900")
+    else:
+        args.append("--window-size=1100,800")
+
+    if os.path.isdir(EXTENSION_PATH):
+        # load turnstile patch (same as DrissionPage add_extension)
+        args.append(f"--disable-extensions-except={EXTENSION_PATH}")
+        args.append(f"--load-extension={EXTENSION_PATH}")
+
+    slog(
+        "PROXY",
+        f"playwright native auth  server={proxy_cfg.get('server')}  "
+        f"user={proxy_cfg.get('username', '')[:6]}***  "
+        f"full={mask_proxy(_browser_proxy)}  "
+        f"(same pattern as grok-farm Camoufox/Playwright)",
+    )
+
+    try:
+        _pw = sync_playwright().start()
+        # persistent context so profile + extensions work
+        _pw_context = _pw.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            executable_path=browser_path,
+            headless=headless,
+            proxy=proxy_cfg,
+            args=args,
+            ignore_default_args=["--enable-automation"],
+            viewport={"width": 1100, "height": 800},
+            locale="en-US",
+        )
+    except Exception as e:
+        slog("PROXY", f"playwright launch failed: {e}", level="error")
+        try:
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+        _pw_context = None
+        return False
+
+    if not _wait_cdp_port(debug_port, timeout=20.0):
+        slog("PROXY", f"CDP port {debug_port} not open after playwright launch", level="error")
+        try:
+            if _pw_context:
+                _pw_context.close()
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+        _pw_context = None
+        return False
+
+    # Attach DrissionPage to Playwright-owned Chromium (do not re-launch)
+    opts = ChromiumOptions(read_file=False)
+    opts.set_address(f"127.0.0.1:{debug_port}")
+    opts.existing_only(True)
+    opts.set_timeouts(base=1)
+    co = opts
+    try:
+        browser = Chromium(opts)
+        # Prefer an open tab
+        try:
+            tabs = list(browser.get_tabs() or [])
+            page = tabs[-1] if tabs else browser.latest_tab
+        except Exception:
+            page = browser.latest_tab
+        if page is None:
+            page = browser.new_tab("about:blank")
+    except Exception as e:
+        slog("PROXY", f"DrissionPage attach failed: {e}", level="error")
+        try:
+            if _pw_context:
+                _pw_context.close()
+            if _pw:
+                _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+        _pw_context = None
+        browser = None
+        page = None
+        return False
+
+    slog("PROXY", f"attached DrissionPage → CDP 127.0.0.1:{debug_port} OK")
+    return True
 
 
 _window_policy_logged = False
@@ -422,13 +823,19 @@ _window_policy_logged = False
 def _apply_window_policy(quiet: bool = True):
     """
     Keep the farm window out of the way for the whole process lifetime.
-    - offscreen: minimize + park far off-screen (CDP only; never hide Google Chrome)
-    Re-call after navigations / soft reset so OS focus steals get undone.
+    - offscreen Chromium: minimize via CDP
+    - Camoufox/Firefox: no CDP window API — skip quietly
     """
     global _window_policy_logged
     if DISPLAY_MODE != "offscreen":
         return
     if browser is None or page is None:
+        return
+    # Camoufox (Firefox) has no Chrome CDP Browser.setWindowBounds
+    if _is_pw_adapter_browser() and _resolve_browser_engine() == "camoufox":
+        if not quiet and not _window_policy_logged:
+            print("[*] Camoufox offscreen: window park skipped (no CDP bounds API)")
+            _window_policy_logged = True
         return
     try:
         if not hasattr(page, "run_cdp"):
@@ -437,7 +844,6 @@ def _apply_window_policy(quiet: bool = True):
         window_id = win.get("windowId") if isinstance(win, dict) else None
         if window_id is None:
             return
-        # minimized stays in Dock and should not pop to foreground on every nav
         page.run_cdp(
             "Browser.setWindowBounds",
             windowId=window_id,
@@ -457,20 +863,74 @@ def _apply_window_policy(quiet: bool = True):
             print(f"[Warn] window policy failed: {e}")
 
 
+def _resolve_browser_engine() -> str:
+    """chromium (default) | camoufox — from env or config.json browser.engine."""
+    env = (os.environ.get("GROK_BROWSER_ENGINE") or "").strip().lower()
+    if env in ("camoufox", "fox", "firefox", "cf", "chromium", "chrome", "pw"):
+        return "camoufox" if env in ("camoufox", "fox", "firefox", "cf") else "chromium"
+    try:
+        conf = _load_config()
+        b = conf.get("browser") if isinstance(conf.get("browser"), dict) else {}
+        v = str(b.get("engine") or "").strip().lower()
+        if v in ("camoufox", "fox", "firefox", "cf"):
+            return "camoufox"
+    except Exception:
+        pass
+    return "chromium"
+
+
 def start_browser():
-    # One Playwright Chromium process per worker: unique profile + CDP port.
+    # Engine: chromium (Playwright native proxy + Drission attach) or camoufox.
     global browser, page, _chrome_temp_dir, _chrome_debug_port, co, _window_policy_logged
+    global _pw, _pw_context
     wid = WORKER_ID or os.environ.get("GROK_WORKER_ID") or str(os.getpid())
+    engine = _resolve_browser_engine()
+    os.environ["GROK_BROWSER_ENGINE"] = engine
+
+    # ── Camoufox path (flash-grok-farm style) ───────────────────────
+    if engine == "camoufox":
+        try:
+            from browser_engine import launch_camoufox_session
+
+            slog(
+                "BROWSER",
+                f"engine=camoufox  proxy={_browser_proxy and 'yes' or 'direct'}  "
+                f"display={DISPLAY_MODE}",
+            )
+            sess = launch_camoufox_session(
+                proxy=_browser_proxy or "",
+                display=DISPLAY_MODE,
+            )
+            # Adapter: DrissionPage-compatible browser/page API over Camoufox
+            _pw_context = sess  # type: ignore[assignment]
+            adapter = sess.extra.get("browser_adapter")
+            browser = adapter
+            page = adapter.latest_tab if adapter else sess.page
+            _chrome_temp_dir = ""
+            _chrome_debug_port = 0
+            slog(
+                "BROWSER",
+                "camoufox ready (Playwright API + Drission-compatible adapter)",
+            )
+            return
+        except Exception as e:
+            slog(
+                "BROWSER",
+                f"camoufox failed ({e}) — fallback chromium",
+                level="warn",
+            )
+            engine = "chromium"
+            os.environ["GROK_BROWSER_ENGINE"] = "chromium"
+
     _chrome_temp_dir = tempfile.mkdtemp(prefix=f"grok_pw_w{wid}_")
     _chrome_debug_port = _pick_free_port(_worker_port_base())
-    co = build_chromium_options(_chrome_temp_dir, _chrome_debug_port)
     browser_path = _resolve_browser_path()
     binary_label = browser_path or "(DrissionPage default — install Playwright Chromium!)"
     if browser_path and "Google Chrome.app" in browser_path and "Testing" not in browser_path:
         print("[Warn] Using Google Chrome.app — may affect your daily browser. Prefer Playwright Chromium.")
     print(
         f"[*] Browser start worker={wid} port={_chrome_debug_port} "
-        f"display={DISPLAY_MODE}\n"
+        f"engine={engine} display={DISPLAY_MODE} proxy_driver={_proxy_driver()}\n"
         f"    binary={binary_label}\n"
         f"    profile={_chrome_temp_dir}"
     )
@@ -481,6 +941,22 @@ def start_browser():
             "Or set GROK_BROWSER_PATH to a Chromium / Chrome for Testing binary."
         )
     _window_policy_logged = False
+
+    # ── Authenticated proxy → Playwright native (like grok-farm) ──
+    if _browser_proxy and _proxy_driver() == "playwright":
+        if start_browser_playwright_proxy(_chrome_temp_dir, _chrome_debug_port):
+            page = page or browser.latest_tab
+            _apply_window_policy(quiet=False)
+            return
+        slog(
+            "PROXY",
+            "playwright path failed — falling back to DrissionPage "
+            f"({'bridge' if _proxy_driver() == 'bridge' else 'direct launch'})",
+            level="warn",
+        )
+
+    # ── No proxy / bridge fallback: DrissionPage launches Chromium ──
+    co = build_chromium_options(_chrome_temp_dir, _chrome_debug_port)
     browser = Chromium(co)
     tabs = browser.get_tabs()
     page = tabs[-1] if tabs else browser.new_tab()
@@ -492,19 +968,62 @@ def start_browser():
 def stop_browser():
     # Full quit + cleanup temp profile for this worker only.
     global browser, page, _chrome_temp_dir, _chrome_debug_port, co, _window_policy_logged
-    if browser is not None:
+    global _pw, _pw_context
+    # Camoufox BrowserSession stored in _pw_context
+    if _pw_context is not None and hasattr(_pw_context, "close") and hasattr(_pw_context, "engine"):
         try:
-            browser.quit()
+            _pw_context.close()
         except Exception:
             pass
-    browser = None
-    page = None
-    co = None
+        _pw_context = None
+        browser = None
+        page = None
+        co = None
+    else:
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+        browser = None
+        page = None
+        co = None
+        if _pw_context is not None:
+            try:
+                _pw_context.close()
+            except Exception:
+                pass
+            _pw_context = None
+        if _pw is not None:
+            try:
+                _pw.stop()
+            except Exception:
+                pass
+            _pw = None
     if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
         shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
     _chrome_temp_dir = ""
     _chrome_debug_port = 0
     _window_policy_logged = False
+    try:
+        from proxy_bridge import stop_local_bridge
+
+        stop_local_bridge()
+    except Exception:
+        pass
+
+
+def _is_pw_adapter_browser() -> bool:
+    """Camoufox / Playwright adapter (not DrissionPage Chromium)."""
+    return browser is not None and (
+        hasattr(browser, "_async")
+        or type(browser).__name__ == "PwBrowserAdapter"
+        or (
+            _pw_context is not None
+            and hasattr(_pw_context, "engine")
+            and getattr(_pw_context, "engine", "") in ("camoufox", "chromium")
+        )
+    )
 
 
 def soft_reset_browser():
@@ -517,6 +1036,25 @@ def soft_reset_browser():
         start_browser()
         return
     try:
+        if _is_pw_adapter_browser():
+            # Playwright/Camoufox: clear cookies + blank tab (no Drission get_tabs)
+            try:
+                page.clear_cache(session_storage=True, cookies=True)
+            except Exception:
+                pass
+            try:
+                page.run_js(
+                    "try{localStorage.clear();sessionStorage.clear();}catch(e){}"
+                )
+            except Exception:
+                pass
+            try:
+                page.get("about:blank")
+            except Exception:
+                page = browser.new_tab("about:blank")
+            print("[*] Soft reset camoufox/playwright (same process)")
+            return
+
         tabs = list(browser.get_tabs() or [])
         # Keep one tab, close the rest
         if tabs:
@@ -565,6 +1103,7 @@ def restart_browser(force_full: bool = False):
     """
     Default: soft reset (reuse process). Full relaunch only when force_full=True
     or soft path cannot recover.
+    Camoufox: soft reset preferred; full only when forced / dead.
     """
     if force_full or browser is None:
         stop_browser()
@@ -578,7 +1117,13 @@ def refresh_active_page():
     global browser, page
     if browser is None:
         start_browser()
+        return page
     try:
+        if _is_pw_adapter_browser():
+            # Keep current page handle; Camoufox navigations stay on same page
+            if page is None:
+                page = browser.new_tab("about:blank")
+            return page
         tabs = browser.get_tabs()
         if tabs:
             page = tabs[-1]
@@ -594,11 +1139,25 @@ def open_signup_page():
     # Open signup page and switch to email registration flow.
     global page
     refresh_active_page()
+    # Camoufox: flash-native open (get_by_role Sign up with email)
+    if _is_pw_adapter_browser():
+        try:
+            from camoufox_signup import sync_open_signup
+
+            sync_open_signup(page, log=lambda m: slog("EMAIL", m))
+            _apply_window_policy(quiet=True)
+            return
+        except Exception as e:
+            slog("EMAIL", f"camoufox open signup warn: {e} — fallback", level="warn")
     try:
         page.get(SIGNUP_URL)
-    except Exception:
+    except Exception as e:
+        slog("BROWSER", f"goto signup failed ({e}); new tab", level="warn")
         refresh_active_page()
-        page = browser.new_tab(SIGNUP_URL)
+        try:
+            page = browser.new_tab(SIGNUP_URL)
+        except Exception as e2:
+            raise RuntimeError(f"open signup failed: {e2}") from e2
     _apply_window_policy(quiet=True)
     click_email_signup_button()
     _apply_window_policy(quiet=True)
@@ -653,12 +1212,33 @@ return true;
 
 
 def fill_email_and_submit(timeout=15):
-    # Create catch-all email via email_register; keep token for OTP step.
-    slog("EMAIL", "generating catch-all alias…")
-    email, dev_token = get_email_and_token()
+    # Create humanized catch-all email; keep token for OTP step.
+    slog("EMAIL", "generating humanized catch-all alias…")
+    _pre_given, _pre_family = "", ""
+    try:
+        from human_email import load_name_pairs, pick_names
+
+        pairs = load_name_pairs()
+        if pairs:
+            _pre_given, _pre_family = pick_names(pairs)
+    except Exception:
+        pass
+    email, dev_token = get_email_and_token(given=_pre_given, family=_pre_family)
     if not email or not dev_token:
         raise Exception("Failed to create email")
     slog("EMAIL", f"alias={email}")
+
+    # Camoufox: flash-native fill + Sign up click
+    if _is_pw_adapter_browser():
+        try:
+            from camoufox_signup import sync_fill_email
+
+            sync_fill_email(page, email, log=lambda m: slog("EMAIL", m))
+            slog("EMAIL", f"submitted sign-up form for {email}")
+            return email, dev_token
+        except Exception as e:
+            slog("EMAIL", f"camoufox fill email failed: {e}", level="error")
+            raise
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -790,6 +1370,22 @@ def fill_code_and_submit(email, dev_token, timeout=60):
     if not code:
         raise Exception("Failed to get verification code")
     slog("OTP", f"got code={code} — filling…")
+
+    # Camoufox: keyboard/slot fill (flash) — avoid React-breaking JS
+    if _is_pw_adapter_browser():
+        try:
+            from camoufox_signup import sync_fill_otp
+
+            ok = sync_fill_otp(page, code, log=lambda m: slog("OTP", m))
+            if ok:
+                slog("OTP", "confirmed (camoufox native)")
+                return
+            # if already on profile form
+            if has_profile_form():
+                slog("OTP", "already on final signup; skip OTP confirm")
+                return
+        except Exception as e:
+            slog("OTP", f"camoufox OTP warn: {e} — fallback JS", level="warn")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1565,15 +2161,38 @@ def fill_profile_and_submit(timeout=75):
     """
     Final signup form: name + password + Turnstile + Complete sign up.
 
-    Design (learned from flaky runs):
-      - Fill fields ONCE (re-fill thrashing kills React state)
-      - NEVER turnstile.reset() unless totally stuck
-      - Dismiss cookie banner first
-      - Prefer real mouse click over form.requestSubmit spam
-      - Only re-click on retry; verify we actually leave the form
+    Camoufox: flash-native path (get_by_role Complete, wait /account).
+    Chromium/Drission: original mouse/JS strategies.
     """
     given_name, family_name, password = build_profile()
     slog("PROFILE", f"fill form  name={given_name} {family_name}")
+
+    # ── Camoufox / Playwright native (flash-grok-farm) ──
+    if _is_pw_adapter_browser():
+        try:
+            from camoufox_signup import sync_profile_complete
+
+            ok = sync_profile_complete(
+                page,
+                given_name,
+                family_name,
+                password,
+                log=lambda m: slog("PROFILE", m),
+                timeout=float(timeout),
+            )
+            if ok:
+                slog("SUBMIT", f"camoufox complete OK url={getattr(page, 'url', '')[:100]}")
+                _wait_post_register_settle(timeout=20)
+                return {
+                    "given_name": given_name,
+                    "family_name": family_name,
+                    "password": password,
+                }
+            raise RuntimeError("camoufox complete_signup did not reach /account")
+        except Exception as e:
+            slog("PROFILE", f"camoufox profile/complete failed: {e}", level="error")
+            raise
+
     deadline = time.time() + timeout
     fields_filled = False
     turnstile_ready = False
@@ -1581,8 +2200,6 @@ def fill_profile_and_submit(timeout=75):
     click_attempts = 0
     last_heartbeat = 0.0
     cookie_dismissed = False
-
-    # Strategy rotation for clicks
     strategies = ["mouse", "mouse", "js", "actions_via_mouse", "form"]
 
     while time.time() < deadline:
@@ -1722,6 +2339,41 @@ def fill_profile_and_submit(timeout=75):
 
         if left:
             slog("SUBMIT", "left profile form ✓")
+            # Flash-style: detect bounce back to signup chooser (not real success)
+            try:
+                cur = str(getattr(page, "url", "") or "")
+            except Exception:
+                cur = ""
+            bounced = False
+            try:
+                bounce = page.run_js(
+                    r"""
+const t = ((document.body && document.body.innerText) || '').toLowerCase();
+return t.includes('sign up with email') || t.includes('create your account')
+  || (t.includes('sign up') && t.includes('log in') && !t.includes('complete sign'));
+                    """
+                )
+                bounced = bool(bounce) and ("sign-up" in cur or "signup" in cur)
+            except Exception:
+                bounced = "sign-up" in cur and "account" not in cur
+            if bounced:
+                slog(
+                    "SUBMIT",
+                    f"bounce to signup chooser after Complete (url={cur[:100]}) — retry",
+                    level="warn",
+                )
+                time.sleep(1.0)
+                fields_filled = False
+                turnstile_ready = False
+                continue
+            # Prefer navigate to /account to settle session (flash waits for /account URL)
+            try:
+                if "sign-up" in cur or not cur:
+                    slog("SUBMIT", "navigate accounts.x.ai/account to settle…")
+                    page.get("https://accounts.x.ai/account")
+                    time.sleep(1.5)
+            except Exception as e:
+                slog("SUBMIT", f"account nav warn: {e}", level="warn")
             _wait_post_register_settle(timeout=25)
             return {
                 "given_name": given_name,
@@ -1868,12 +2520,53 @@ _GROK_CF_NAMES = ("cf_clearance", "__cf_bm", "cf_chl_rc_i", "cf_chl_2", "cf_chl_
 
 
 def _iter_browser_cookies():
-    """Yield (name, value, domain) from all domains."""
+    """Yield (name, value, domain) from all domains (DrissionPage or Playwright/Camoufox)."""
     refresh_active_page()
     if page is None:
         return
-    cookies = page.cookies(all_domains=True, all_info=True) or []
-    for item in cookies:
+
+    cookies = []
+    # 1) DrissionPage / adapter with cookies()
+    try:
+        if hasattr(page, "cookies"):
+            cookies = page.cookies(all_domains=True, all_info=True) or []
+    except TypeError:
+        try:
+            cookies = page.cookies() or []
+        except Exception:
+            cookies = []
+    except Exception:
+        cookies = []
+
+    # 2) Playwright raw page / context
+    if not cookies:
+        try:
+            raw = getattr(page, "raw", None) or page
+            ctx = getattr(raw, "context", None)
+            if ctx is not None:
+                if _is_pw_adapter_browser() and hasattr(page, "_async") and page._async:
+                    cookies = page._run(ctx.cookies())  # type: ignore[attr-defined]
+                else:
+                    cookies = ctx.cookies() or []
+        except Exception:
+            cookies = []
+
+    # 3) Browser-level context (Camoufox session)
+    if not cookies and browser is not None:
+        try:
+            # PwBrowserAdapter → underlying browser.contexts[0]
+            if hasattr(browser, "_browser"):
+                b = browser._browser
+                if getattr(b, "contexts", None):
+                    ctx = b.contexts[0]
+                    if _is_pw_adapter_browser() and hasattr(browser, "_async") and browser._async:
+                        cookies = browser._run(ctx.cookies())  # type: ignore[attr-defined]
+                    else:
+                        cookies = ctx.cookies() or []
+        except Exception:
+            cookies = []
+
+    for item in cookies or []:
         if isinstance(item, dict):
             name = str(item.get("name", "")).strip()
             value = str(item.get("value", "")).strip()
@@ -2031,6 +2724,8 @@ def wait_for_sso_cookie(timeout=90):
     sso_ready_at = None
     visited_grok = False
     last_url = ""
+    nudged_account = False
+    poll_ticks = 0
 
     while time.time() < deadline:
         try:
@@ -2047,7 +2742,11 @@ def wait_for_sso_cookie(timeout=90):
                 slog("SSO", f"url={cur[:140]}")
                 last_url = cur
 
-            wanted, names_seen = _collect_grok_session_cookies()
+            try:
+                wanted, names_seen = _collect_grok_session_cookies()
+            except Exception as e:
+                slog("SSO", f"cookie read warn: {e}", level="warn")
+                wanted, names_seen = {}, set()
             last_seen_names |= names_seen
             has_sso = bool(wanted.get("sso"))
 
@@ -2058,12 +2757,26 @@ def wait_for_sso_cookie(timeout=90):
                     phase = "settle"
                     sso_ready_at = time.time()
                 else:
-                    # Kalau natural redirect ke grok.com, lanjut collect di sana
+                    # Kalau natural redirect ke grok.com / account page
                     if "grok.com" in cur:
                         slog("SSO", "natural redirect → grok.com")
                         phase = "settle"
                         visited_grok = True
                         sso_ready_at = time.time()
+                    elif "/account" in cur and "sign-up" not in cur:
+                        slog("SSO", "on accounts.x.ai/account — poll cookies")
+                        # try soft nav once if still no sso after a few seconds
+                    elif "sign-up" in cur:
+                        # Still on signup after Complete — nudge to /account once
+                        poll_ticks += 1
+                        if not nudged_account and poll_ticks >= 5:
+                            nudged_account = True
+                            try:
+                                slog("SSO", "still on sign-up — open /account")
+                                page.get("https://accounts.x.ai/account")
+                                time.sleep(2)
+                            except Exception as e:
+                                slog("SSO", f"account nudge warn: {e}", level="warn")
                     time.sleep(1)
                     continue
 
@@ -2579,39 +3292,68 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         f"pass={profile.get('password','')}",
     )
 
-    # Primary path: SSO → Device OAuth Build → 9router grok-cli
+    # Primary: settle → PKCE/device → chat usable → push 9router
+    # ANY failure here must raise so main() counts FAIL (not OK).
     try:
-        slog("FLOW", "⑥ convert SSO → Build OAuth → 9router")
+        slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
         convert_and_push_grok_cli(result)
         slog("PUSH", "9router import OK")
     except Exception as e:
-        slog("PUSH", f"convert/push failed: {e}", level="error")
+        err = str(e)
+        el = err.lower()
+        if "denied" in el or "probe" in el or "usable" in el or "smoke" in el:
+            phase = "PROBE"
+        elif "jwt gate" in el or "bot_flag" in el:
+            phase = "CONVERT"
+        elif (
+            "convert" in el
+            or "sso" in el
+            or "device" in el
+            or "token" in el
+            or "oauth" in el
+            or "pkce" in el
+            or "proxy" in el
+            or "accounts.x.ai" in el
+            or "auth.x.ai" in el
+        ):
+            phase = "CONVERT"
+        else:
+            phase = "PUSH"
+        slog(phase, f"FAILED: {e}", level="error")
+        slog(
+            "FAIL",
+            f"pipeline stop at {phase}  email={email}  "
+            f"(will count as ✗ — not imported)",
+            level="error",
+        )
+        raise RuntimeError(f"{phase}: {e}") from e
 
-    # Optional: grok2api Web pool (off by default)
+    # Optional side paths — non-fatal (don't flip PASS→FAIL)
     try:
         push_sso_to_grok2api([result])
     except Exception as e:
-        slog("PUSH", f"grok2api failed: {e}", level="warn")
+        slog("PUSH", f"grok2api failed (non-fatal): {e}", level="warn")
 
-    # Optional: 9router grok-web cookie import (off by default)
     try:
         push_sso_to_9router([result])
     except Exception as e:
-        slog("PUSH", f"grok-web failed: {e}", level="warn")
+        slog("PUSH", f"grok-web failed (non-fatal): {e}", level="warn")
 
-    slog("DONE", f"account complete  email={email}")
+    slog("DONE", f"SUCCESS account complete  email={email}  (imported to 9router)")
     return result
 
 
 def convert_and_push_grok_cli(result: dict) -> None:
     """
-    Path A: pure HTTP convert Web SSO → Build OAuth, then push to 9router grok-cli
-    via POST /api/oauth/grok-cli/import-token (NOT raw SQLite — UI won't see DB-only writes).
+    Build OAuth → chat usable probe → 9router grok-cli.
 
-    Config (config.json → grok_cli):
-      enabled: true
-      base_url: "http://127.0.0.1:20127"
-      data_dir: "~/.9router"
+    Default (flash path): browser PKCE with referrer=grok-build on the same
+    session as signup. Fallback: HTTP device convert from SSO cookie.
+
+    inject_policy:
+      usable  — only push if chat probe USABLE (default; fights 403)
+      all     — push if tokens ok (legacy)
+      jwt_clean — hard reject bot_flag (optional)
     """
     conf = _load_config()
     gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
@@ -2620,32 +3362,197 @@ def convert_and_push_grok_cli(result: dict) -> None:
         return
 
     from push_9router_grok_cli import push_build_tokens_to_9router
-    from sso_to_build import convert_sso_to_build
 
     email = str(result.get("email") or "").strip()
-    # Human name for displayName (matches manual OAuth cards like "Neo Lin")
     given = str(result.get("given_name") or "").strip()
     family = str(result.get("family_name") or "").strip()
     display = f"{given} {family}".strip()
+    px = current_proxy_url()
 
-    slog("CONVERT", f"Web SSO -> Build OAuth (email={email or '-'})")
-    tokens = convert_sso_to_build(result, name_hint=email)
+    oauth_mode = str(gcli.get("oauth_mode") or "pkce").strip().lower()
+    referrer = str(gcli.get("oauth_referrer") or "grok-build").strip() or "grok-build"
+    try:
+        settle_s = float(gcli.get("post_signup_settle_sec") or 12)
+    except (TypeError, ValueError):
+        settle_s = 12.0
+    inject_policy = str(gcli.get("inject_policy") or "usable").strip().lower()
+    if inject_policy in ("jwt", "clean"):
+        inject_policy = "jwt_clean"
+    reject_bot = bool(gcli.get("jwt_reject_bot_flag") or inject_policy == "jwt_clean")
+    enforce_ref = gcli.get("jwt_enforce_referrer")
+    if enforce_ref is None:
+        enforce_ref = True
+    probe_model = str(gcli.get("chat_probe_model") or gcli.get("smoke_model") or "grok-4.5").strip()
+
+    # ── SETTLE (hygiene before OAuth — flash anti-bot) ──────────────
+    if settle_s > 0:
+        slog("SETTLE", f"post-signup idle {settle_s:.0f}s before OAuth (bot hygiene)")
+        time.sleep(settle_s)
+        slog("SETTLE", "done")
+
+    # ── PHASE: CONVERT (PKCE browser preferred) ─────────────────────
+    tokens = None
+    if oauth_mode in ("pkce", "browser", "oidc", "grok-build"):
+        slog(
+            "CONVERT",
+            f"browser PKCE referrer={referrer} email={email or '-'} "
+            f"(flash path — same session as signup)",
+        )
+        try:
+            from build_oauth_pkce import (
+                jwt_gate_decision,
+                obtain_tokens_via_browser_pkce,
+            )
+
+            # Prefer active page (Chromium Drission / Playwright attach)
+            oauth_page = page
+            if oauth_page is None:
+                raise RuntimeError("no browser page for PKCE")
+            tokens = obtain_tokens_via_browser_pkce(
+                oauth_page,
+                email=email,
+                referrer=referrer,
+                timeout_sec=float(gcli.get("oauth_timeout_sec") or 90),
+                proxy=px,
+                log=lambda m: slog("CONVERT", m),
+            )
+        except Exception as e:
+            slog(
+                "CONVERT",
+                f"PKCE browser failed ({e}) — fallback device SSO convert",
+                level="warn",
+            )
+            tokens = None
+
+    if tokens is None:
+        slog("CONVERT", f"Web SSO → Device OAuth (fallback) email={email or '-'}")
+        from sso_to_build import convert_sso_to_build
+
+        tokens = convert_sso_to_build(result, name_hint=email)
+
+    # Normalize token object for push (BuildTokens from either module)
+    access = getattr(tokens, "access_token", "") or ""
+    refresh = getattr(tokens, "refresh_token", "") or ""
+    tok_email = getattr(tokens, "email", "") or email
+    tok_uid = getattr(tokens, "user_id", "") or ""
+    bot_flag = getattr(tokens, "bot_flag_source", None)
+    tok_ref = getattr(tokens, "referrer", "") or ""
+    slog(
+        "CONVERT",
+        f"tokens OK  email={tok_email or '-'}  user_id={tok_uid or '-'}  "
+        f"bot_flag={bot_flag!r}  referrer={tok_ref!r}  "
+        f"mode={getattr(tokens, 'auth_mode', '?')}",
+    )
+
+    # JWT gate (soft bot by default; hard referrer=grok-build)
+    try:
+        from build_oauth_pkce import jwt_gate_decision, BuildTokens as PkceTokens
+
+        if not isinstance(tokens, PkceTokens):
+            # wrap device tokens for gate
+            gate_tokens = PkceTokens(
+                access_token=access,
+                refresh_token=refresh,
+                email=tok_email,
+                user_id=tok_uid,
+                bot_flag_source=bot_flag,
+                referrer=tok_ref,
+            )
+        else:
+            gate_tokens = tokens
+        # Only hard-enforce referrer when we actually minted via browser PKCE
+        is_pkce = (
+            getattr(tokens, "auth_mode", "") == "oidc_pkce"
+            or bool(getattr(tokens, "referrer", "") or tok_ref)
+        )
+        gate = jwt_gate_decision(
+            gate_tokens,
+            reject_bot_flag=reject_bot,
+            require_referrer=referrer,
+            enforce_referrer=bool(enforce_ref) and is_pkce,
+        )
+        if not gate.get("ok"):
+            slog("CONVERT", f"JWT gate FAIL: {gate.get('reason')}", level="error")
+            raise RuntimeError(f"JWT gate: {gate.get('reason')}")
+        slog(
+            "CONVERT",
+            f"JWT gate OK bot={gate.get('bot_flag_source')!r} ref={gate.get('referrer')!r}",
+        )
+    except ImportError:
+        pass
+
+    # ── PHASE: CHAT USABLE (truth for 403 — flash inject_policy=usable) ──
+    usable_info = None
+    if inject_policy == "usable":
+        from chat_usable import probe_chat_usable
+
+        slog("PROBE", f"chat usable model={probe_model} email={tok_email or '-'}")
+        usable_info = probe_chat_usable(
+            access,
+            email=tok_email,
+            model=probe_model,
+            proxy=px,
+            timeout=float(gcli.get("smoke_timeout_sec") or 45),
+        )
+        if not usable_info.get("usable") and px:
+            slog("PROBE", "proxy path failed/denied — retry DIRECT", level="warn")
+            usable_info = probe_chat_usable(
+                access,
+                email=tok_email,
+                model=probe_model,
+                proxy="",
+                timeout=float(gcli.get("smoke_timeout_sec") or 45),
+            )
+        result["chat_probe"] = usable_info
+        if usable_info.get("usable"):
+            slog(
+                "PROBE",
+                f"USABLE  status={usable_info.get('status')}  "
+                f"latency_ms={usable_info.get('latency_ms')}  "
+                f"reply={str(usable_info.get('reply') or '')[:40]}",
+            )
+        else:
+            slog(
+                "PROBE",
+                f"DENIED  status={usable_info.get('status')}  "
+                f"err={usable_info.get('err')}  "
+                f"(will NOT inject — policy=usable)",
+                level="error",
+            )
+            raise RuntimeError(
+                f"chat DENIED status={usable_info.get('status')} "
+                f"email={tok_email} err={usable_info.get('err')}"
+            )
+    else:
+        # legacy smoke only when bot-flagged
+        slog("PROBE", f"inject_policy={inject_policy} — skip hard usable gate")
+
+    # ── PHASE: PUSH ─────────────────────────────────────────────────
+    slog("PUSH", f"import grok-cli → 9router  email={tok_email or '-'}")
     push_build_tokens_to_9router(
         tokens,
         base_url=str(gcli.get("base_url") or "http://127.0.0.1:20127"),
         data_dir=str(gcli.get("data_dir") or "~/.9router"),
-        # Dashboard password login (Gsuiteto9router style) — works for https://ai.khalid.id
         password=str(gcli.get("password") or gcli.get("dashboard_password") or ""),
         cli_token=str(gcli.get("cli_token") or ""),
-        name=email or tokens.name,
-        email=email or tokens.email,
-        display_name=display or tokens.name,
+        name=email or getattr(tokens, "name", "") or tok_email,
+        email=tok_email,
+        display_name=display or getattr(tokens, "name", "") or tok_email,
+        # already probed usable — never skip import on JWT bot alone
+        smoke_bot_flag=False,
+        smoke_model=probe_model,
+        smoke_timeout_sec=float(gcli.get("smoke_timeout_sec") or 45),
     )
-    result["build_access_token"] = tokens.access_token
-    result["build_refresh_token"] = tokens.refresh_token
-    result["build_email"] = tokens.email
-    result["build_user_id"] = tokens.user_id
-    slog("CONVERT", f"grok-cli ready email={tokens.email or email} user_id={tokens.user_id or '-'}")
+    result["build_access_token"] = access
+    result["build_refresh_token"] = refresh
+    result["build_email"] = tok_email
+    result["build_user_id"] = tok_uid
+    result["bot_flag_source"] = bot_flag
+    result["oauth_referrer"] = tok_ref
+    slog(
+        "PUSH",
+        f"grok-cli ready  email={tok_email}  user_id={tok_uid or '-'}",
+    )
 
 
 def load_run_count() -> int:
@@ -2797,8 +3704,11 @@ def main():
     current_round = 0
     collected_sso: list = []
     try:
-        slog("BROWSER", "starting Chromium…")
-        start_browser()  # single process for all rounds
+        slog(
+            "BROWSER",
+            f"proxy_mode={_proxy_mode}  pool={len(_proxy_pool)}  "
+            f"(per_account → full Chromium restart when proxy changes)",
+        )
         while True:
             if args.count > 0 and current_round >= args.count:
                 break
@@ -2806,6 +3716,9 @@ def main():
             current_round += 1
             progress_begin_account(current_round)
             hard_fail = False
+
+            # 1 proxy per account (or sticky per_worker) — restarts browser if needed
+            ensure_browser_proxy_for_account(current_round)
 
             try:
                 result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
@@ -2826,17 +3739,36 @@ def main():
                         "browser has been closed",
                         "no such",
                         "crash",
+                        "proxy",
+                        "err_proxy",
+                        "tunnel",
                     )
                 )
             finally:
                 if args.count == 0 or current_round < args.count:
-                    slog(
-                        "BROWSER",
-                        "soft-reset → next account"
-                        if not hard_fail
-                        else "FULL restart (browser unhealthy)",
-                    )
-                    restart_browser(force_full=hard_fail)
+                    next_idx = current_round + 1
+                    next_proxy = select_proxy_for_account(next_idx)
+                    same_proxy = next_proxy == current_proxy_url()
+                    if hard_fail:
+                        slog("BROWSER", "FULL restart (browser unhealthy)")
+                        restart_browser(force_full=True)
+                    elif same_proxy and _proxy_mode == "per_worker":
+                        slog("BROWSER", "soft-reset → next account (same proxy)")
+                        restart_browser(force_full=False)
+                    elif same_proxy and len(_proxy_pool) <= 1:
+                        slog("BROWSER", "soft-reset → next account (single/same proxy)")
+                        restart_browser(force_full=False)
+                    else:
+                        # Next ensure_browser_proxy_for_account will full-restart
+                        # if proxy changes; soft-reset only when same proxy reused.
+                        if same_proxy:
+                            slog("BROWSER", "soft-reset → next account (proxy reuse)")
+                            restart_browser(force_full=False)
+                        else:
+                            slog(
+                                "BROWSER",
+                                "next account uses different proxy → defer restart",
+                            )
                     _apply_window_policy(quiet=True)
 
             if args.count == 0 or current_round < args.count:

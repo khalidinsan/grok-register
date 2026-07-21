@@ -34,11 +34,23 @@ CONFIG_PATH = ROOT / "config.json"
 
 
 def load_pool_config() -> dict:
+    from proxy_util import load_proxy_file as _load_pf, load_proxy_list, normalize_proxy
+
     defaults = {
         "count": 1,          # TOTAL accounts
         "concurrent": 2,     # parallel browsers
         "stagger_sec": 20,
         "proxies": [],
+        "proxy_file": "",
+        # per_account = rotate 1 proxy per account (default)
+        # per_worker  = sticky proxy for whole worker process
+        "proxy_mode": "per_account",
+        # health check before spawn (latency to accounts.x.ai)
+        "proxy_check": True,
+        "proxy_check_url": "https://accounts.x.ai/",
+        "proxy_max_ms": 4000,
+        "proxy_check_timeout": 12,
+        "proxy_check_workers": 10,
         "display": "offscreen" if sys.platform == "darwin" else "headed",
     }
     if not CONFIG_PATH.is_file():
@@ -63,13 +75,44 @@ def load_pool_config() -> dict:
         if isinstance(pool.get("stagger_sec"), (int, float)) and pool["stagger_sec"] >= 0:
             out["stagger_sec"] = float(pool["stagger_sec"])
 
-        proxies = pool.get("proxies") or pool.get("proxy_list") or []
-        if isinstance(proxies, list):
-            out["proxies"] = [str(p).strip() for p in proxies if str(p).strip()]
-        if not out["proxies"]:
+        mode = str(pool.get("proxy_mode") or out["proxy_mode"]).strip().lower()
+        if mode in ("per_account", "rotate", "account"):
+            out["proxy_mode"] = "per_account"
+        elif mode in ("per_worker", "worker", "sticky"):
+            out["proxy_mode"] = "per_worker"
+
+        proxies: list[str] = []
+        pf = str(pool.get("proxy_file") or conf.get("proxy_file") or "").strip()
+        if pf:
+            out["proxy_file"] = pf
+            try:
+                proxies = _load_pf(pf)
+            except FileNotFoundError as e:
+                print(f"[Warn] {e}")
+        if not proxies:
+            proxies = load_proxy_list(pool.get("proxies") or pool.get("proxy_list") or [])
+        if not proxies:
             single = str(conf.get("browser_proxy") or conf.get("proxy") or "").strip()
             if single:
-                out["proxies"] = [single]
+                n = normalize_proxy(single)
+                if n:
+                    proxies = [n]
+        out["proxies"] = proxies
+
+        # proxy health check knobs
+        if "proxy_check" in pool:
+            out["proxy_check"] = bool(pool.get("proxy_check"))
+        for key, cast in (
+            ("proxy_check_url", str),
+            ("proxy_max_ms", float),
+            ("proxy_check_timeout", float),
+            ("proxy_check_workers", int),
+        ):
+            if pool.get(key) is not None:
+                try:
+                    out[key] = cast(pool[key])
+                except (TypeError, ValueError):
+                    pass
 
         display = (
             pool.get("display")
@@ -89,16 +132,12 @@ def load_pool_config() -> dict:
 
 
 def load_proxy_file(path: str) -> list[str]:
-    p = Path(path).expanduser()
-    if not p.is_file():
-        raise SystemExit(f"proxy file not found: {p}")
-    lines = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        lines.append(s)
-    return lines
+    from proxy_util import load_proxy_file as _load
+
+    try:
+        return _load(path)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e)) from e
 
 
 def split_workload(total: int, concurrent: int) -> list[int]:
@@ -129,18 +168,9 @@ def platform_is_mac() -> bool:
 
 
 def _mask_proxy(url: str) -> str:
-    if not url or "@" not in url:
-        return url
-    try:
-        left, right = url.rsplit("@", 1)
-        if "://" in left:
-            scheme, creds = left.split("://", 1)
-            if ":" in creds:
-                user = creds.split(":", 1)[0]
-                return f"{scheme}://{user}:***@{right}"
-        return f"***@{right}"
-    except Exception:
-        return "***"
+    from proxy_util import mask_proxy
+
+    return mask_proxy(url)
 
 
 def spawn_worker_process(
@@ -359,14 +389,37 @@ def main() -> int:
     )
     parser.add_argument(
         "--proxy-file",
-        default="",
-        help="text file: one proxy URL per line",
+        default=cfg.get("proxy_file") or "",
+        help="proxy list file (URL or Webshare host:port:user:pass)",
     )
     parser.add_argument(
         "--proxy",
         action="append",
         default=[],
-        help="proxy URL (repeatable); round-robin to workers",
+        help="proxy URL (repeatable)",
+    )
+    parser.add_argument(
+        "--proxy-mode",
+        choices=["per_account", "per_worker"],
+        default=cfg.get("proxy_mode") or "per_account",
+        help="per_account=1 proxy per account (rotate); per_worker=sticky per worker",
+    )
+    parser.add_argument(
+        "--proxy-check",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("proxy_check", True)),
+        help="probe proxies → accounts.x.ai and drop slow ones (default: on)",
+    )
+    parser.add_argument(
+        "--proxy-max-ms",
+        type=float,
+        default=float(cfg.get("proxy_max_ms") or 4000),
+        help="max acceptable latency ms to accounts.x.ai (default 4000)",
+    )
+    parser.add_argument(
+        "--proxy-check-url",
+        default=str(cfg.get("proxy_check_url") or "https://accounts.x.ai/"),
+        help="URL for proxy health probe",
     )
     parser.add_argument(
         "--display",
@@ -419,9 +472,68 @@ def main() -> int:
     if display in ("bg", "background"):
         display = "offscreen"
 
-    proxies = list(args.proxy) if args.proxy else list(cfg["proxies"])
+    from proxy_util import encode_proxy_env, load_proxy_list, normalize_proxy
+
+    if args.proxy:
+        proxies = load_proxy_list(args.proxy)
+    else:
+        proxies = list(cfg["proxies"])
     if args.proxy_file:
         proxies = load_proxy_file(args.proxy_file)
+    # normalize any leftover raw lines
+    proxies = [normalize_proxy(p) or p for p in proxies if p]
+    proxy_mode = getattr(args, "proxy_mode", None) or cfg.get("proxy_mode") or "per_account"
+
+    # ── health check: collect only as many good proxies as accounts need ──
+    # e.g. 10 accounts + 100 proxies → stop after 10 KEEP (don't probe all 100)
+    do_check = bool(getattr(args, "proxy_check", cfg.get("proxy_check", True)))
+    if proxies and do_check:
+        from proxy_health import apply_proxy_check, resolve_proxy_need
+
+        need = resolve_proxy_need(
+            total_accounts=total,
+            concurrent=n_workers,
+            proxy_count=len(proxies),
+            proxy_mode=proxy_mode,
+        )
+        print(
+            f"[PROXY-CHECK] plan: need {need} good proxy(ies) "
+            f"for total={total if total > 0 else '∞'} concurrent={n_workers} "
+            f"from {len(proxies)} listed",
+            flush=True,
+        )
+        try:
+            proxies = apply_proxy_check(
+                proxies,
+                enabled=True,
+                target=str(
+                    getattr(args, "proxy_check_url", None)
+                    or cfg.get("proxy_check_url")
+                    or "https://accounts.x.ai/"
+                ),
+                max_ms=float(
+                    getattr(args, "proxy_max_ms", None)
+                    or cfg.get("proxy_max_ms")
+                    or 4000
+                ),
+                timeout=float(cfg.get("proxy_check_timeout") or 12),
+                workers=int(cfg.get("proxy_check_workers") or 10),
+                need=need,
+                total_accounts=total,
+                concurrent=n_workers,
+                proxy_mode=proxy_mode,
+                require_one=True,
+            )
+        except RuntimeError as e:
+            raise SystemExit(f"[proxy-check] {e}") from e
+        try:
+            good_path = ROOT / "proxy.good.txt"
+            good_path.write_text("\n".join(proxies) + "\n", encoding="utf-8")
+            print(f"[PROXY-CHECK] wrote {good_path.name} ({len(proxies)} lines)")
+        except Exception:
+            pass
+    elif proxies and not do_check:
+        print("[PROXY-CHECK] skipped (--no-proxy-check)")
 
     if not SCRIPT.is_file():
         raise SystemExit(f"missing farm script: {SCRIPT}")
@@ -435,12 +547,15 @@ def main() -> int:
     print(f"  split      : {shares}  (sum={sum(shares) if total > 0 else '∞'})")
     print(f"  stagger    : {args.stagger_sec}s")
     print(f"  display    : {display}")
-    print(f"  proxies    : {len(proxies)} configured")
+    print(
+        f"  proxies    : {len(proxies)}  mode={proxy_mode}"
+        + (f"  check={'on' if do_check else 'off'}" if proxies else "")
+    )
     print("-" * 60)
     print("  log tag   : [W2 3/33 · #70/100 · remW 30 · ✓2 ✗0]")
     print("              W=worker local/share  #=global index")
     print("              remW=sisa di worker ini  ✓/✗ = ok/fail worker")
-    print("  phases    : START → FLOW ①..⑥ → OK/FAIL → SCORE")
+    print("  phases    : START → FLOW ①..⑤ → CONVERT → SMOKE → PUSH → OK/FAIL")
     if display == "headed" and platform_is_mac():
         print("  [!] headed on Mac steals focus — prefer --offscreen while working")
     if display == "headless":
@@ -448,7 +563,12 @@ def main() -> int:
     if not proxies and n_workers > 1:
         print(
             "  [!] no proxies — all workers share your home IP. "
-            "OK for a tiny test; add pool.proxies or --proxy for safer concurrent."
+            "OK for a tiny test; add pool.proxies / --proxy-file for safer concurrent."
+        )
+    if proxies and proxy_mode == "per_account":
+        print(
+            f"  [proxy] per_account rotate — global account #k uses "
+            f"proxy[(k-1) % {len(proxies)}]; browser full-restart on change"
         )
     print("=" * 60)
 
@@ -477,7 +597,7 @@ def main() -> int:
 
     for i, share in enumerate(shares):
         wid = str(i + 1)
-        proxy = proxies[i % len(proxies)] if proxies else ""
+        sticky = proxies[i % len(proxies)] if proxies and proxy_mode == "per_worker" else ""
         debug_port = 9300 + int(wid) * 20
         env = os.environ.copy()
         env["GROK_WORKER_ID"] = wid
@@ -486,9 +606,16 @@ def main() -> int:
         env["GROK_WORKER_SHARE"] = str(share)
         env["GROK_POOL_TOTAL"] = str(total if total > 0 else 0)
         env["GROK_POOL_OFFSET"] = str(offsets[i])
-        if proxy:
-            env["GROK_BROWSER_PROXY"] = proxy
+        env["GROK_POOL_CONCURRENT"] = str(n_workers)
+        env["GROK_PROXY_MODE"] = proxy_mode
+        if proxies:
+            env["GROK_PROXIES"] = encode_proxy_env(proxies)
         else:
+            env.pop("GROK_PROXIES", None)
+        if sticky:
+            env["GROK_BROWSER_PROXY"] = sticky
+        else:
+            # per_account: worker picks proxy per account from GROK_PROXIES
             env.pop("GROK_BROWSER_PROXY", None)
             env.pop("BROWSER_PROXY", None)
 
@@ -505,11 +632,17 @@ def main() -> int:
         ]
         g_from = offsets[i] + 1 if total > 0 else 0
         g_to = offsets[i] + share if total > 0 else 0
+        if proxy_mode == "per_worker" and sticky:
+            proxy_note = f"  proxy={_mask_proxy(sticky)} (sticky)"
+        elif proxies:
+            proxy_note = f"  proxies={len(proxies)} (rotate/account)"
+        else:
+            proxy_note = "  proxy=(none)"
         print(
             f"[pool] worker {wid}/{n_workers}: {share} account(s)"
             + (f"  global#{g_from}–{g_to}" if total > 0 else "")
             + f"  cdp≈{debug_port}"
-            + (f"  proxy={_mask_proxy(proxy)}" if proxy else "  proxy=(none)")
+            + proxy_note
         )
         if args.dry_run:
             print(f"       cmd: {' '.join(cmd)}")

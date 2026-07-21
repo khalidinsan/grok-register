@@ -1,3 +1,5 @@
 DrissionPage==4.1.0.9
 playwright>=1.40.0
 textual>=1.0.0
+requests>=2.28.0
+camoufox[geoip]>=0.4.11
