@@ -694,6 +694,22 @@ def main() -> int:
             )
         if "GROK_BLOCK_ASSETS" not in env:
             env["GROK_BLOCK_ASSETS"] = "1" if cfg.get("block_assets", True) else "0"
+        if "GROK_REGISTER_MODE" not in env:
+            env["GROK_REGISTER_MODE"] = str(
+                cfg.get("register_mode") or "browser"
+            ).strip() or "browser"
+        if "GROK_OAUTH_GAP_SEC" not in env:
+            gcli = cfg.get("grok_cli") if isinstance(cfg.get("grok_cli"), dict) else {}
+            # run_pool cfg is pool-centric; also accept top-level from full config if present
+            env["GROK_OAUTH_GAP_SEC"] = str(
+                gcli.get("oauth_gap_sec") if gcli else cfg.get("oauth_gap_sec") or "8"
+            )
+        if "GROK_CHAT_PROBE_OFF_CRITICAL" not in env:
+            gcli = cfg.get("grok_cli") if isinstance(cfg.get("grok_cli"), dict) else {}
+            off = True
+            if gcli and gcli.get("chat_probe_off_critical") is not None:
+                off = bool(gcli.get("chat_probe_off_critical"))
+            env["GROK_CHAT_PROBE_OFF_CRITICAL"] = "1" if off else "0"
         if proxies:
             env["GROK_PROXIES"] = encode_proxy_env(proxies)
         else:

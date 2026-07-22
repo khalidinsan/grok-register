@@ -2,6 +2,7 @@
     "run": {
         "count": 10
     },
+    "register_mode": "browser",
     "pool": {
         "count": 10,
         "concurrent": 2,
@@ -41,6 +42,8 @@
         "oauth_mode": "pkce",
         "oauth_referrer": "grok-build",
         "post_signup_settle_sec": 12,
+        "oauth_gap_sec": 8,
+        "chat_probe_off_critical": true,
         "inject_policy": "usable",
         "jwt_reject_bot_flag": false,
         "jwt_enforce_referrer": true,

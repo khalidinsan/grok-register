@@ -4,10 +4,11 @@ Convert Grok Web SSO cookie → Grok Build / CLI OAuth tokens via Device Flow.
 Port of grok2api backend/internal/infra/provider/web/sso_build.go (HTTP-only, no browser).
 
 Flow:
-  1. Validate SSO session on accounts.x.ai
-  2. Start device code (client_id = Grok CLI / Build)
-  3. Open verification URI + verify user_code + approve (with sso cookie)
-  4. Poll token endpoint → access_token + refresh_token
+  1. Materialize wrapper JWT → session SSO (if needed)
+  2. Validate SSO session on accounts.x.ai
+  3. Start device code (client_id = Grok CLI / Build)
+  4. Open verification URI + verify user_code + approve (with full cookie jar)
+  5. Poll token endpoint → access_token + refresh_token
 """
 
 from __future__ import annotations
@@ -17,10 +18,18 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
+
+from sso_util import (
+    is_session_sso,
+    is_wrapper_sso,
+    materialize_sso_via_browser,
+    materialize_sso_via_http,
+    normalize_sso_value,
+)
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 SCOPE = (
@@ -38,6 +47,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
+# Domains that need SSO / CF cookies for device OAuth
+_COOKIE_DOMAINS = (".x.ai", "accounts.x.ai", "auth.x.ai")
+
+# Rate-limit / slow-down retry: max 4 tries, sleep min(20*attempt, 120)
+_RL_MAX_TRIES = 4
+
 
 @dataclass
 class BuildTokens:
@@ -54,12 +69,7 @@ class BuildTokens:
 
 
 def normalize_sso_token(value: str) -> str:
-    value = (value or "").strip()
-    if value.lower().startswith("sso="):
-        value = value[4:].strip()
-    if ";" in value and "sso=" not in value.lower():
-        value = value.split(";", 1)[0].strip()
-    return value.replace("\r", "").replace("\n", "").replace("\x00", "").strip()
+    return normalize_sso_value(value)
 
 
 def extract_sso_from_credential(raw: Any) -> Tuple[str, str]:
@@ -92,8 +102,65 @@ def extract_sso_from_credential(raw: Any) -> Tuple[str, str]:
         else:
             sso = normalize_sso_token(text)
     sso = normalize_sso_token(sso)
-    sso_rw = (sso_rw or sso).strip()
+    sso_rw = normalize_sso_token(sso_rw or sso)
     return sso, sso_rw
+
+
+def _cookies_to_items(cookies: Any) -> List[Dict[str, Any]]:
+    """Normalize dict / list / cookie-header string into [{name,value,...}]."""
+    if not cookies:
+        return []
+    if isinstance(cookies, dict):
+        # Could be name→value OR a single cookie dict with "name"/"value"
+        if "name" in cookies and ("value" in cookies or "Value" in cookies):
+            return [cookies]
+        return [{"name": k, "value": v} for k, v in cookies.items() if k]
+    if isinstance(cookies, (list, tuple)):
+        out: List[Dict[str, Any]] = []
+        for c in cookies:
+            if isinstance(c, dict):
+                out.append(c)
+            elif isinstance(c, str) and "=" in c:
+                n, v = c.split("=", 1)
+                out.append({"name": n.strip(), "value": v.strip()})
+        return out
+    if isinstance(cookies, str):
+        items = []
+        for part in cookies.split(";"):
+            part = part.strip()
+            if "=" in part:
+                n, v = part.split("=", 1)
+                items.append({"name": n.strip(), "value": v.strip()})
+        return items
+    return []
+
+
+def _looks_rate_limited(status: int, body: bytes | str = b"", err_text: str = "") -> bool:
+    text = err_text
+    if isinstance(body, bytes):
+        text = (text + " " + body.decode("utf-8", errors="replace")).lower()
+    else:
+        text = (text + " " + str(body or "")).lower()
+    if status == 429:
+        return True
+    return any(
+        k in text
+        for k in (
+            "rate_limit",
+            "rate limit",
+            "ratelimit",
+            "slow_down",
+            "too many requests",
+            "try again later",
+        )
+    )
+
+
+def _rl_sleep(attempt: int) -> None:
+    """attempt is 1-based try index after a failure."""
+    delay = min(20 * attempt, 120)
+    print(f"[Build] rate-limit / slow_down — backoff {delay}s (attempt {attempt})", flush=True)
+    time.sleep(delay)
 
 
 def _safe_xai_url(raw: str) -> bool:
@@ -125,6 +192,7 @@ class SsoBuildFlow:
         sso_rw: str | None = None,
         user_agent: str = USER_AGENT,
         proxy: str | None = None,
+        cookies: Any = None,
     ):
         self.user_agent = user_agent
         self.session = requests.Session()
@@ -141,8 +209,55 @@ class SsoBuildFlow:
                 "User-Agent": user_agent,
             }
         )
-        self.session.cookies.set("sso", sso, domain=".x.ai", path="/")
-        self.session.cookies.set("sso-rw", sso_rw or sso, domain=".x.ai", path="/")
+        # Full jar first (cf_clearance, __cf_bm, ...), then force SSO on top
+        self._set_extra_cookies(cookies)
+        self._set_sso_cookies(sso, sso_rw or sso)
+
+    def _set_cookie_all_domains(self, name: str, value: str, path: str = "/") -> None:
+        for domain in _COOKIE_DOMAINS:
+            try:
+                self.session.cookies.set(name, value, domain=domain, path=path)
+            except Exception:
+                try:
+                    self.session.cookies.set(name, value, domain=domain)
+                except Exception:
+                    pass
+
+    def _set_sso_cookies(self, sso: str, sso_rw: str) -> None:
+        sso = normalize_sso_token(sso)
+        sso_rw = normalize_sso_token(sso_rw or sso)
+        if not sso:
+            return
+        self._set_cookie_all_domains("sso", sso)
+        self._set_cookie_all_domains("sso-rw", sso_rw or sso)
+
+    def _set_extra_cookies(self, cookies: Any) -> int:
+        """Inject full jar (cf_clearance etc.) — SSO alone often fails CF on device/verify."""
+        n = 0
+        for c in _cookies_to_items(cookies):
+            name = str(c.get("name") or c.get("Name") or "").strip()
+            value = c.get("value") if "value" in c else c.get("Value")
+            if not name or value is None:
+                continue
+            # Skip overwriting sso here; _set_sso_cookies runs after
+            path = str(c.get("path") or c.get("Path") or "/").strip() or "/"
+            domain_hint = str(c.get("domain") or c.get("Domain") or "").strip()
+            domains = list(_COOKIE_DOMAINS)
+            if domain_hint and domain_hint not in domains:
+                domains.insert(0, domain_hint)
+            for d in domains:
+                try:
+                    self.session.cookies.set(name, str(value), domain=d, path=path)
+                    n += 1
+                    break
+                except Exception:
+                    try:
+                        self.session.cookies.set(name, str(value), domain=d)
+                        n += 1
+                        break
+                    except Exception:
+                        continue
+        return n
 
     def do(
         self,
@@ -158,7 +273,7 @@ class SsoBuildFlow:
         current_method = method.upper()
         current_form = form
         for _ in range(9):
-            kwargs = {
+            kwargs: Dict[str, Any] = {
                 "method": current_method,
                 "url": current_url,
                 "timeout": timeout,
@@ -193,19 +308,43 @@ class SsoBuildFlow:
 
         raise RuntimeError("too many redirects")
 
+    def _do_with_rl_retry(
+        self,
+        method: str,
+        url: str,
+        form: Optional[Dict[str, str]] = None,
+        *,
+        label: str = "request",
+        timeout: float = 30,
+    ) -> Tuple[int, str, bytes]:
+        """HTTP call with exponential backoff on 429 / rate_limit / slow_down."""
+        last: Tuple[int, str, bytes] = (0, url, b"")
+        for attempt in range(1, _RL_MAX_TRIES + 1):
+            status, final_url, body = self.do(method, url, form=form, timeout=timeout)
+            last = (status, final_url, body)
+            if not _looks_rate_limited(status, body):
+                return status, final_url, body
+            if attempt >= _RL_MAX_TRIES:
+                break
+            _rl_sleep(attempt)
+        return last
+
     def convert(self, name_hint: str = "") -> BuildTokens:
         print("[Build] Validating Web SSO on accounts.x.ai ...")
-        status, final_url, _ = self.do("GET", ACCOUNTS_URL)
+        status, final_url, body = self._do_with_rl_retry("GET", ACCOUNTS_URL, label="accounts")
         if status == 401 or "sign-in" in final_url or "sign-up" in final_url:
             raise RuntimeError("SSO unauthorized / redirected to sign-in")
         if status < 200 or status >= 400:
+            if _looks_rate_limited(status, body):
+                raise RuntimeError(f"SSO check rate-limited HTTP {status} url={final_url}")
             raise RuntimeError(f"SSO check failed HTTP {status} url={final_url}")
 
         print("[Build] Starting device code ...")
-        status, _, body = self.do(
+        status, _, body = self._do_with_rl_retry(
             "POST",
             DEVICE_URL,
             {"client_id": CLIENT_ID, "scope": SCOPE, "referrer": "grok-build"},
+            label="device_code",
         )
         if status < 200 or status >= 300:
             raise RuntimeError(f"device code failed HTTP {status}: {body[:200]!r}")
@@ -220,19 +359,23 @@ class SsoBuildFlow:
 
         print(f"[Build] user_code={user_code}")
 
-        status, final_url, _ = self.do("GET", verify_complete)
+        status, final_url, body = self._do_with_rl_retry(
+            "GET", verify_complete, label="verify_uri"
+        )
         if status < 200 or status >= 400:
             raise RuntimeError(f"open verify page failed HTTP {status}")
 
         print("[Build] Verifying user_code with SSO ...")
-        status, final_url, _ = self.do("POST", VERIFY_URL, {"user_code": user_code})
+        status, final_url, body = self._do_with_rl_retry(
+            "POST", VERIFY_URL, {"user_code": user_code}, label="verify"
+        )
         if status < 200 or status >= 400:
             raise RuntimeError(f"verify failed HTTP {status} url={final_url}")
         if "consent" not in final_url:
             print(f"[Build] warn: verify final_url={final_url} (expected consent)")
 
         print("[Build] Approving device flow ...")
-        status, final_url, _ = self.do(
+        status, final_url, body = self._do_with_rl_retry(
             "POST",
             APPROVE_URL,
             {
@@ -241,6 +384,7 @@ class SsoBuildFlow:
                 "principal_type": "User",
                 "principal_id": "",
             },
+            label="approve",
         )
         if status < 200 or status >= 400:
             raise RuntimeError(f"approve failed HTTP {status} url={final_url}")
@@ -251,6 +395,7 @@ class SsoBuildFlow:
         if interval < 1:
             interval = 1
         deadline = time.time() + min(expires_in, 75)
+        rl_poll_tries = 0
         while time.time() < deadline:
             time.sleep(interval)
             status, _, body = self.do(
@@ -268,9 +413,14 @@ class SsoBuildFlow:
                 raise RuntimeError(f"token parse error: {e} body={body[:200]!r}") from e
 
             if 200 <= status < 300 and payload.get("access_token"):
+                access = str(payload["access_token"])
+                refresh = str(payload.get("refresh_token") or "").strip()
+                if not refresh:
+                    raise RuntimeError(
+                        "token response missing refresh_token "
+                        "(offline_access / Build scope required)"
+                    )
                 exp_in = int(payload.get("expires_in") or 3600)
-                access = payload["access_token"]
-                refresh = payload.get("refresh_token") or ""
                 id_token = payload.get("id_token") or ""
                 claims = _decode_jwt_claims(id_token or access)
                 email = str(claims.get("email") or "").strip()
@@ -294,11 +444,18 @@ class SsoBuildFlow:
                     scope=str(payload.get("scope") or SCOPE),
                 )
 
-            err = payload.get("error") or ""
+            err = str(payload.get("error") or "")
             if err == "authorization_pending":
                 continue
-            if err == "slow_down":
+            if err == "slow_down" or _looks_rate_limited(status, body, err):
+                rl_poll_tries += 1
+                if rl_poll_tries > _RL_MAX_TRIES:
+                    raise RuntimeError(
+                        f"token poll rate-limited after {_RL_MAX_TRIES} tries: "
+                        f"{payload.get('error_description') or err or body[:200]!r}"
+                    )
                 interval += 5
+                _rl_sleep(rl_poll_tries)
                 continue
             if err in ("access_denied", "expired_token"):
                 raise RuntimeError(f"authorization denied: {err}")
@@ -312,28 +469,105 @@ class SsoBuildFlow:
         raise RuntimeError("device flow poll timeout")
 
 
+def _maybe_materialize_sso(
+    sso: str,
+    *,
+    proxy: str | None,
+    cookies: Any,
+    page: Any,
+) -> str:
+    """If sso is a set-cookie wrapper JWT, exchange it for a session cookie."""
+    sso = normalize_sso_token(sso)
+    if not sso or not is_wrapper_sso(sso):
+        return sso
+
+    print("[Build] SSO looks like set-cookie wrapper — materializing session ...", flush=True)
+    log = lambda m: print(m, flush=True)  # noqa: E731
+
+    # Prefer live page if provided
+    if page is not None:
+        try:
+            out = materialize_sso_via_browser(page, sso, log=log, timeout=45.0)
+            if out and is_session_sso(out):
+                print(f"[Build] browser materialize OK len={len(out)}", flush=True)
+                return out
+            if out:
+                print(
+                    f"[Build] browser materialize returned non-session len={len(out)}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"[Build] browser materialize failed: {e}", flush=True)
+
+    px = ""
+    if proxy is not None:
+        px = (proxy or "").strip()
+    else:
+        px = (os.environ.get("GROK_BROWSER_PROXY") or "").strip()
+
+    jar = cookies
+    if jar is None:
+        jar = {}
+    try:
+        out = materialize_sso_via_http(
+            sso,
+            proxy=px,
+            cookies_jar=jar,
+            log=log,
+            timeout=30.0,
+        )
+        if out and is_session_sso(out):
+            print(f"[Build] http materialize OK len={len(out)}", flush=True)
+            return out
+    except Exception as e:
+        print(f"[Build] http materialize failed: {e}", flush=True)
+
+    # Fall through with original; device flow may still fail clearly
+    print("[Build] warn: could not materialize wrapper; trying device flow as-is", flush=True)
+    return sso
+
+
 def convert_sso_to_build(
     sso_credential: Any,
     name_hint: str = "",
     *,
     proxy: str | None = None,
     fallback_direct: bool = True,
+    cookies: Any = None,
+    page: Any = None,
 ) -> BuildTokens:
     """
-    Convert Web SSO → Build tokens.
+    Convert Web SSO → Build tokens (requires access_token + refresh_token).
 
     proxy=None → use GROK_BROWSER_PROXY env (browser account proxy).
     proxy=""   → force direct (no proxy).
     fallback_direct: if proxied convert hits 429 / proxy errors, retry once direct.
+    cookies: optional full jar (dict or list) with cf_clearance, __cf_bm, sso-rw, etc.
+    page: optional DrissionPage / Playwright-like handle for wrapper materialize.
     """
     sso, sso_rw = extract_sso_from_credential(sso_credential)
     if not sso:
+        # Try pulling sso from cookies jar
+        for c in _cookies_to_items(cookies):
+            name = str(c.get("name") or c.get("Name") or "")
+            value = c.get("value") if "value" in c else c.get("Value")
+            if name == "sso" and value:
+                sso = normalize_sso_token(str(value))
+            elif name in ("sso-rw", "sso_rw") and value and not sso_rw:
+                sso_rw = normalize_sso_token(str(value))
+    if not sso:
         raise ValueError("empty SSO token")
 
+    sso = _maybe_materialize_sso(sso, proxy=proxy, cookies=cookies, page=page)
+    sso_rw = normalize_sso_token(sso_rw or sso)
+
     def _run(px: str | None) -> BuildTokens:
-        return SsoBuildFlow(sso=sso, sso_rw=sso_rw, proxy=px).convert(
-            name_hint=name_hint
-        )
+        return SsoBuildFlow(
+            sso=sso,
+            sso_rw=sso_rw,
+            proxy=px,
+            cookies=cookies,
+        ).convert(name_hint=name_hint)
 
     try:
         return _run(proxy)
@@ -352,6 +586,9 @@ def convert_sso_to_build(
                 "429",
                 "too many requests",
                 "proxy connection",
+                "rate-limited",
+                "rate_limit",
+                "slow_down",
             )
         )
         if fallback_direct and used_proxy and proxy_fail:
@@ -367,8 +604,53 @@ def convert_sso_to_build(
 if __name__ == "__main__":
     import sys
 
+    # Lightweight unit checks (no network) when run with --self-test
+    if len(sys.argv) >= 2 and sys.argv[1] == "--self-test":
+        from sso_util import decode_jwt_payload, unwrap_success_url
+
+        def _fake_jwt(payload: dict) -> str:
+            header = (
+                base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}')
+                .decode()
+                .rstrip("=")
+            )
+            body = (
+                base64.urlsafe_b64encode(
+                    json.dumps(payload, separators=(",", ":")).encode()
+                )
+                .decode()
+                .rstrip("=")
+            )
+            return f"{header}.{body}.sig"
+
+        wrapper = _fake_jwt(
+            {
+                "config": {
+                    "token": "inner",
+                    "success_url": "https://auth.x.ai/set-cookie?q=abc",
+                }
+            }
+        )
+        session = _fake_jwt({"session": {"id": "abc"}, "user": "u1"})
+        assert is_wrapper_sso(wrapper) and not is_session_sso(wrapper)
+        assert is_session_sso(session) and not is_wrapper_sso(session)
+        assert unwrap_success_url(wrapper).startswith("https://auth.x.ai/")
+        assert decode_jwt_payload(wrapper) is not None
+        assert normalize_sso_token("sso=" + session) == session
+        # cookie jar helper
+        items = _cookies_to_items(
+            {"cf_clearance": "x", "sso": session, "__cf_bm": "y"}
+        )
+        assert len(items) == 3
+        assert _looks_rate_limited(429)
+        assert _looks_rate_limited(200, b'{"error":"slow_down"}')
+        assert not _looks_rate_limited(200, b'{"error":"authorization_pending"}')
+        print("sso_to_build self-test OK")
+        sys.exit(0)
+
     if len(sys.argv) < 2:
         print("Usage: python sso_to_build.py <sso-jwt-or-header-file>")
+        print("       python sso_to_build.py --self-test")
         sys.exit(1)
     raw = open(sys.argv[1], encoding="utf-8").read().strip()
     tok = convert_sso_to_build(raw)

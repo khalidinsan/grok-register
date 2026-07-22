@@ -479,6 +479,19 @@ class PoolRunner:
             "GROK_BLOCK_ASSETS",
             str(os.environ.get("GROK_BLOCK_ASSETS") or "1"),
         )
+        # register_mode / oauth gap / deferred probe (parent env or defaults)
+        env.setdefault(
+            "GROK_REGISTER_MODE",
+            str(os.environ.get("GROK_REGISTER_MODE") or "browser"),
+        )
+        env.setdefault(
+            "GROK_OAUTH_GAP_SEC",
+            str(os.environ.get("GROK_OAUTH_GAP_SEC") or "8"),
+        )
+        env.setdefault(
+            "GROK_CHAT_PROBE_OFF_CRITICAL",
+            str(os.environ.get("GROK_CHAT_PROBE_OFF_CRITICAL") or "1"),
+        )
         pool = getattr(self.state, "proxy_pool", None) or []
         if pool:
             env["GROK_PROXIES"] = encode_proxy_env(pool)

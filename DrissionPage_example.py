@@ -3432,62 +3432,205 @@ def push_sso_to_api(new_tokens: list) -> None:
     push_sso_to_grok2api(accounts)
 
 
+def _resolve_register_mode() -> str:
+    """browser (default) | hybrid — env GROK_REGISTER_MODE or config register_mode."""
+    try:
+        from hybrid.register import resolve_register_mode
+
+        return resolve_register_mode(_load_config())
+    except Exception:
+        env = (os.environ.get("GROK_REGISTER_MODE") or "").strip().lower()
+        if env in ("hybrid", "browser"):
+            return env
+        conf = _load_config()
+        mode = str(conf.get("register_mode") or "").strip().lower()
+        if not mode:
+            run = conf.get("run") if isinstance(conf.get("run"), dict) else {}
+            mode = str(run.get("register_mode") or "").strip().lower()
+        return mode if mode in ("hybrid", "browser") else "browser"
+
+
+def _try_hybrid_registration() -> dict | None:
+    """
+    Hybrid path: short browser harvest (castle/cookies/next-action) + protocol HTTP.
+    Returns result dict on success, None on failure (caller falls back to browser).
+    """
+    from hybrid.register import register_one_hybrid
+
+    global page, browser
+    # Ensure browser is up (main loop usually already started it)
+    if page is None or browser is None:
+        try:
+            start_browser()
+        except Exception as e:
+            slog("HYBRID", f"browser start failed: {e}", level="warn")
+            return None
+
+    return register_one_hybrid(
+        page=page,
+        browser=browser,
+        log=lambda m: slog("HYBRID", m),
+        proxy=current_proxy_url(),
+        get_email=get_email_and_token,
+        get_otp=lambda tok, em, **kw: get_oai_code(tok, em, timeout=120),
+        build_profile=build_profile,
+        open_signup_fn=open_signup_page,
+        get_turnstile_fn=lambda: getTurnstileToken(),
+    )
+
+
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # One round: open signup -> register -> capture SSO -> write file -> push 9router.
-    slog("FLOW", "① open sign-up")
-    open_signup_page()
-    slog("FLOW", "② email step")
-    email, dev_token = fill_email_and_submit()
-    slog("FLOW", "③ OTP / IMAP")
-    fill_code_and_submit(email, dev_token)
-    slog("FLOW", "④ profile + Turnstile + Complete sign up")
-    profile = fill_profile_and_submit()
-    slog("FLOW", "⑤ wait SSO cookies")
-    sso_cred = wait_for_sso_cookie()  # dict: apiKey / sso_token / providerSpecificData
-    append_sso_to_txt(sso_cred, output_path)
+    # Optional hybrid: protocol HTTP after short browser harvest; fall back to full browser.
+    reg_mode = _resolve_register_mode()
+    hybrid_result = None
+    if reg_mode == "hybrid":
+        slog("FLOW", "① hybrid register (browser harvest + protocol HTTP)")
+        try:
+            hybrid_result = _try_hybrid_registration()
+        except Exception as e:
+            slog("HYBRID", f"exception — fall back to browser: {e}", level="warn")
+            hybrid_result = None
+        if not hybrid_result or not (
+            hybrid_result.get("sso_token") or hybrid_result.get("sso") or hybrid_result.get("apiKey")
+        ):
+            slog(
+                "HYBRID",
+                "failed or no SSO — fall back to full browser register",
+                level="warn",
+            )
+            hybrid_result = None
+            # Mid-signup browser state may be dirty; soft-reset before full UI path
+            try:
+                soft_reset_browser()
+            except Exception:
+                try:
+                    restart_browser(force_full=False)
+                except Exception:
+                    pass
+        else:
+            slog("HYBRID", f"OK email={hybrid_result.get('email','')}")
 
-    if extract_numbers:
-        extract_visible_numbers()
-
-    # Flatten for logs + 9router push (structured credential)
-    if isinstance(sso_cred, dict):
+    if hybrid_result:
+        email = str(hybrid_result.get("email") or "")
+        profile = {
+            "given_name": hybrid_result.get("given_name") or "",
+            "family_name": hybrid_result.get("family_name") or "",
+            "password": hybrid_result.get("password") or "",
+        }
+        sso_cred = {
+            "apiKey": hybrid_result.get("apiKey") or "",
+            "sso_token": hybrid_result.get("sso_token") or hybrid_result.get("sso") or "",
+            "sso_rw": hybrid_result.get("sso_rw") or "",
+            "cookie_header": hybrid_result.get("cookie_header")
+            or hybrid_result.get("apiKey")
+            or "",
+            "cloudflare_cookies": hybrid_result.get("cloudflare_cookies") or "",
+            "providerSpecificData": hybrid_result.get("providerSpecificData") or {},
+        }
+        # Prefer live browser cookies if materialize already set them
+        try:
+            live = wait_for_sso_cookie(timeout=25, no_sso_deadline=12)
+            if isinstance(live, dict) and (live.get("sso_token") or live.get("apiKey")):
+                sso_cred = live
+                slog("HYBRID", "using browser-materialized SSO cookies")
+        except Exception as e:
+            slog("HYBRID", f"SSO wait after hybrid (using protocol sso): {e}", level="warn")
+        append_sso_to_txt(sso_cred, output_path)
         result = {
             "email": email,
-            "sso": sso_cred.get("sso_token") or sso_cred.get("apiKey") or "",
-            "apiKey": sso_cred.get("apiKey") or "",
-            "sso_token": sso_cred.get("sso_token") or "",
-            "sso_rw": sso_cred.get("sso_rw") or "",
-            "cookie_header": sso_cred.get("cookie_header") or sso_cred.get("apiKey") or "",
+            "sso": sso_cred.get("sso_token") or sso_cred.get("apiKey") or hybrid_result.get("sso") or "",
+            "apiKey": sso_cred.get("apiKey") or hybrid_result.get("apiKey") or "",
+            "sso_token": sso_cred.get("sso_token") or hybrid_result.get("sso_token") or "",
+            "sso_rw": sso_cred.get("sso_rw") or hybrid_result.get("sso_rw") or "",
+            "cookie_header": sso_cred.get("cookie_header")
+            or sso_cred.get("apiKey")
+            or "",
             "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
             "providerSpecificData": sso_cred.get("providerSpecificData") or {},
+            "hybrid": True,
             **profile,
         }
     else:
-        # backward compat if someone returns a plain string
-        cred = normalize_grok_web_credential(sso_cred)
-        result = {
-            "email": email,
-            "sso": cred.get("sso_token") or str(sso_cred),
-            "apiKey": cred.get("apiKey") or str(sso_cred),
-            "sso_token": cred.get("sso_token") or "",
-            "sso_rw": cred.get("sso_rw") or "",
-            "cookie_header": cred.get("apiKey") or str(sso_cred),
-            "cloudflare_cookies": cred.get("cloudflare_cookies") or "",
-            "providerSpecificData": cred.get("providerSpecificData") or {},
-            **profile,
-        }
+        slog("FLOW", "① open sign-up")
+        open_signup_page()
+        slog("FLOW", "② email step")
+        email, dev_token = fill_email_and_submit()
+        slog("FLOW", "③ OTP / IMAP")
+        fill_code_and_submit(email, dev_token)
+        slog("FLOW", "④ profile + Turnstile + Complete sign up")
+        profile = fill_profile_and_submit()
+        slog("FLOW", "⑤ wait SSO cookies")
+        sso_cred = wait_for_sso_cookie()  # dict: apiKey / sso_token / providerSpecificData
+        append_sso_to_txt(sso_cred, output_path)
+
+        if extract_numbers:
+            extract_visible_numbers()
+
+        # Flatten for logs + 9router push (structured credential)
+        if isinstance(sso_cred, dict):
+            result = {
+                "email": email,
+                "sso": sso_cred.get("sso_token") or sso_cred.get("apiKey") or "",
+                "apiKey": sso_cred.get("apiKey") or "",
+                "sso_token": sso_cred.get("sso_token") or "",
+                "sso_rw": sso_cred.get("sso_rw") or "",
+                "cookie_header": sso_cred.get("cookie_header") or sso_cred.get("apiKey") or "",
+                "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
+                "providerSpecificData": sso_cred.get("providerSpecificData") or {},
+                **profile,
+            }
+        else:
+            # backward compat if someone returns a plain string
+            cred = normalize_grok_web_credential(sso_cred)
+            result = {
+                "email": email,
+                "sso": cred.get("sso_token") or str(sso_cred),
+                "apiKey": cred.get("apiKey") or str(sso_cred),
+                "sso_token": cred.get("sso_token") or "",
+                "sso_rw": cred.get("sso_rw") or "",
+                "cookie_header": cred.get("apiKey") or str(sso_cred),
+                "cloudflare_cookies": cred.get("cloudflare_cookies") or "",
+                "providerSpecificData": cred.get("providerSpecificData") or {},
+                **profile,
+            }
 
     slog(
         "CREATED",
         f"email={email}  name={profile.get('given_name','')} {profile.get('family_name','')}  "
-        f"pass={profile.get('password','')}",
+        f"pass={profile.get('password','')}"
+        + ("  mode=hybrid" if result.get("hybrid") else ""),
     )
 
     # Primary: settle → PKCE/device → chat usable → push 9router
     # ANY failure here must raise so main() counts FAIL (not OK).
+    # When GROK_CHAT_PROBE_OFF_CRITICAL (default on): OAuth on browser path,
+    # soft-reset, then HTTP probe+push so browser is not held during probe.
     try:
-        slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
-        convert_and_push_grok_cli(result)
+        conf = _load_config()
+        gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
+        off_crit = _chat_probe_off_critical(gcli)
+        if off_crit:
+            slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE  (PROBE deferred off critical)")
+            tokens = convert_grok_cli_tokens(result)
+            if tokens is not None:
+                slog("PROBE", "deferred (off critical path)")
+                result["inject_pending_probe"] = True
+                try:
+                    soft_reset_browser()
+                    slog("BROWSER", "soft-reset after OAuth (probe off critical path)")
+                except Exception as e:
+                    slog(
+                        "BROWSER",
+                        f"soft-reset after OAuth failed (non-fatal): {e}",
+                        level="warn",
+                    )
+                slog("FLOW", "⑧ PROBE → ⑨ PUSH")
+                probe_and_push_grok_cli(result, tokens)
+                result["inject_pending_probe"] = False
+        else:
+            slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
+            convert_and_push_grok_cli(result)
         slog("PUSH", "9router import OK")
     except Exception as e:
         err = str(e)
@@ -3534,30 +3677,82 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     return result
 
 
-def convert_and_push_grok_cli(result: dict) -> None:
+# ── grok-cli rate hygiene / probe scheduling ──────────────────────────
+# Env (config grok_cli.* also accepted; env wins when set):
+#   GROK_OAUTH_GAP_SEC            float, default 8 — min seconds between OAuth mints
+#   GROK_CHAT_PROBE_OFF_CRITICAL  bool,  default true — probe+push after browser
+#                                 soft-reset (HTTP only; browser not held on probe)
+_last_oauth_ts: float = 0.0
+
+
+def _oauth_gap_sec(gcli: dict | None = None) -> float:
+    raw = (os.environ.get("GROK_OAUTH_GAP_SEC") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    gcli = gcli or {}
+    try:
+        if gcli.get("oauth_gap_sec") is not None:
+            return max(0.0, float(gcli.get("oauth_gap_sec")))
+    except (TypeError, ValueError):
+        pass
+    return 8.0
+
+
+def _chat_probe_off_critical(gcli: dict | None = None) -> bool:
+    raw = (os.environ.get("GROK_CHAT_PROBE_OFF_CRITICAL") or "").strip()
+    if raw:
+        return _env_bool_local("GROK_CHAT_PROBE_OFF_CRITICAL", True)
+    gcli = gcli or {}
+    if gcli.get("chat_probe_off_critical") is not None:
+        return bool(gcli.get("chat_probe_off_critical"))
+    return True
+
+
+def _wait_oauth_gap(gap_sec: float) -> None:
+    """Sleep remaining gap since last successful OAuth (single-worker safe)."""
+    global _last_oauth_ts
+    if gap_sec <= 0:
+        return
+    if _last_oauth_ts <= 0:
+        return
+    elapsed = time.time() - _last_oauth_ts
+    if elapsed < gap_sec:
+        rem = gap_sec - elapsed
+        slog("OAUTH", f"gap sleep {rem:.1f}s (oauth_gap_sec={gap_sec:g})")
+        time.sleep(rem)
+
+
+def _mark_oauth_done() -> None:
+    global _last_oauth_ts
+    _last_oauth_ts = time.time()
+
+
+def _gcli_inject_policy(gcli: dict) -> str:
+    inject_policy = str(gcli.get("inject_policy") or "usable").strip().lower()
+    if inject_policy in ("jwt", "clean"):
+        return "jwt_clean"
+    return inject_policy
+
+
+def convert_grok_cli_tokens(result: dict):
     """
-    Build OAuth → chat usable probe → 9router grok-cli.
+    OAuth-only: settle → PKCE/device → JWT gate. Returns BuildTokens or None.
 
-    Default (flash path): browser PKCE with referrer=grok-build on the same
-    session as signup. Fallback: HTTP device convert from SSO cookie.
+    Does NOT probe chat or push to 9router. Browser may still be needed for PKCE.
 
-    inject_policy:
-      usable  — only push if chat probe USABLE (default; fights 403)
-      all     — push if tokens ok (legacy)
-      jwt_clean — hard reject bot_flag (optional)
+    Env / config (see module comment above convert_and_push_grok_cli):
+      GROK_OAUTH_GAP_SEC / grok_cli.oauth_gap_sec
     """
     conf = _load_config()
     gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
     if gcli.get("enabled") is False:
         print("[*] grok-cli convert disabled (grok_cli.enabled=false)")
-        return
-
-    from push_9router_grok_cli import push_build_tokens_to_9router
+        return None
 
     email = str(result.get("email") or "").strip()
-    given = str(result.get("given_name") or "").strip()
-    family = str(result.get("family_name") or "").strip()
-    display = f"{given} {family}".strip()
     px = current_proxy_url()
 
     oauth_mode = str(gcli.get("oauth_mode") or "pkce").strip().lower()
@@ -3566,14 +3761,14 @@ def convert_and_push_grok_cli(result: dict) -> None:
         settle_s = float(gcli.get("post_signup_settle_sec") or 12)
     except (TypeError, ValueError):
         settle_s = 12.0
-    inject_policy = str(gcli.get("inject_policy") or "usable").strip().lower()
-    if inject_policy in ("jwt", "clean"):
-        inject_policy = "jwt_clean"
+    inject_policy = _gcli_inject_policy(gcli)
     reject_bot = bool(gcli.get("jwt_reject_bot_flag") or inject_policy == "jwt_clean")
     enforce_ref = gcli.get("jwt_enforce_referrer")
     if enforce_ref is None:
         enforce_ref = True
-    probe_model = str(gcli.get("chat_probe_model") or gcli.get("smoke_model") or "grok-4.5").strip()
+
+    gap_sec = _oauth_gap_sec(gcli)
+    _wait_oauth_gap(gap_sec)
 
     # ── SETTLE (hygiene before OAuth — flash anti-bot) ──────────────
     if settle_s > 0:
@@ -3590,10 +3785,7 @@ def convert_and_push_grok_cli(result: dict) -> None:
             f"(flash path — same session as signup)",
         )
         try:
-            from build_oauth_pkce import (
-                jwt_gate_decision,
-                obtain_tokens_via_browser_pkce,
-            )
+            from build_oauth_pkce import obtain_tokens_via_browser_pkce
 
             # Prefer active page (Chromium Drission / Playwright attach)
             oauth_page = page
@@ -3619,9 +3811,34 @@ def convert_and_push_grok_cli(result: dict) -> None:
         slog("CONVERT", f"Web SSO → Device OAuth (fallback) email={email or '-'}")
         from sso_to_build import convert_sso_to_build
 
-        tokens = convert_sso_to_build(result, name_hint=email)
+        # Full jar (sso + cf_clearance etc.) helps device verify under CF
+        jar: dict = {}
+        try:
+            wanted, _ = _collect_grok_session_cookies()
+            if wanted:
+                jar.update(wanted)
+        except Exception:
+            pass
+        if isinstance(result, dict):
+            if result.get("sso_token") or result.get("sso"):
+                jar.setdefault("sso", result.get("sso_token") or result.get("sso"))
+            if result.get("sso_rw"):
+                jar.setdefault("sso-rw", result.get("sso_rw"))
+            cf = str(result.get("cloudflare_cookies") or "")
+            for part in cf.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    jar.setdefault(k.strip(), v.strip())
+        tokens = convert_sso_to_build(
+            result,
+            name_hint=email,
+            proxy=px or current_proxy_url(),
+            page=page,
+            cookies=jar or None,
+        )
 
-    # Normalize token object for push (BuildTokens from either module)
+    # Normalize token fields onto result (probe/push use tokens object)
     access = getattr(tokens, "access_token", "") or ""
     refresh = getattr(tokens, "refresh_token", "") or ""
     tok_email = getattr(tokens, "email", "") or email
@@ -3672,6 +3889,49 @@ def convert_and_push_grok_cli(result: dict) -> None:
     except ImportError:
         pass
 
+    _mark_oauth_done()
+    result["build_access_token"] = access
+    result["build_refresh_token"] = refresh
+    result["build_email"] = tok_email
+    result["build_user_id"] = tok_uid
+    result["bot_flag_source"] = bot_flag
+    result["oauth_referrer"] = tok_ref
+    result["_build_tokens"] = tokens
+    return tokens
+
+
+def probe_and_push_grok_cli(result: dict, tokens) -> None:
+    """
+    Chat usable probe + 9router push. HTTP-only — no browser required.
+
+    inject_policy=usable (default): NEVER inject until probe USABLE.
+    DENIED raises RuntimeError so main counts FAIL.
+    """
+    if tokens is None:
+        return
+
+    conf = _load_config()
+    gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
+    if gcli.get("enabled") is False:
+        return
+
+    from push_9router_grok_cli import push_build_tokens_to_9router
+
+    email = str(result.get("email") or "").strip()
+    given = str(result.get("given_name") or "").strip()
+    family = str(result.get("family_name") or "").strip()
+    display = f"{given} {family}".strip()
+    px = current_proxy_url()
+
+    inject_policy = _gcli_inject_policy(gcli)
+    probe_model = str(
+        gcli.get("chat_probe_model") or gcli.get("smoke_model") or "grok-4.5"
+    ).strip()
+
+    access = getattr(tokens, "access_token", "") or result.get("build_access_token") or ""
+    tok_email = getattr(tokens, "email", "") or result.get("build_email") or email
+    tok_uid = getattr(tokens, "user_id", "") or result.get("build_user_id") or ""
+
     # ── PHASE: CHAT USABLE (truth for 403 — flash inject_policy=usable) ──
     usable_info = None
     if inject_policy == "usable":
@@ -3715,10 +3975,10 @@ def convert_and_push_grok_cli(result: dict) -> None:
                 f"email={tok_email} err={usable_info.get('err')}"
             )
     else:
-        # legacy smoke only when bot-flagged
+        # legacy: skip hard usable gate (may still smoke inside push)
         slog("PROBE", f"inject_policy={inject_policy} — skip hard usable gate")
 
-    # ── PHASE: PUSH ─────────────────────────────────────────────────
+    # ── PHASE: PUSH (only after USABLE when policy=usable) ──────────
     slog("PUSH", f"import grok-cli → 9router  email={tok_email or '-'}")
     push_build_tokens_to_9router(
         tokens,
@@ -3735,15 +3995,44 @@ def convert_and_push_grok_cli(result: dict) -> None:
         smoke_timeout_sec=float(gcli.get("smoke_timeout_sec") or 45),
     )
     result["build_access_token"] = access
-    result["build_refresh_token"] = refresh
+    result["build_refresh_token"] = (
+        getattr(tokens, "refresh_token", "") or result.get("build_refresh_token") or ""
+    )
     result["build_email"] = tok_email
     result["build_user_id"] = tok_uid
-    result["bot_flag_source"] = bot_flag
-    result["oauth_referrer"] = tok_ref
+    result["bot_flag_source"] = getattr(tokens, "bot_flag_source", None)
+    result["oauth_referrer"] = getattr(tokens, "referrer", "") or ""
     slog(
         "PUSH",
         f"grok-cli ready  email={tok_email}  user_id={tok_uid or '-'}",
     )
+
+
+def convert_and_push_grok_cli(result: dict) -> None:
+    """
+    Build OAuth → chat usable probe → 9router grok-cli (combined path).
+
+    Prefer split helpers when deferring probe off the browser critical path:
+      convert_grok_cli_tokens(result) → tokens
+      probe_and_push_grok_cli(result, tokens)
+
+    Default (flash path): browser PKCE with referrer=grok-build on the same
+    session as signup. Fallback: HTTP device convert from SSO cookie.
+
+    Env:
+      GROK_OAUTH_GAP_SEC            — seconds between OAuth mints (default 8)
+      GROK_CHAT_PROBE_OFF_CRITICAL  — if true (default), callers soft-reset
+                                      browser before probe (see run_single_registration)
+
+    inject_policy:
+      usable  — only push if chat probe USABLE (default; fights 403)
+      all     — push if tokens ok (legacy)
+      jwt_clean — hard reject bot_flag (optional)
+    """
+    tokens = convert_grok_cli_tokens(result)
+    if tokens is None:
+        return
+    probe_and_push_grok_cli(result, tokens)
 
 
 def load_run_count() -> int:
@@ -3906,7 +4195,9 @@ def main():
     slog(
         "BOOT",
         f"share={WORKER_TOTAL or '∞'}  pool={POOL_TOTAL or WORKER_TOTAL or '∞'}  "
-        f"offset={POOL_OFFSET}  display={DISPLAY_MODE}  out={os.path.basename(args.output)}",
+        f"offset={POOL_OFFSET}  display={DISPLAY_MODE}  "
+        f"register_mode={_resolve_register_mode()}  "
+        f"out={os.path.basename(args.output)}",
     )
     slog(
         "BOOT",

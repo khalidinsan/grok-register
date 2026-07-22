@@ -3,3 +3,5 @@ playwright>=1.40.0
 textual>=1.0.0
 requests>=2.28.0
 camoufox[geoip]>=0.4.11
+# Chrome TLS fingerprint for hybrid protocol + SSO materialize / device OAuth
+curl_cffi>=0.7.0
