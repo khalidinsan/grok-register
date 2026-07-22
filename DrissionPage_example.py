@@ -3912,9 +3912,7 @@ def convert_grok_cli_tokens(result: dict):
         settle_s = float(gcli.get("post_signup_settle_sec") or 12)
     except (TypeError, ValueError):
         settle_s = 12.0
-    # Hybrid already settled during protocol path — shorter idle before PKCE
-    if from_hybrid and settle_s > 6:
-        settle_s = 6.0
+    # Bot hygiene: always honor post_signup_settle_sec (default 12s), including hybrid
     inject_policy = _gcli_inject_policy(gcli)
     reject_bot = bool(gcli.get("jwt_reject_bot_flag") or inject_policy == "jwt_clean")
     enforce_ref = gcli.get("jwt_enforce_referrer")
