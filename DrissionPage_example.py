@@ -3737,6 +3737,155 @@ def _gcli_inject_policy(gcli: dict) -> str:
     return inject_policy
 
 
+def _inject_sso_cookies_to_page(sso: str, sso_rw: str = "", cf_header: str = "") -> None:
+    """Best-effort inject session SSO (+ CF) into active browser context before PKCE."""
+    global page
+    if page is None or not sso:
+        return
+    sso = str(sso).strip()
+    sso_rw = str(sso_rw or sso).strip()
+    # Playwright/Camoufox context.add_cookies if available
+    try:
+        raw = getattr(page, "raw", None) or page
+        ctx = getattr(raw, "context", None)
+        if ctx is not None:
+            cookies = []
+            for domain in (".x.ai", "accounts.x.ai", "auth.x.ai", ".accounts.x.ai"):
+                cookies.append(
+                    {
+                        "name": "sso",
+                        "value": sso,
+                        "domain": domain if domain.startswith(".") else domain,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "sameSite": "Lax",
+                    }
+                )
+                cookies.append(
+                    {
+                        "name": "sso-rw",
+                        "value": sso_rw,
+                        "domain": domain if domain.startswith(".") else domain,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "sameSite": "Lax",
+                    }
+                )
+            for part in str(cf_header or "").split(";"):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                k, _, v = part.partition("=")
+                k, v = k.strip(), v.strip()
+                if not k or not v:
+                    continue
+                cookies.append(
+                    {
+                        "name": k,
+                        "value": v,
+                        "domain": ".x.ai",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "sameSite": "Lax",
+                    }
+                )
+            is_async = bool(getattr(page, "_async", False) or getattr(page, "_loop", None))
+            loop = getattr(page, "_loop", None)
+            if is_async and loop is not None:
+                loop.run_until_complete(ctx.add_cookies(cookies))
+            else:
+                ctx.add_cookies(cookies)
+            return
+    except Exception as e:
+        slog("CONVERT", f"context.add_cookies warn: {e}", level="warn")
+    # JS fallback
+    try:
+        page.run_js(
+            """
+            (v, rw) => {
+              try {
+                document.cookie = 'sso=' + v + '; path=/; domain=.x.ai; Secure; SameSite=Lax';
+                document.cookie = 'sso-rw=' + (rw||v) + '; path=/; domain=.x.ai; Secure; SameSite=Lax';
+              } catch (e) {}
+              return true;
+            }
+            """,
+            sso,
+            sso_rw,
+        )
+    except Exception:
+        pass
+
+
+def prepare_page_for_pkce(result: dict | None = None) -> Any:
+    """
+    Stabilize browser tab after hybrid / mid-flow so PKCE goto doesn't
+    NS_BINDING_ABORTED on a detached frame.
+
+    - refresh page handle
+    - optional new tab
+    - re-inject SSO cookies from result
+    - navigate accounts.x.ai/account then brief pause
+    """
+    global page, browser
+    refresh_active_page()
+    sso = ""
+    sso_rw = ""
+    cf = ""
+    if isinstance(result, dict):
+        sso = str(result.get("sso_token") or result.get("sso") or "").strip()
+        if sso.lower().startswith("sso="):
+            sso = sso[4:].split(";")[0].strip()
+        sso_rw = str(result.get("sso_rw") or sso).strip()
+        cf = str(result.get("cloudflare_cookies") or "").strip()
+    if not sso:
+        try:
+            wanted, _ = _collect_grok_session_cookies()
+            sso = str(wanted.get("sso") or "").strip()
+            sso_rw = str(wanted.get("sso-rw") or sso).strip()
+        except Exception:
+            pass
+
+    # Prefer a fresh tab on Camoufox/Playwright (old tab may be detached after hybrid)
+    try:
+        if browser is not None and _is_pw_adapter_browser():
+            try:
+                page = browser.new_tab("about:blank")
+            except Exception:
+                try:
+                    if page is not None:
+                        page.get("about:blank")
+                except Exception:
+                    pass
+            time.sleep(0.4)
+            if sso:
+                _inject_sso_cookies_to_page(sso, sso_rw, cf)
+            try:
+                page.get("https://accounts.x.ai/account")
+            except Exception as e:
+                slog("CONVERT", f"PKCE prep goto account warn: {e}", level="warn")
+            time.sleep(1.2)
+            slog("CONVERT", "PKCE prep: new tab + cookies → accounts.x.ai/account")
+            return page
+    except Exception as e:
+        slog("CONVERT", f"PKCE prep new-tab warn: {e}", level="warn")
+
+    if page is None:
+        start_browser()
+    try:
+        if sso:
+            _inject_sso_cookies_to_page(sso, sso_rw, cf)
+        page.get("https://accounts.x.ai/account")
+        time.sleep(1.5)
+        slog("CONVERT", "PKCE prep: re-nav accounts.x.ai/account")
+    except Exception as e:
+        slog("CONVERT", f"PKCE prep nav warn: {e}", level="warn")
+    return page
+
+
 def convert_grok_cli_tokens(result: dict):
     """
     OAuth-only: settle → PKCE/device → JWT gate. Returns BuildTokens or None.
@@ -3745,6 +3894,7 @@ def convert_grok_cli_tokens(result: dict):
 
     Env / config (see module comment above convert_and_push_grok_cli):
       GROK_OAUTH_GAP_SEC / grok_cli.oauth_gap_sec
+      GROK_DEVICE_RL_MAX_TRIES (default 2) / GROK_DEVICE_POLL_TIMEOUT_SEC (45)
     """
     conf = _load_config()
     gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
@@ -3754,6 +3904,7 @@ def convert_grok_cli_tokens(result: dict):
 
     email = str(result.get("email") or "").strip()
     px = current_proxy_url()
+    from_hybrid = bool(isinstance(result, dict) and result.get("hybrid"))
 
     oauth_mode = str(gcli.get("oauth_mode") or "pkce").strip().lower()
     referrer = str(gcli.get("oauth_referrer") or "grok-build").strip() or "grok-build"
@@ -3761,6 +3912,9 @@ def convert_grok_cli_tokens(result: dict):
         settle_s = float(gcli.get("post_signup_settle_sec") or 12)
     except (TypeError, ValueError):
         settle_s = 12.0
+    # Hybrid already settled during protocol path — shorter idle before PKCE
+    if from_hybrid and settle_s > 6:
+        settle_s = 6.0
     inject_policy = _gcli_inject_policy(gcli)
     reject_bot = bool(gcli.get("jwt_reject_bot_flag") or inject_policy == "jwt_clean")
     enforce_ref = gcli.get("jwt_enforce_referrer")
@@ -3776,39 +3930,65 @@ def convert_grok_cli_tokens(result: dict):
         time.sleep(settle_s)
         slog("SETTLE", "done")
 
+    # Stabilize page after hybrid (prevents NS_BINDING_ABORTED on PKCE goto)
+    if from_hybrid or oauth_mode in ("pkce", "browser", "oidc", "grok-build"):
+        try:
+            prepare_page_for_pkce(result)
+        except Exception as e:
+            slog("CONVERT", f"PKCE prep failed (continue): {e}", level="warn")
+
     # ── PHASE: CONVERT (PKCE browser preferred) ─────────────────────
     tokens = None
+    pkce_err: Exception | None = None
     if oauth_mode in ("pkce", "browser", "oidc", "grok-build"):
         slog(
             "CONVERT",
             f"browser PKCE referrer={referrer} email={email or '-'} "
-            f"(flash path — same session as signup)",
+            f"(flash path — same session as signup"
+            f"{'; hybrid prep' if from_hybrid else ''})",
         )
-        try:
-            from build_oauth_pkce import obtain_tokens_via_browser_pkce
+        for pkce_try in range(1, 3 if from_hybrid else 2):
+            try:
+                from build_oauth_pkce import obtain_tokens_via_browser_pkce
 
-            # Prefer active page (Chromium Drission / Playwright attach)
-            oauth_page = page
-            if oauth_page is None:
-                raise RuntimeError("no browser page for PKCE")
-            tokens = obtain_tokens_via_browser_pkce(
-                oauth_page,
-                email=email,
-                referrer=referrer,
-                timeout_sec=float(gcli.get("oauth_timeout_sec") or 90),
-                proxy=px,
-                log=lambda m: slog("CONVERT", m),
-            )
-        except Exception as e:
+                oauth_page = page
+                if oauth_page is None:
+                    raise RuntimeError("no browser page for PKCE")
+                if pkce_try > 1:
+                    slog("CONVERT", f"PKCE retry #{pkce_try} after prep", level="warn")
+                    prepare_page_for_pkce(result)
+                    oauth_page = page
+                tokens = obtain_tokens_via_browser_pkce(
+                    oauth_page,
+                    email=email,
+                    referrer=referrer,
+                    timeout_sec=float(gcli.get("oauth_timeout_sec") or 90),
+                    proxy=px,
+                    log=lambda m: slog("CONVERT", m),
+                )
+                pkce_err = None
+                break
+            except Exception as e:
+                pkce_err = e
+                slog(
+                    "CONVERT",
+                    f"PKCE browser failed try={pkce_try}: {e}",
+                    level="warn",
+                )
+                tokens = None
+                # Only re-prep once for hybrid
+                if pkce_try >= (2 if from_hybrid else 1):
+                    break
+
+        if tokens is None and pkce_err is not None:
             slog(
                 "CONVERT",
-                f"PKCE browser failed ({e}) — fallback device SSO convert",
+                f"PKCE failed — device SSO fallback (fail-fast)  err={pkce_err}",
                 level="warn",
             )
-            tokens = None
 
     if tokens is None:
-        slog("CONVERT", f"Web SSO → Device OAuth (fallback) email={email or '-'}")
+        slog("CONVERT", f"Web SSO → Device OAuth (fail-fast) email={email or '-'}")
         from sso_to_build import convert_sso_to_build
 
         # Full jar (sso + cf_clearance etc.) helps device verify under CF
@@ -3830,12 +4010,23 @@ def convert_grok_cli_tokens(result: dict):
                 if "=" in part:
                     k, _, v = part.partition("=")
                     jar.setdefault(k.strip(), v.strip())
+        # Fail-fast: 2 RL tries, 45s poll — never burn ~7min
+        try:
+            max_rl = int(os.environ.get("GROK_DEVICE_RL_MAX_TRIES") or "2")
+        except (TypeError, ValueError):
+            max_rl = 2
+        try:
+            poll_to = float(os.environ.get("GROK_DEVICE_POLL_TIMEOUT_SEC") or "45")
+        except (TypeError, ValueError):
+            poll_to = 45.0
         tokens = convert_sso_to_build(
             result,
             name_hint=email,
             proxy=px or current_proxy_url(),
             page=page,
             cookies=jar or None,
+            max_rl_tries=max_rl,
+            poll_timeout_sec=poll_to,
         )
 
     # Normalize token fields onto result (probe/push use tokens object)

@@ -50,8 +50,23 @@ USER_AGENT = (
 # Domains that need SSO / CF cookies for device OAuth
 _COOKIE_DOMAINS = (".x.ai", "accounts.x.ai", "auth.x.ai")
 
-# Rate-limit / slow-down retry: max 4 tries, sleep min(20*attempt, 120)
-_RL_MAX_TRIES = 4
+# Rate-limit / slow-down retry. Fail-fast default 2 (env GROK_DEVICE_RL_MAX_TRIES).
+# Was 4 with sleep up to 120s → ~7min hangs on dead SSO. Prefer short + fail.
+def _rl_max_tries_default() -> int:
+    try:
+        return max(1, min(6, int(os.environ.get("GROK_DEVICE_RL_MAX_TRIES") or "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _poll_timeout_default() -> float:
+    try:
+        return max(15.0, float(os.environ.get("GROK_DEVICE_POLL_TIMEOUT_SEC") or "45"))
+    except (TypeError, ValueError):
+        return 45.0
+
+
+_RL_MAX_TRIES = 2  # module default; SsoBuildFlow can override
 
 
 @dataclass
@@ -156,10 +171,13 @@ def _looks_rate_limited(status: int, body: bytes | str = b"", err_text: str = ""
     )
 
 
-def _rl_sleep(attempt: int) -> None:
-    """attempt is 1-based try index after a failure."""
-    delay = min(20 * attempt, 120)
-    print(f"[Build] rate-limit / slow_down — backoff {delay}s (attempt {attempt})", flush=True)
+def _rl_sleep(attempt: int, *, cap: float = 25.0) -> None:
+    """attempt is 1-based try index after a failure. Fail-fast: cap ~25s (was 120)."""
+    delay = min(8 * attempt, cap)
+    print(
+        f"[Build] rate-limit / slow_down — backoff {delay:.0f}s (attempt {attempt})",
+        flush=True,
+    )
     time.sleep(delay)
 
 
@@ -193,9 +211,22 @@ class SsoBuildFlow:
         user_agent: str = USER_AGENT,
         proxy: str | None = None,
         cookies: Any = None,
+        *,
+        max_rl_tries: int | None = None,
+        poll_timeout_sec: float | None = None,
     ):
         self.user_agent = user_agent
         self.session = requests.Session()
+        self._max_rl = (
+            max(1, int(max_rl_tries))
+            if max_rl_tries is not None
+            else _rl_max_tries_default()
+        )
+        self._poll_timeout = (
+            float(poll_timeout_sec)
+            if poll_timeout_sec is not None
+            else _poll_timeout_default()
+        )
         # Optional HTTP(S) proxy. Pass proxy="" to force direct.
         if proxy is None:
             proxy = (os.environ.get("GROK_BROWSER_PROXY") or "").strip()
@@ -319,12 +350,13 @@ class SsoBuildFlow:
     ) -> Tuple[int, str, bytes]:
         """HTTP call with exponential backoff on 429 / rate_limit / slow_down."""
         last: Tuple[int, str, bytes] = (0, url, b"")
-        for attempt in range(1, _RL_MAX_TRIES + 1):
+        max_tries = getattr(self, "_max_rl", None) or _rl_max_tries_default()
+        for attempt in range(1, max_tries + 1):
             status, final_url, body = self.do(method, url, form=form, timeout=timeout)
             last = (status, final_url, body)
             if not _looks_rate_limited(status, body):
                 return status, final_url, body
-            if attempt >= _RL_MAX_TRIES:
+            if attempt >= max_tries:
                 break
             _rl_sleep(attempt)
         return last
@@ -394,8 +426,10 @@ class SsoBuildFlow:
         print("[Build] Polling OAuth token ...")
         if interval < 1:
             interval = 1
-        deadline = time.time() + min(expires_in, 75)
+        poll_cap = float(getattr(self, "_poll_timeout", None) or _poll_timeout_default())
+        deadline = time.time() + min(expires_in, poll_cap)
         rl_poll_tries = 0
+        max_rl = getattr(self, "_max_rl", None) or _rl_max_tries_default()
         while time.time() < deadline:
             time.sleep(interval)
             status, _, body = self.do(
@@ -449,12 +483,12 @@ class SsoBuildFlow:
                 continue
             if err == "slow_down" or _looks_rate_limited(status, body, err):
                 rl_poll_tries += 1
-                if rl_poll_tries > _RL_MAX_TRIES:
+                if rl_poll_tries > max_rl:
                     raise RuntimeError(
-                        f"token poll rate-limited after {_RL_MAX_TRIES} tries: "
+                        f"token poll rate-limited after {max_rl} tries: "
                         f"{payload.get('error_description') or err or body[:200]!r}"
                     )
-                interval += 5
+                interval += 2
                 _rl_sleep(rl_poll_tries)
                 continue
             if err in ("access_denied", "expired_token"):
@@ -535,6 +569,8 @@ def convert_sso_to_build(
     fallback_direct: bool = True,
     cookies: Any = None,
     page: Any = None,
+    max_rl_tries: int | None = None,
+    poll_timeout_sec: float | None = None,
 ) -> BuildTokens:
     """
     Convert Web SSO → Build tokens (requires access_token + refresh_token).
@@ -544,6 +580,7 @@ def convert_sso_to_build(
     fallback_direct: if proxied convert hits 429 / proxy errors, retry once direct.
     cookies: optional full jar (dict or list) with cf_clearance, __cf_bm, sso-rw, etc.
     page: optional DrissionPage / Playwright-like handle for wrapper materialize.
+    max_rl_tries / poll_timeout_sec: fail-fast knobs (defaults from env, ~2 tries / 45s).
     """
     sso, sso_rw = extract_sso_from_credential(sso_credential)
     if not sso:
@@ -567,6 +604,8 @@ def convert_sso_to_build(
             sso_rw=sso_rw,
             proxy=px,
             cookies=cookies,
+            max_rl_tries=max_rl_tries,
+            poll_timeout_sec=poll_timeout_sec,
         ).convert(name_hint=name_hint)
 
     try:
