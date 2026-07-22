@@ -479,19 +479,39 @@ class PoolRunner:
             "GROK_BLOCK_ASSETS",
             str(os.environ.get("GROK_BLOCK_ASSETS") or "1"),
         )
-        # register_mode / oauth gap / deferred probe (parent env or defaults)
-        env.setdefault(
-            "GROK_REGISTER_MODE",
-            str(os.environ.get("GROK_REGISTER_MODE") or "browser"),
-        )
+        # register_mode / oauth gap / deferred probe — prefer shell env, else config.json
+        _full = {}
+        try:
+            _cfgp = ROOT / "config.json"
+            if _cfgp.is_file():
+                import json as _json
+
+                _full = _json.loads(_cfgp.read_text(encoding="utf-8"))
+        except Exception:
+            _full = {}
+        _gcli = _full.get("grok_cli") if isinstance(_full.get("grok_cli"), dict) else {}
+        _rmode = str(
+            os.environ.get("GROK_REGISTER_MODE")
+            or _full.get("register_mode")
+            or (_full.get("run") or {}).get("register_mode")
+            or "browser"
+        ).strip().lower()
+        if _rmode not in ("hybrid", "browser"):
+            _rmode = "browser"
+        env.setdefault("GROK_REGISTER_MODE", _rmode)
         env.setdefault(
             "GROK_OAUTH_GAP_SEC",
-            str(os.environ.get("GROK_OAUTH_GAP_SEC") or "8"),
+            str(
+                os.environ.get("GROK_OAUTH_GAP_SEC")
+                or _gcli.get("oauth_gap_sec")
+                or "8"
+            ),
         )
-        env.setdefault(
-            "GROK_CHAT_PROBE_OFF_CRITICAL",
-            str(os.environ.get("GROK_CHAT_PROBE_OFF_CRITICAL") or "1"),
-        )
+        _off = os.environ.get("GROK_CHAT_PROBE_OFF_CRITICAL")
+        if _off is None or str(_off).strip() == "":
+            _off_cfg = _gcli.get("chat_probe_off_critical")
+            _off = "1" if (_off_cfg is None or _off_cfg is True) else "0"
+        env.setdefault("GROK_CHAT_PROBE_OFF_CRITICAL", str(_off))
         pool = getattr(self.state, "proxy_pool", None) or []
         if pool:
             env["GROK_PROXIES"] = encode_proxy_env(pool)
