@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
@@ -12,6 +14,7 @@ import os
 import platform
 import secrets
 import sys
+from typing import Any
 
 # Windows: console/pipe often cp1252 — Unicode in print()/slog (→ ✓ …) must not crash farm
 if hasattr(sys.stdout, "reconfigure"):
