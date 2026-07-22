@@ -384,10 +384,46 @@ def select_proxy_for_account(account_index: int) -> str:
     return _proxy_pool[(gidx - 1) % len(_proxy_pool)]
 
 
-def ensure_browser_proxy_for_account(account_index: int) -> str:
+def _env_bool_local(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def is_proxy_failure(err: BaseException | str) -> bool:
+    """Flash-aligned: detect dead proxy / tunnel so we can retry or fall direct."""
+    s = str(err).lower()
+    name = type(err).__name__.lower() if not isinstance(err, str) else ""
+    keys = (
+        "invalidproxy",
+        "failed to connect to proxy",
+        "proxy connection",
+        "err_proxy",
+        "tunnel connection failed",
+        "402 payment required",
+        "proxy_error",
+        "ns_error_proxy",
+        "proxy refused",
+        "proxy timeout",
+        "err_tunnel",
+        "socks",
+        "net::err_proxy",
+        "could not connect to proxy",
+        "proxy authentication",
+        "407 proxy",
+    )
+    return any(k in s or k in name for k in keys)
+
+
+def force_browser_proxy(proxy_url: str, *, account_index: int = 0, reason: str = "") -> str:
     """
-    Switch browser to the proxy for this account.
-    Full restart only when proxy URL changes (can't hot-swap).
+    Point browser at proxy_url (empty = direct). Full restart when URL changes.
+    Used by per-account pick and by proxy-retry → direct fallback.
     """
     global _browser_proxy
     try:
@@ -395,13 +431,16 @@ def ensure_browser_proxy_for_account(account_index: int) -> str:
     except Exception:
         mask_proxy = lambda u: (u[:32] + "…") if u and len(u) > 32 else (u or "")  # type: ignore
 
-    nxt = select_proxy_for_account(account_index)
-    prev = _browser_proxy
+    nxt = (proxy_url or "").strip()
+    prev = _browser_proxy or ""
     if browser is not None and nxt == prev:
-        slog(
-            "PROXY",
-            f"reuse  #{account_index}  {mask_proxy(nxt) if nxt else '(direct)'}",
-        )
+        if reason:
+            slog("PROXY", f"reuse  #{account_index or '?'}  {mask_proxy(nxt) if nxt else '(direct)'}  ({reason})")
+        else:
+            slog(
+                "PROXY",
+                f"reuse  #{account_index or '?'}  {mask_proxy(nxt) if nxt else '(direct)'}",
+            )
         return nxt
 
     _browser_proxy = nxt
@@ -415,14 +454,16 @@ def ensure_browser_proxy_for_account(account_index: int) -> str:
     if _proxy_pool and nxt in _proxy_pool:
         slot = f"  slot={_proxy_pool.index(nxt) + 1}/{len(_proxy_pool)}"
     need_restart = browser is not None and prev != nxt
+    tag = f"  ({reason})" if reason else ""
     slog(
         "PROXY",
-        f"account#{account_index} → {mask_proxy(nxt) if nxt else '(direct)'}{slot}"
+        f"account#{account_index or '?'} → {mask_proxy(nxt) if nxt else '(direct)'}{slot}"
         + (
             "  [full browser restart]"
             if need_restart
             else ("  [start]" if browser is None else "  [same]")
-        ),
+        )
+        + tag,
     )
     if browser is None:
         start_browser()
@@ -430,6 +471,58 @@ def ensure_browser_proxy_for_account(account_index: int) -> str:
         stop_browser()
         start_browser()
     return nxt
+
+
+def ensure_browser_proxy_for_account(account_index: int) -> str:
+    """
+    Switch browser to the proxy for this account.
+    Full restart only when proxy URL changes (can't hot-swap).
+    """
+    return force_browser_proxy(
+        select_proxy_for_account(account_index),
+        account_index=account_index,
+    )
+
+
+def pick_proxy_for_try(
+    account_index: int,
+    tried: set[str],
+    try_i: int,
+    *,
+    max_proxy_tries: int,
+    allow_direct: bool,
+) -> tuple[str | None, str]:
+    """
+    Flash strategy: try up to N distinct proxies, then direct if pool dead.
+
+    Returns (proxy_url_or_None_for_direct, label).
+    """
+    # Past proxy budget → direct fallback
+    if try_i >= max(1, max_proxy_tries) or not _proxy_pool:
+        if allow_direct or not _proxy_pool:
+            return None, "direct"
+        # no direct allowed and no unused proxy
+        return None, "direct"
+
+    # Prefer account's assigned proxy first
+    primary = select_proxy_for_account(account_index)
+    candidates: list[str] = []
+    if primary:
+        candidates.append(primary)
+    for p in _proxy_pool:
+        if p not in candidates:
+            candidates.append(p)
+
+    for p in candidates:
+        key = p or "direct"
+        if key in tried:
+            continue
+        return p, key
+
+    # All proxies exhausted
+    if allow_direct:
+        return None, "direct"
+    return primary or None, primary or "direct"
 
 # Global browser handles — options rebuilt per start_browser() for multi-worker isolation.
 co = None
@@ -769,6 +862,15 @@ def start_browser_playwright_proxy(profile_dir: str, debug_port: int) -> bool:
             viewport={"width": 1100, "height": 800},
             locale="en-US",
         )
+        # flash-style font/media block on first page
+        try:
+            from browser_engine import install_asset_block
+
+            p0 = _pw_context.pages[0] if _pw_context.pages else None
+            if p0 is not None and install_asset_block(p0, is_async=False):
+                slog("BROWSER", "asset-block on (font/media third-party)")
+        except Exception as _ab_e:
+            slog("BROWSER", f"asset-block skip: {_ab_e}", level="warn")
     except Exception as e:
         slog("PROXY", f"playwright launch failed: {e}", level="error")
         try:
@@ -934,14 +1036,24 @@ def start_browser():
             page = adapter.latest_tab if adapter else sess.page
             _chrome_temp_dir = ""
             _chrome_debug_port = 0
+            ab = sess.extra.get("asset_block")
             slog(
                 "BROWSER",
                 f"camoufox ready  display={DISPLAY_MODE}  "
                 f"headless={sess.extra.get('headless')!r}  "
-                f"os={sess.extra.get('camoufox_os') or '?'}",
+                f"os={sess.extra.get('camoufox_os') or '?'}  "
+                f"asset_block={'on' if ab else 'off'}",
             )
             return
         except Exception as e:
+            # Surface proxy-class launch errors so account loop can retry/direct
+            if is_proxy_failure(e):
+                slog(
+                    "BROWSER",
+                    f"camoufox proxy fail ({e}) — raise for retry/direct",
+                    level="warn",
+                )
+                raise
             slog(
                 "BROWSER",
                 f"camoufox failed ({e}) — fallback chromium",
@@ -2733,13 +2845,15 @@ def normalize_grok_web_credential(raw) -> dict:
     }
 
 
-def wait_for_sso_cookie(timeout=90):
+def wait_for_sso_cookie(timeout=90, no_sso_deadline=22):
     """
     Collect SSO after register — JANGAN buru-buru buka grok.com.
 
     Phases:
       1) wait_sso  — poll cookie di session sekarang (accounts.x.ai).
                      Tunggu sso muncul / redirect natural dulu.
+                     Fail-fast kalau stuck di /account tanpa sso
+                     (session mati: cuma CF cookies) biar gak nge-hang 90s.
       2) settle    — baru optional buka grok.com (setelah sso ada)
                      biar cf_clearance + binding domain settle.
 
@@ -2753,7 +2867,11 @@ def wait_for_sso_cookie(timeout=90):
     visited_grok = False
     last_url = ""
     nudged_account = False
+    reloaded_account = False
     poll_ticks = 0
+    last_poll_log = 0.0
+    stuck_on_account_since = None
+    wait_started = time.time()
 
     while time.time() < deadline:
         try:
@@ -2769,6 +2887,9 @@ def wait_for_sso_cookie(timeout=90):
             if cur and cur != last_url:
                 slog("SSO", f"url={cur[:140]}")
                 last_url = cur
+                # reset stuck timer on URL change
+                if "/account" not in cur or "sign-up" in cur:
+                    stuck_on_account_since = None
 
             try:
                 wanted, names_seen = _collect_grok_session_cookies()
@@ -2777,23 +2898,55 @@ def wait_for_sso_cookie(timeout=90):
                 wanted, names_seen = {}, set()
             last_seen_names |= names_seen
             has_sso = bool(wanted.get("sso"))
+            now = time.time()
 
             # ── Phase 1: tunggu SSO tanpa navigasi paksa ──
             if phase == "wait_sso":
                 if has_sso:
                     slog("SSO", "cookie muncul — settle session…")
                     phase = "settle"
-                    sso_ready_at = time.time()
+                    sso_ready_at = now
+                    stuck_on_account_since = None
                 else:
-                    # Kalau natural redirect ke grok.com / account page
+                    # Kalau natural redirect ke grok.com — pindah settle, tapi
+                    # jangan anggap sso ada; settle phase akan fail-fast kalau kosong.
                     if "grok.com" in cur:
-                        slog("SSO", "natural redirect → grok.com")
-                        phase = "settle"
-                        visited_grok = True
-                        sso_ready_at = time.time()
+                        if now - last_poll_log >= 8:
+                            slog("SSO", "on grok.com tanpa sso cookie — wait briefly")
+                            last_poll_log = now
+                        # short grace on grok without sso then fail
+                        if now - wait_started >= no_sso_deadline:
+                            raise Exception(
+                                "No sso cookie after signup (on grok.com without auth); "
+                                f"cookies seen: {sorted(last_seen_names)}"
+                            )
                     elif "/account" in cur and "sign-up" not in cur:
-                        slog("SSO", "on accounts.x.ai/account — poll cookies")
-                        # try soft nav once if still no sso after a few seconds
+                        if stuck_on_account_since is None:
+                            stuck_on_account_since = now
+                        stuck_for = now - stuck_on_account_since
+                        # rate-limit log (every 10s) — dulu spam 1×/detik keliatan hang
+                        if now - last_poll_log >= 10:
+                            slog(
+                                "SSO",
+                                f"on /account no sso yet  t={stuck_for:.0f}s  "
+                                f"cookies={sorted(names_seen)[:8]}",
+                            )
+                            last_poll_log = now
+                        # one soft reload after ~8s (sometimes cookie late-set)
+                        if not reloaded_account and stuck_for >= 8:
+                            reloaded_account = True
+                            try:
+                                slog("SSO", "reload /account once (late sso?)")
+                                page.get("https://accounts.x.ai/account")
+                                time.sleep(2)
+                            except Exception as e:
+                                slog("SSO", f"account reload warn: {e}", level="warn")
+                        # fail-fast: session dead (CF only, no auth cookie)
+                        if stuck_for >= no_sso_deadline:
+                            raise Exception(
+                                "No sso cookie after signup (stuck on /account); "
+                                f"cookies seen: {sorted(last_seen_names)}"
+                            )
                     elif "sign-up" in cur:
                         # Still on signup after Complete — nudge to /account once
                         poll_ticks += 1
@@ -2861,9 +3014,19 @@ def wait_for_sso_cookie(timeout=90):
                     )
                     return cred
 
+                # entered settle without sso (e.g. natural grok redirect) — don't hang
+                if not has_sso and sso_ready_at and (time.time() - sso_ready_at) >= no_sso_deadline:
+                    raise Exception(
+                        f"No sso cookie after signup; cookies seen: {sorted(last_seen_names)}"
+                    )
+
         except PageDisconnectedError:
             refresh_active_page()
         except Exception as e:
+            # re-raise our intentional fail-fast
+            msg = str(e)
+            if msg.startswith("No sso cookie after signup"):
+                raise
             slog("SSO", f"wait error: {e}", level="warn")
 
         time.sleep(1)
@@ -3514,7 +3677,7 @@ def convert_and_push_grok_cli(result: dict) -> None:
     if inject_policy == "usable":
         from chat_usable import probe_chat_usable
 
-        slog("PROBE", f"chat usable model={probe_model} email={tok_email or '-'}")
+        slog("PROBE", f"starting  model={probe_model}  email={tok_email or '-'}")
         usable_info = probe_chat_usable(
             access,
             email=tok_email,
@@ -3774,10 +3937,16 @@ def main():
     current_round = 0
     collected_sso: list = []
     try:
+        # Flash-aligned proxy retries (env):
+        #   GROK_PROXY_RETRIES=3          max distinct proxies per account
+        #   GROK_PROXY_FALLBACK_DIRECT=1  after pool fails → direct (default on)
+        max_proxy_tries = int(os.environ.get("GROK_PROXY_RETRIES", "3") or "3")
+        allow_direct_fallback = _env_bool_local("GROK_PROXY_FALLBACK_DIRECT", True)
         slog(
             "BROWSER",
             f"proxy_mode={_proxy_mode}  pool={len(_proxy_pool)}  "
-            f"(per_account → full Chromium restart when proxy changes)",
+            f"retries={max_proxy_tries}  fallback_direct={allow_direct_fallback}  "
+            f"(per_account → full restart when proxy changes)",
         )
         while True:
             if args.count > 0 and current_round >= args.count:
@@ -3787,34 +3956,102 @@ def main():
             progress_begin_account(current_round)
             hard_fail = False
 
-            # 1 proxy per account (or sticky per_worker) — restarts browser if needed
-            ensure_browser_proxy_for_account(current_round)
+            # Proxy strategy (flash): try up to N distinct proxies, then direct
+            tried_pids: set[str] = set()
+            last_error: Exception | None = None
+            account_ok = False
+            fail_recorded = False
+            total_attempts = max(1, max_proxy_tries) + (1 if allow_direct_fallback else 0)
+            # If no pool, single direct attempt
+            if not _proxy_pool:
+                total_attempts = 1
+
+            for try_i in range(total_attempts):
+                proxy_url, proxy_key = pick_proxy_for_try(
+                    current_round,
+                    tried_pids,
+                    try_i,
+                    max_proxy_tries=max_proxy_tries if _proxy_pool else 0,
+                    allow_direct=allow_direct_fallback or not _proxy_pool,
+                )
+                key = proxy_key or (proxy_url or "direct")
+                if key in tried_pids and try_i > 0:
+                    # nothing new left
+                    if allow_direct_fallback and "direct" not in tried_pids:
+                        proxy_url, key = None, "direct"
+                    else:
+                        break
+                tried_pids.add(key)
+
+                reason = ""
+                if try_i and key == "direct":
+                    reason = "proxy pool unusable → DIRECT"
+                    slog("PROXY", f"#{current_round} {reason}", level="warn")
+                elif try_i:
+                    reason = f"proxy retry #{try_i + 1}"
+                    slog("PROXY", f"#{current_round} {reason}: {key[:48]}", level="warn")
+
+                try:
+                    force_browser_proxy(
+                        proxy_url or "",
+                        account_index=current_round,
+                        reason=reason or "start",
+                    )
+                    result = run_single_registration(
+                        args.output, extract_numbers=args.extract_numbers
+                    )
+                    collected_sso.append(
+                        result.get("sso_token")
+                        or result.get("sso")
+                        or result.get("apiKey")
+                        or ""
+                    )
+                    progress_end_account(True, f"email={result.get('email','')}")
+                    account_ok = True
+                    last_error = None
+                    break
+                except KeyboardInterrupt:
+                    slog("STOP", "interrupted by user", level="warn")
+                    raise
+                except Exception as error:
+                    last_error = error
+                    more = try_i < total_attempts - 1
+                    if is_proxy_failure(error) and more:
+                        slog(
+                            "PROXY",
+                            f"#{current_round} proxy fail, will retry/fallback: {error}",
+                            level="warn",
+                        )
+                        try:
+                            stop_browser()
+                        except Exception:
+                            pass
+                        continue
+                    # non-proxy fail or out of retries — count as account fail
+                    progress_end_account(False, str(error))
+                    fail_recorded = True
+                    err_l = str(error).lower()
+                    hard_fail = any(
+                        k in err_l
+                        for k in (
+                            "disconnected",
+                            "connection",
+                            "target closed",
+                            "browser has been closed",
+                            "no such",
+                            "crash",
+                            "proxy",
+                            "err_proxy",
+                            "tunnel",
+                        )
+                    )
+                    break
+
+            if not account_ok and last_error is not None and not fail_recorded:
+                progress_end_account(False, str(last_error))
+                hard_fail = True
 
             try:
-                result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
-                collected_sso.append(result.get("sso_token") or result.get("sso") or result.get("apiKey") or "")
-                progress_end_account(True, f"email={result.get('email','')}")
-            except KeyboardInterrupt:
-                slog("STOP", "interrupted by user", level="warn")
-                break
-            except Exception as error:
-                progress_end_account(False, str(error))
-                err_l = str(error).lower()
-                hard_fail = any(
-                    k in err_l
-                    for k in (
-                        "disconnected",
-                        "connection",
-                        "target closed",
-                        "browser has been closed",
-                        "no such",
-                        "crash",
-                        "proxy",
-                        "err_proxy",
-                        "tunnel",
-                    )
-                )
-            finally:
                 if args.count == 0 or current_round < args.count:
                     next_idx = current_round + 1
                     next_proxy = select_proxy_for_account(next_idx)
@@ -3829,8 +4066,7 @@ def main():
                         slog("BROWSER", "soft-reset → next account (single/same proxy)")
                         restart_browser(force_full=False)
                     else:
-                        # Next ensure_browser_proxy_for_account will full-restart
-                        # if proxy changes; soft-reset only when same proxy reused.
+                        # Next force_browser_proxy will full-restart if proxy changes
                         if same_proxy:
                             slog("BROWSER", "soft-reset → next account (proxy reuse)")
                             restart_browser(force_full=False)
@@ -3840,6 +4076,9 @@ def main():
                                 "next account uses different proxy → defer restart",
                             )
                     _apply_window_policy(quiet=True)
+            except KeyboardInterrupt:
+                slog("STOP", "interrupted by user", level="warn")
+                break
 
             if args.count == 0 or current_round < args.count:
                 time.sleep(2)

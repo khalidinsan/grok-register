@@ -466,6 +466,19 @@ class PoolRunner:
         env["GROK_POOL_CONCURRENT"] = str(self.state.concurrent)
         env["GROK_PROXY_MODE"] = getattr(self.state, "proxy_mode", None) or "per_account"
         env["PYTHONUNBUFFERED"] = "1"
+        # flash-aligned proxy retry / asset-block (env wins if already set)
+        env.setdefault(
+            "GROK_PROXY_RETRIES",
+            str(os.environ.get("GROK_PROXY_RETRIES") or "3"),
+        )
+        env.setdefault(
+            "GROK_PROXY_FALLBACK_DIRECT",
+            str(os.environ.get("GROK_PROXY_FALLBACK_DIRECT") or "1"),
+        )
+        env.setdefault(
+            "GROK_BLOCK_ASSETS",
+            str(os.environ.get("GROK_BLOCK_ASSETS") or "1"),
+        )
         pool = getattr(self.state, "proxy_pool", None) or []
         if pool:
             env["GROK_PROXIES"] = encode_proxy_env(pool)

@@ -149,7 +149,9 @@ def load_proxy_file(path: str) -> list[str]:
     try:
         return _load(path)
     except FileNotFoundError as e:
-        raise SystemExit(str(e)) from e
+        # config may list proxy.txt that is not present yet — warn, don't hard-exit
+        print(f"[Warn] {e}", flush=True)
+        return []
 
 
 def split_workload(total: int, concurrent: int) -> list[int]:
@@ -683,6 +685,15 @@ def main() -> int:
         env["GROK_POOL_OFFSET"] = str(offsets[i])
         env["GROK_POOL_CONCURRENT"] = str(n_workers)
         env["GROK_PROXY_MODE"] = proxy_mode
+        # flash-aligned: proxy retries → direct + asset block
+        if "GROK_PROXY_RETRIES" not in env:
+            env["GROK_PROXY_RETRIES"] = str(cfg.get("proxy_retries") or "3")
+        if "GROK_PROXY_FALLBACK_DIRECT" not in env:
+            env["GROK_PROXY_FALLBACK_DIRECT"] = (
+                "1" if cfg.get("proxy_fallback_direct", True) else "0"
+            )
+        if "GROK_BLOCK_ASSETS" not in env:
+            env["GROK_BLOCK_ASSETS"] = "1" if cfg.get("block_assets", True) else "0"
         if proxies:
             env["GROK_PROXIES"] = encode_proxy_env(proxies)
         else:

@@ -11,6 +11,7 @@ Env / config:
   GROK_BROWSER_PROXY=http://user:pass@host:port
   GROK_DISPLAY=headed|offscreen|headless|virtual
   GROK_HEADLESS=true|false   (flash-compatible; true → headless)
+  GROK_BLOCK_ASSETS=true|false  (flash: abort third-party font/media; default on)
 
 Display defaults (flash-aligned):
   macOS   → offscreen   (work-friendly; park window, no focus steal)
@@ -34,6 +35,109 @@ from proxy_util import mask_proxy, playwright_proxy_dict
 
 # All accepted display tokens after normalization
 DISPLAY_MODES = ("headed", "offscreen", "headless", "virtual")
+
+# Flash asset-block: never touch these origins (CF / Turnstile / xAI / Grok)
+_ASSET_BLOCK_KEEP_HOSTS = (
+    "challenges.cloudflare",
+    "cloudflare.com",
+    "turnstile",
+    "cf-assets",
+    "accounts.x.ai",
+    "auth.x.ai",
+    "x.ai",
+    "grok.com",
+    "grok.x.ai",
+)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def install_asset_block(
+    page: Any,
+    *,
+    loop: Any = None,
+    is_async: bool = False,
+    enabled: Optional[bool] = None,
+) -> bool:
+    """
+    Flash-style light asset block: abort third-party font/media only.
+
+    Keeps images/scripts/XHR (Turnstile/CF need them) and always continues
+    on auth / Cloudflare / Grok hosts. Opt-out: GROK_BLOCK_ASSETS=false.
+
+    Works with Playwright sync page or async page (+ loop for async install).
+    Returns True if route installed.
+    """
+    if enabled is None:
+        enabled = _env_bool("GROK_BLOCK_ASSETS", True)
+    if not enabled or page is None:
+        return False
+
+    keep = _ASSET_BLOCK_KEEP_HOSTS
+
+    def _should_abort(request: Any) -> bool:
+        try:
+            rtype = (getattr(request, "resource_type", None) or "").lower()
+            url = (getattr(request, "url", None) or "").lower()
+        except Exception:
+            return False
+        if any(h in url for h in keep):
+            return False
+        return rtype in ("media", "font")
+
+    if is_async:
+
+        async def _block_heavy(route):
+            try:
+                if _should_abort(route.request):
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        try:
+            if loop is not None:
+                loop.run_until_complete(page.route("**/*", _block_heavy))
+            else:
+                # already inside a running loop
+                return False
+            return True
+        except Exception as e:
+            print(f"[browser] asset-block route warn: {e}", flush=True)
+            return False
+
+    # sync Playwright
+    def _block_heavy_sync(route):
+        try:
+            if _should_abort(route.request):
+                route.abort()
+                return
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        page.route("**/*", _block_heavy_sync)
+        return True
+    except Exception as e:
+        print(f"[browser] asset-block route warn: {e}", flush=True)
+        return False
 
 
 class _ActionsProxy:
@@ -294,6 +398,7 @@ def launch_chromium_session(
 
     context = pw.chromium.launch_persistent_context(**launch_kwargs)
     page = context.pages[0] if context.pages else context.new_page()
+    blocked = install_asset_block(page, is_async=False)
     return BrowserSession(
         engine="chromium",
         page=page,
@@ -303,7 +408,11 @@ def launch_chromium_session(
         _context=context,
         _profile_dir=profile_dir,
         _debug_port=debug_port,
-        extra={"proxy_cfg": proxy_cfg, "mask": mask_proxy(proxy) if proxy else ""},
+        extra={
+            "proxy_cfg": proxy_cfg,
+            "mask": mask_proxy(proxy) if proxy else "",
+            "asset_block": blocked,
+        },
     )
 
 
@@ -672,10 +781,36 @@ def launch_camoufox_session(
         browser = await manager.__aenter__()
         page = await browser.new_page()
         page.set_default_timeout(60000)
-        return manager, browser, page
+        # install route inside same loop as Camoufox page
+        blocked = False
+        if _env_bool("GROK_BLOCK_ASSETS", True):
+
+            async def _block_heavy(route):
+                try:
+                    rtype = (route.request.resource_type or "").lower()
+                    url = (route.request.url or "").lower()
+                    if any(h in url for h in _ASSET_BLOCK_KEEP_HOSTS):
+                        await route.continue_()
+                        return
+                    if rtype in ("media", "font"):
+                        await route.abort()
+                        return
+                    await route.continue_()
+                except Exception:
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+
+            try:
+                await page.route("**/*", _block_heavy)
+                blocked = True
+            except Exception as e:
+                print(f"[browser] asset-block route warn: {e}", flush=True)
+        return manager, browser, page, blocked
 
     try:
-        manager, browser, page = loop.run_until_complete(_start())
+        manager, browser, page, asset_blocked = loop.run_until_complete(_start())
     except Exception as e:
         # virtual needs Xvfb / pyvirtualdisplay — give a clear hint
         if display == "virtual" or headless == "virtual":
@@ -700,6 +835,7 @@ def launch_camoufox_session(
             "mask": mask_proxy(proxy) if proxy else "",
             "headless": headless,
             "camoufox_os": fox_os,
+            "asset_block": asset_blocked,
         },
     )
     adapter = PwBrowserAdapter(

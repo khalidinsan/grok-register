@@ -14,7 +14,10 @@
         "proxy_check_url": "https://accounts.x.ai/",
         "proxy_max_ms": 4000,
         "proxy_check_timeout": 12,
-        "proxy_check_workers": 10
+        "proxy_check_workers": 10,
+        "proxy_retries": 3,
+        "proxy_fallback_direct": true,
+        "block_assets": true
     },
     "email": {
         "domain": "yourdomain.com",
