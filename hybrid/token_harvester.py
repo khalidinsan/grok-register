@@ -5,6 +5,7 @@ Adapted for grok-register's Camoufox / PwPageAdapter / DrissionPage page API:
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -647,28 +648,14 @@ true;
             self._lg(f"[hybrid] inject turnstile: {e}")
             return False
 
-    def get_turnstile_token(self, timeout: int = 90, inject: bool = True) -> str:
+    def _read_turnstile_js(self) -> dict:
+        """Read token + status from page (native input, API, or inject host)."""
         page = self.page()
         if page is None:
-            return ""
-
-        # Prefer host project's solver if provided
-        if self._get_turnstile_fn:
-            try:
-                tok = self._get_turnstile_fn()
-                if tok and len(str(tok)) >= 80:
-                    return str(tok)
-            except Exception as e:
-                self._lg(f"[hybrid] get_turnstile_fn: {e}")
-
-        if inject:
-            self.inject_turnstile_widget()
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                tok = page.run_js(
-                    """
+            return {"tok": "", "status": "no-page"}
+        try:
+            tok = page.run_js(
+                """
 let tok = '';
 try { if (window.__hybrid_turnstile) tok = String(window.__hybrid_turnstile); } catch (e) {}
 if (!tok) {
@@ -685,20 +672,161 @@ return {
   status: String(window.__hybrid_turnstile_status || '')
 };
 """
-                )
-                if isinstance(tok, dict):
-                    val = str(tok.get("tok") or "").strip()
-                    if len(val) >= 80:
-                        self._lg(f"[hybrid] turnstile len={len(val)}")
-                        return val
-                    if tok.get("status") in ("script-fail", "render-fail", "error"):
-                        self.inject_turnstile_widget()
-                else:
-                    val = str(tok or "").strip()
-                    if len(val) >= 80:
-                        return val
-            except Exception:
-                pass
-            time.sleep(1)
-        self._lg("[hybrid] turnstile timeout")
+            )
+            if isinstance(tok, dict):
+                return {
+                    "tok": str(tok.get("tok") or "").strip(),
+                    "status": str(tok.get("status") or ""),
+                }
+            return {"tok": str(tok or "").strip(), "status": ""}
+        except Exception:
+            return {"tok": "", "status": "err"}
+
+    def _nudge_native_turnstile(self) -> None:
+        """Camoufox-safe: click iframe/widget via JS (no Drission shadow_root)."""
+        page = self.page()
+        if page is None:
+            return
+        try:
+            page.run_js(
+                """
+(() => {
+  try {
+    const ifr = document.querySelector(
+      'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
+    );
+    if (ifr) { ifr.click(); return 'iframe'; }
+    const w = document.querySelector('[data-sitekey], .cf-turnstile, div[id*="turnstile"]');
+    if (w) { w.click(); return 'widget'; }
+  } catch (e) {}
+  return '';
+})()
+"""
+            )
+        except Exception:
+            pass
+        # Playwright frame click (Camoufox) — optional, best-effort
+        try:
+            raw = getattr(page, "raw", None) or page
+            loop = getattr(page, "_loop", None)
+            is_async = bool(getattr(page, "_async", False) or loop)
+
+            def _click_frames(p):
+                for fr in p.frames:
+                    u = (fr.url or "").lower()
+                    if "turnstile" not in u and "challenges.cloudflare" not in u:
+                        continue
+                    for sel in (
+                        "input[type=checkbox]",
+                        "label",
+                        "body",
+                        "#challenge-stage",
+                        ".ctp-checkbox-label",
+                    ):
+                        try:
+                            loc = fr.locator(sel).first
+                            if loc.count() > 0:
+                                loc.click(timeout=1500)
+                                return True
+                        except Exception:
+                            continue
+                return False
+
+            if is_async and loop is not None:
+
+                async def _go():
+                    return _click_frames(raw)
+
+                # frames/click may be sync on raw in some wrappers — try both
+                try:
+                    loop.run_until_complete(raw.evaluate("() => true"))
+                except Exception:
+                    pass
+                try:
+                    for fr in list(getattr(raw, "frames", []) or []):
+                        u = str(getattr(fr, "url", "") or "").lower()
+                        if "turnstile" not in u and "challenges.cloudflare" not in u:
+                            continue
+                        try:
+                            loop.run_until_complete(
+                                fr.locator("input[type=checkbox]").first.click(timeout=1500)
+                            )
+                            return
+                        except Exception:
+                            try:
+                                loop.run_until_complete(fr.locator("body").click(timeout=1000))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            else:
+                _click_frames(raw)
+        except Exception:
+            pass
+
+    def get_turnstile_token(self, timeout: int = 40, inject: bool = True) -> str:
+        """
+        Camoufox-first turnstile strategy (regkit-inspired, no Drission shadow):
+
+          1) Poll native widget briefly + JS/iframe nudge (~8s)
+          2) Inject standalone widget (regkit inject path) + poll remainder
+          3) Skip getTurnstileToken/Drission shadow_root (burns ~45s on Camoufox)
+
+        Opt-in legacy host solver: GROK_HYBRID_USE_DRISSION_TS=1
+        """
+        page = self.page()
+        if page is None:
+            return ""
+
+        # Opt-in only: Drission shadow click path (Chromium + extension). Camoufox: skip.
+        use_drission = (os.environ.get("GROK_HYBRID_USE_DRISSION_TS") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if use_drission and self._get_turnstile_fn:
+            try:
+                tok = self._get_turnstile_fn()
+                if tok and len(str(tok)) >= 80:
+                    self._lg(f"[hybrid] turnstile via host solver len={len(str(tok))}")
+                    return str(tok)
+            except Exception as e:
+                self._lg(f"[hybrid] host turnstile skip: {e}")
+
+        t0 = time.time()
+        native_budget = min(10.0, max(4.0, float(timeout) * 0.25))
+        # Phase A — native widget already on page (if any)
+        self._lg("[hybrid] turnstile: native poll + nudge")
+        while time.time() - t0 < native_budget:
+            st = self._read_turnstile_js()
+            val = st.get("tok") or ""
+            if len(val) >= 80:
+                self._lg(f"[hybrid] turnstile native len={len(val)}")
+                return val
+            self._nudge_native_turnstile()
+            time.sleep(0.6)
+
+        # Phase B — inject standalone (regkit style; works headless Camoufox)
+        if inject:
+            self._lg("[hybrid] turnstile: inject widget")
+            self.inject_turnstile_widget()
+
+        deadline = time.time() + max(5.0, timeout - (time.time() - t0))
+        re_inject_at = time.time() + 12.0
+        while time.time() < deadline:
+            st = self._read_turnstile_js()
+            val = st.get("tok") or ""
+            if len(val) >= 80:
+                self._lg(f"[hybrid] turnstile inject len={len(val)} status={st.get('status')}")
+                return val
+            status = st.get("status") or ""
+            if status in ("script-fail", "render-fail", "error") or time.time() >= re_inject_at:
+                if inject:
+                    self.inject_turnstile_widget()
+                re_inject_at = time.time() + 15.0
+            self._nudge_native_turnstile()
+            time.sleep(0.7)
+
+        self._lg("[hybrid] turnstile timeout (native+inject)")
         return ""

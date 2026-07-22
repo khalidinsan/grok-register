@@ -159,10 +159,21 @@ def register_one_hybrid(
                 tok_sess._browser = getattr(dpe, "browser", None)
                 if open_signup_fn is None:
                     tok_sess._open_signup_fn = getattr(dpe, "open_signup_page", None)
+                # Do NOT auto-wire Drission getTurnstileToken on Camoufox —
+                # shadow_root path burns ~45s then fails. Opt-in only via
+                # GROK_HYBRID_USE_DRISSION_TS=1 + explicit get_turnstile_fn.
                 if get_turnstile_fn is None:
-                    gtt = getattr(dpe, "getTurnstileToken", None)
-                    if gtt:
-                        tok_sess._get_turnstile_fn = lambda: gtt()
+                    import os as _os
+
+                    if (_os.environ.get("GROK_HYBRID_USE_DRISSION_TS") or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        gtt = getattr(dpe, "getTurnstileToken", None)
+                        if gtt:
+                            tok_sess._get_turnstile_fn = lambda: gtt()
             except Exception:
                 pass
 
@@ -262,9 +273,10 @@ def register_one_hybrid(
         except Exception:
             pass
 
-        turnstile = tok_sess.get_turnstile_token(timeout=90, inject=True)
+        # Camoufox-first: native nudge ~8s + inject (~30s), no Drission 45s burn
+        turnstile = tok_sess.get_turnstile_token(timeout=40, inject=True)
         if len(turnstile) < 80:
-            lg(f"[hybrid] turnstile short len={len(turnstile)}")
+            lg(f"[hybrid] turnstile short len={len(turnstile)} — abort hybrid")
             return None
 
         castle2 = tok_sess.read_captured_castle() or castle
