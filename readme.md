@@ -1,76 +1,182 @@
 # Grok Register Farm
 
-Automated Grok (x.ai) account registration with [DrissionPage](https://github.com/g1879/DrissionPage).
+Automated **xAI / Grok** account registration farm: signup → SSO → **Grok Build / CLI OAuth** → chat usable probe → inject **9router** (`grok-cli`).
 
-Flow:
+Default browser engine: **Camoufox** (anti-detect Firefox). Optional **Chromium** (Playwright) fallback.
 
-1. Create a catch-all alias (`random@yourdomain.com`)
-2. Complete signup in Chrome (Turnstile patched via extension)
-3. Read OTP from Gmail IMAP
-4. Capture Web SSO cookies
-5. Convert SSO → **Grok Build / CLI OAuth** (Device Flow)
-6. Push the account into **9router** as provider `grok-cli` (optional)
+```text
+catch-all email + IMAP OTP
+  → register (browser full UI  |  hybrid: short browser + protocol HTTP)
+  → SSO cookies (wrapper → session materialize if needed)
+  → SETTLE (bot hygiene, default 12s)
+  → OAuth PKCE referrer=grok-build  (fallback: device OAuth, fail-fast)
+  → PROBE cli-chat-proxy (inject only if USABLE)
+  → PUSH 9router grok-cli
+```
 
-> x.ai rejects common disposable mail domains. Use your own catch-all domain.
+> x.ai rejects common disposable mail domains. Use your **own catch-all domain**.
+
+**Research / personal use only.** Respect site ToS and local law.
 
 ---
 
 ## Features
 
-- Catch-all domain + Gmail IMAP OTP (same pattern as alibaba farm)
-- Cloudflare Turnstile helper (Chrome extension patches CDP `MouseEvent.screenX/Y`)
-- **SSO → Build OAuth** conversion (`sso_to_build.py`)
-- Auto-import into **9router `grok-cli`** (HTTP API; works with sql.js)
-- Optional grok2api Web import (legacy / optional)
-- **Multi-worker pool** (`run_pool.py`) for small concurrent farms
-- **Unlimited mode** (`-n 0` / `--unlimited`) — farm until Ctrl+C / quit / Force stop
-- **Terminal UI dashboard** (`farm_tui.py` / `run_pool.py --tui`) — live progress, per-worker table, filterable logs
-- **Display modes**: `headed` · `offscreen` · `headless` (Mac-friendly offscreen default)
-- Isolated Chrome per worker (unique CDP port + profile; no shared PortFinder collisions)
+| Area | Notes |
+|------|--------|
+| **Engines** | Camoufox (default) · Playwright Chromium fallback |
+| **Register modes** | `browser` full UI · `hybrid` (castle harvest + protocol HTTP) |
+| **Mail** | Catch-all domain + Gmail IMAP OTP · humanized local-parts |
+| **OAuth** | Browser **PKCE** `referrer=grok-build` · device SSO fallback (fail-fast) |
+| **Inject policy** | `usable` — chat probe **200** only; **402/403 DENIED never inject** |
+| **Proxy** | Pool file, `per_account` / `per_worker`, health check, retry → direct |
+| **Asset block** | Optional third-party font/media block (bandwidth) |
+| **Farm** | Multi-worker pool · unlimited mode · Textual TUI |
+| **Display** | `headless` (Linux) · `offscreen` (Mac) · `virtual` (Xvfb) · `headed` |
 
 ---
 
 ## Requirements
 
-- Python **3.10–3.13** recommended (3.14 may hit TLS edge cases)
-- Chrome / Chromium
-- Your domain with **catch-all** → Gmail
-- Gmail **App Password** (IMAP)
-- Optional: [9router](https://github.com/) on `http://127.0.0.1:20127`
-- Optional: [grok2api](https://github.com/chenyme/grok2api)
+| | |
+|--|--|
+| **OS** | macOS · Linux (VPS OK) · Windows |
+| **Python** | **3.10–3.13** recommended (3.14 may hit TLS edge cases) |
+| **Mail** | Domain with **catch-all** → Gmail + [App Password](https://myaccount.google.com/apppasswords) |
+| **Optional** | Local [9router](https://github.com/) (`http://127.0.0.1:20127` or remote URL) |
+| **Optional** | Residential proxies (`proxy.txt`) |
 
 ---
 
 ## Install
 
+### 1) Clone & venv
+
 ```bash
+cd grok-register
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# Required: Playwright Chromium (isolated from your daily Google Chrome)
-playwright install chromium
 ```
 
-The farm **always** prefers Playwright’s Chromium / Chrome for Testing binary. It will **not** use `/Applications/Google Chrome.app` unless you set `GROK_ALLOW_SYSTEM_CHROME=1`.
+`requirements.txt` includes: Camoufox, Playwright, Textual, requests, **curl_cffi** (hybrid + device TLS).
 
-| Browser | Role |
-|---------|------|
-| **Google Chrome** (your app) | Daily work — untouched |
-| **Playwright Chromium** | Farm only — own profile + CDP port |
-
-Optional: `GROK_BROWSER_PATH=/path/to/chromium` to force a binary.
-
-### Linux server (Xvfb)
+### 2) Browser binaries (required)
 
 ```bash
-apt install -y xvfb
-pip install PyVirtualDisplay
+# Camoufox binary (default engine) — run once per machine
+python -m camoufox fetch
+
+# Chromium fallback (optional but recommended)
 playwright install chromium
-python -m playwright install-deps chromium
 ```
 
-macOS does **not** use Xvfb. Use display modes below. Farm windows are **Chromium**, not your Google Chrome.
+| Binary | Role |
+|--------|------|
+| **Camoufox** | Default farm engine |
+| **Playwright Chromium** | Fallback / legacy extension path |
+| **Google Chrome.app** | **Not used** (daily browser stays clean) |
+
+Optional: `GROK_BROWSER_PATH=/path/to/chromium` to force Chromium binary.
+
+### 3) Config
+
+```bash
+cp config.example.json config.json
+# edit config.json — never commit secrets
+```
+
+### 4) Proxies (optional)
+
+```bash
+# one proxy per line — supported formats:
+#   host:port:user:pass
+#   http://user:pass@host:port
+#   user:pass@host:port
+cp proxy.txt.example proxy.txt   # if you have an example
+# or write your own proxy.txt
+```
+
+Residential sticky tip: **~30 min** session duration is a good default (reg + OAuth ~1–2 min).
+
+---
+
+## Linux / VPS setup (complete)
+
+Do **not** run as **root** (Camoufox XPCOM often breaks).
+
+```bash
+# Debian / Ubuntu example
+sudo apt update
+sudo apt install -y \
+  python3 python3-venv python3-pip \
+  xvfb \
+  libgtk-3-0 libx11-xcb1 libdbus-glib-1-2 \
+  libasound2t64 || sudo apt install -y libasound2
+
+# project
+git clone <your-fork-or-repo> grok-register
+cd grok-register
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m camoufox fetch
+playwright install chromium
+# if Chromium fails to launch:
+python -m playwright install-deps chromium || true
+
+cp config.example.json config.json
+# fill email.*, grok_cli.*, register_mode, pool.proxy_file, etc.
+# add proxy.txt if using residential proxies
+```
+
+### Run on Linux
+
+```bash
+# Preferred helper (defaults: Camoufox + headless; xvfb-run if needed)
+chmod +x run_linux.sh
+./run_linux.sh farm_tui.py -u -c 2 --stagger 15 \
+  --display headless --proxy-file proxy.txt --proxy-mode per_account
+
+# Pure headless without wrapper
+GROK_DISPLAY=headless GROK_BROWSER_ENGINE=camoufox \
+  .venv/bin/python farm_tui.py -u -c 2 --display headless \
+  --proxy-file proxy.txt --proxy-mode per_account
+
+# If pure headless fails CF often — headed on virtual X:
+./run_linux.sh --virtual farm_tui.py -u -c 1 --proxy-file proxy.txt
+```
+
+| Flag / env | Meaning |
+|------------|---------|
+| `./run_linux.sh` | Activates `.venv`, sets Camoufox + headless by default |
+| `--headless` | `GROK_DISPLAY=headless` |
+| `--virtual` | Camoufox on Xvfb (`needs xvfb`) |
+| `--headed` | Real display (VNC / desktop) |
+| **Never root** | `run_linux.sh` exits if `id -u == 0` |
+
+---
+
+## macOS setup
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m camoufox fetch
+playwright install chromium
+cp config.example.json config.json
+# edit config.json + proxy.txt
+```
+
+Default display on Mac: **`offscreen`** (parked windows, work-friendly).
+
+```bash
+.venv/bin/python farm_tui.py -u -c 2 --offscreen \
+  --proxy-file proxy.txt --proxy-mode per_account
+
+# debug visible
+.venv/bin/python farm_tui.py -c 1 --display headed
+```
 
 ---
 
@@ -80,335 +186,208 @@ macOS does **not** use Xvfb. Use display modes below. Farm windows are **Chromiu
 cp config.example.json config.json
 ```
 
-Example:
+### Minimal example
 
 ```json
 {
-  "run": {
-    "count": 1
-  },
+  "run": { "count": 1 },
+  "register_mode": "hybrid",
   "pool": {
-    "workers": 2,
-    "count": 1,
-    "stagger_sec": 20,
-    "display": "offscreen",
-    "proxies": []
+    "count": 0,
+    "concurrent": 2,
+    "stagger_sec": 15,
+    "display": "headless",
+    "proxy_mode": "per_account",
+    "proxy_file": "proxy.txt",
+    "proxy_check": true,
+    "proxy_retries": 3,
+    "proxy_fallback_direct": true,
+    "block_assets": true
   },
   "email": {
     "domain": "yourdomain.com",
     "imap_user": "you@gmail.com",
     "imap_pass": "abcd efgh ijkl mnop",
     "imap_host": "imap.gmail.com",
-    "imap_port": 993
+    "imap_port": 993,
+    "local_style": "human"
   },
-  "proxy": "",
-  "browser_proxy": "",
+  "browser": { "engine": "camoufox" },
   "grok_cli": {
     "enabled": true,
     "base_url": "http://127.0.0.1:20127",
-    "data_dir": "~/.9router"
-  },
-  "grok2api": {
-    "enabled": false,
-    "base_url": "http://127.0.0.1:8000",
-    "username": "admin",
-    "password": "your-admin-password",
-    "tier": "auto"
-  },
-  "ninerouter": {
-    "enabled": false,
-    "base_url": "http://127.0.0.1:20127",
-    "provider": "grok-web",
-    "data_dir": "~/.9router"
+    "password": "your-9router-dashboard-password",
+    "data_dir": "~/.9router",
+    "oauth_mode": "pkce",
+    "oauth_referrer": "grok-build",
+    "post_signup_settle_sec": 12,
+    "oauth_gap_sec": 8,
+    "chat_probe_off_critical": true,
+    "inject_policy": "usable",
+    "jwt_reject_bot_flag": false,
+    "jwt_enforce_referrer": true,
+    "chat_probe_model": "grok-4.5"
   }
 }
 ```
 
 Env overrides for email: `EMAIL_DOMAIN`, `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, `IMAP_PORT`.
 
-### Field reference
+### Important fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `run.count` | int | Rounds for single-process mode (`0` = unlimited until stop). Overridden by `--count` / `--unlimited`. |
-| `pool.workers` | int | Parallel processes for `run_pool.py` (Mac: start with 2–3). Alias of concurrent. |
-| `pool.count` | int | **Total** accounts for the pool (`0` = unlimited). Overridden by `-n` / `--unlimited`. |
-| `pool.concurrent` | int | How many browsers in parallel. |
-| `pool.stagger_sec` | number | Delay (seconds) between starting workers. |
-| `pool.display` | string | `headed` · `offscreen` · `headless` (default `offscreen` on Mac). |
-| `pool.proxies` | string[] | Proxy URLs (or Webshare `host:port:user:pass`). |
-| `pool.proxy_file` | string | Path to proxy list file (Webshare export OK). |
-| `pool.proxy_mode` | string | `per_account` (default, 1 proxy / account rotate) or `per_worker` (sticky). |
-| `email.domain` | string | Catch-all domain → generates `random@domain`. |
-| `email.imap_user` | string | Gmail address that receives catch-all mail. |
-| `email.imap_pass` | string | Gmail App Password (not your login password). |
-| `email.imap_host` | string | Default `imap.gmail.com`. |
-| `email.imap_port` | int | Default `993`. |
-| `browser_proxy` | string | Global browser proxy (overridden per worker by `GROK_BROWSER_PROXY`). |
-| `grok_cli.enabled` | bool | Convert SSO → Build OAuth and push to 9router `grok-cli`. |
-| `grok_cli.base_url` | string | 9router base URL (default `http://127.0.0.1:20127`). |
-| `grok_cli.smoke_bot_flag` | bool | If JWT has `bot_flag_source`, smoke-test before import (default `true`). |
-| `grok_cli.smoke_model` | string | Model for bot-flag smoke (default `grok-4.5`). |
-| `grok_cli.smoke_timeout_sec` | number | Smoke HTTP timeout seconds (default `45`). |
-| `grok2api.enabled` | bool | Optional import of Web SSO into grok2api. |
-| `ninerouter.enabled` | bool | Legacy grok-web cookie import (usually leave `false`). |
+| Field | Description |
+|-------|-------------|
+| `register_mode` | `browser` (full UI) · `hybrid` (protocol after short harvest). Default if unset: **browser**. Env: `GROK_REGISTER_MODE`. |
+| `pool.concurrent` / `-c` | Parallel workers (browsers). |
+| `pool.count` / `-n` | Total accounts (`0` = unlimited). |
+| `pool.display` | `headless` · `offscreen` · `virtual` · `headed`. |
+| `pool.proxy_file` | Path to proxy list. |
+| `pool.proxy_mode` | `per_account` (rotate) · `per_worker` (sticky). |
+| `pool.proxy_check` | Probe proxies before spawn (default on). |
+| `pool.proxy_retries` | Distinct proxies per account before fail (default 3). |
+| `pool.proxy_fallback_direct` | After proxy fails → try **direct** (default true). |
+| `pool.block_assets` | Abort third-party font/media (`GROK_BLOCK_ASSETS`). |
+| `browser.engine` | `camoufox` (default) · `chromium`. |
+| `grok_cli.post_signup_settle_sec` | **Bot hygiene** idle before OAuth (default **12**). |
+| `grok_cli.oauth_gap_sec` | Min seconds between OAuth mints (default 8). |
+| `grok_cli.chat_probe_off_critical` | Soft-reset browser before HTTP probe (default true). |
+| `grok_cli.inject_policy` | `usable` · `jwt_clean` · `all`. |
+| `grok_cli.oauth_mode` | `pkce` (preferred) · device fallback automatic. |
+
+---
+
+## Environment variables (quick ref)
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `GROK_BROWSER_ENGINE` | `camoufox` | `camoufox` \| `chromium` |
+| `GROK_DISPLAY` / `GROK_HEADLESS` | platform | Display mode |
+| `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` |
+| `GROK_BLOCK_ASSETS` | `1` | Font/media asset block |
+| `GROK_PROXY_RETRIES` | `3` | Proxy tries per account |
+| `GROK_PROXY_FALLBACK_DIRECT` | `1` | Fall back to direct |
+| `GROK_OAUTH_GAP_SEC` | `8` | Gap between converts |
+| `GROK_CHAT_PROBE_OFF_CRITICAL` | `1` | Defer probe after OAuth |
+| `GROK_DEVICE_RL_MAX_TRIES` | `2` | Device OAuth rate-limit tries |
+| `GROK_DEVICE_POLL_TIMEOUT_SEC` | `45` | Device token poll cap |
+| `GROK_HYBRID_USE_DRISSION_TS` | off | Opt-in slow Drission Turnstile path |
+| `GROK_BROWSER_PROXY` / `GROK_PROXIES` | — | Worker proxy (set by pool/TUI) |
 
 ---
 
 ## Email setup (catch-all + IMAP)
 
-1. Point your domain to Cloudflare Email Routing (or similar).
-2. Enable **Catch-All** → forward to your Gmail.
-3. Enable Google 2FA and create an [App Password](https://myaccount.google.com/apppasswords).
+1. Point domain to Cloudflare Email Routing (or similar).
+2. Enable **Catch-All** → forward to Gmail.
+3. Google 2FA → [App Password](https://myaccount.google.com/apppasswords).
 4. Fill `email.*` in `config.json`.
 
 ---
 
 ## Usage
 
-### Single process (1 browser)
+### Single process
 
 ```bash
 source .venv/bin/activate
 
-# Use run.count from config
-python DrissionPage_example.py
-
-# Explicit rounds
-python DrissionPage_example.py --count 5
-# short flag:
 python DrissionPage_example.py -n 5
-
-# Unlimited (until Ctrl+C)
-python DrissionPage_example.py --count 0
-python DrissionPage_example.py --unlimited
-python DrissionPage_example.py -u
-
-# Display modes
-python DrissionPage_example.py --offscreen          # Mac-friendly (default intent)
-python DrissionPage_example.py --headless
-python DrissionPage_example.py --display headed     # visible windows (debug)
+python DrissionPage_example.py -u                    # unlimited
+python DrissionPage_example.py -n 1 --display headed # debug
 ```
 
-### Concurrent pool (multi-process)
-
-Simple API: **total accounts** + **how many parallel browsers**.
+### Multi-worker / TUI (recommended)
 
 ```bash
-# “I want 100 accounts, 3 at a time”
-python run_pool.py --count 100 --concurrent 3
-# short flags:
-python run_pool.py -n 100 -c 3
+# Mac
+python farm_tui.py -u -c 2 --stagger 15 --offscreen \
+  --proxy-file proxy.txt --proxy-mode per_account
 
-# Split example: 100 ÷ 3 → workers get 34 + 33 + 33
-python run_pool.py -n 100 -c 3 --dry-run
+# Linux (helper)
+./run_linux.sh farm_tui.py -u -c 2 --stagger 15 \
+  --display headless --proxy-file proxy.txt --proxy-mode per_account
 
-# Unlimited — every worker runs forever until Ctrl+C / quit
-python run_pool.py --unlimited -c 2 --offscreen
-python run_pool.py -u -c 2 --offscreen
-python run_pool.py -n 0 -c 2 --offscreen
-
-# Mac-friendly window (minimized Chromium, not your Google Chrome)
-python run_pool.py -n 10 -c 2 --offscreen
-
-# Debug with visible windows
-python run_pool.py -n 2 -c 1 --display headed
-
-# Proxies (round-robin to workers)
-python run_pool.py -n 20 -c 3 --proxy-file proxies.txt
-
-# Live Terminal UI (recommended for multi-worker)
-python run_pool.py --tui -n 20 -c 3 --stagger 5 --offscreen
-python run_pool.py --tui --unlimited -c 2 --offscreen
-# same thing:
-python farm_tui.py -n 20 -c 3 --stagger 5 --offscreen
-python farm_tui.py -u -c 2 --offscreen
+# Skip proxy health check (if check is wrong but proxies work)
+python farm_tui.py -c 1 --no-proxy-check --proxy-file proxy.txt
 ```
-
-### Terminal UI (`farm_tui.py`)
-
-Dashboard instead of interleaved stdout:
-
-| Panel | What you see |
-|-------|----------------|
-| **Summary** | global `done/total` (or `done=N · ∞ mode`), ✓/✗, rate/min, progress bar |
-| **Workers table** | per-worker status, phase (EMAIL/OTP/PROFILE/…), email, last msg |
-| **Live log** | structured lines; filter by worker |
-
-| Key | Action |
-|-----|--------|
-| `q` | stop all workers & quit (also closes Chromium) |
-| `a` | show all workers in log |
-| `1`–`9` | filter log to that worker |
-| `p` | pause / resume log auto-scroll |
 
 | Flag | Meaning |
 |------|---------|
-| `-n` / `--count` | **Total** accounts to create (`0` = unlimited until stop) |
-| `-u` / `--unlimited` | Same as `-n 0` — farm forever until Ctrl+C / quit |
-| `-c` / `--concurrent` | How many browsers run in parallel |
-| `--stagger` | Seconds between *starting* each worker |
-| `--tui` | Launch live dashboard (`farm_tui`) |
-| `--dry-run` | Print split plan only |
+| `-n` / `--count` | Total accounts (`0` = unlimited) |
+| `-u` / `--unlimited` | Same as `-n 0` |
+| `-c` / `--concurrent` | Parallel workers |
+| `--stagger` | Seconds between starting workers |
+| `--display` / `--headless` / `--offscreen` / `--virtual` / `--headed` | Display |
+| `--proxy-file` | Proxy list path |
+| `--proxy-mode` | `per_account` \| `per_worker` |
+| `--no-proxy-check` | Skip preflight probe |
+| `--dry-run` | Print worker split only (`run_pool.py`) |
 
-### Unlimited mode
+### TUI keys
 
-`0` and `--unlimited` mean **no target total**: each concurrent worker keeps registering until you stop it.
+| Key | Action |
+|-----|--------|
+| `q` | Stop all workers & quit |
+| `a` | All workers in log |
+| `1`–`9` | Filter log by worker |
+| `p` | Pause / resume log scroll |
 
-| Surface | How to enable | How to stop |
-|---------|---------------|-------------|
-| Single process | `-n 0` / `-u` / `--unlimited` | `Ctrl+C` |
-| Pool / TUI | `-n 0` / `-u` / `--unlimited` | `Ctrl+C` or `q` in TUI |
-| 9router Add Account | **Total accounts = 0** | **Force stop** |
+### Display modes
 
-In unlimited mode, progress shows `done/∞` (no ETA to a finish target; acc/min still updates).
+| Platform | Default |
+|----------|---------|
+| **Linux / VPS** | **`headless`** |
+| **Windows** | **`headless`** |
+| **macOS** | **`offscreen`** |
 
-Config `pool` in `config.json`:
-
-```json
-"pool": {
-  "count": 100,
-  "concurrent": 3,
-  "stagger_sec": 20,
-  "display": "offscreen"
-}
-```
-
-### Display modes (flash-aligned)
-
-Defaults (same idea as flash-grok-farm):
-
-| Platform | Default | Engine default |
-|----------|---------|----------------|
-| **Linux / VPS** | **`headless`** | **Camoufox** |
-| **Windows** | **`headless`** | **Camoufox** |
-| **macOS** | **`offscreen`** | **Camoufox** |
-
-| Mode | Window | Turnstile | When to use |
-|------|--------|-----------|-------------|
-| **`headless`** | None (Camoufox `headless=True`) | Usually OK with Camoufox + good proxy | **Linux/VPS farm (flash default)** |
-| **`virtual`** | Headed on **Xvfb** (Camoufox `headless='virtual'`) | Better if pure headless fails CF | Linux without GUI; needs `xvfb` |
-| **`offscreen`** | Parked off-screen + hide | Usually OK | **Mac while working** |
-| **`headed`** | Visible | Most reliable for debug | Turnstile / CF debug |
-
-CLI / env (flash-compatible):
-
-```bash
-# shortcuts
---headless | --virtual | --offscreen | --headed
---display headless|virtual|offscreen|headed
-
-# env (same flags as flash-grok-farm)
-export GROK_HEADLESS=true          # → headless
-export GROK_HEADLESS=false         # → headed
-export GROK_DISPLAY=virtual        # Camoufox + Xvfb
-export GROK_BROWSER_ENGINE=camoufox
-
-# Linux VPS helper (auto xvfb-run when needed)
-./run_linux.sh farm_tui.py -u -c 2
-./run_linux.sh --virtual farm_tui.py -u -c 1
-GROK_HEADLESS=true ./run_linux.sh run_pool.py -n 10 -c 2
-```
-
-Mac daily farm (unchanged ergonomics):
-
-```bash
-python farm_tui.py -u -c 2 --offscreen   # or omit flags → offscreen on darwin
-```
+| Mode | When |
+|------|------|
+| `headless` | VPS farm (default Linux) |
+| `virtual` | Linux no GUI, better CF than pure headless — needs `xvfb` |
+| `offscreen` | Mac while working |
+| `headed` | Debug Turnstile / CF |
 
 ---
 
-## Pipeline details
+## Register modes
 
-### Per successful registration
+| Mode | How | Config / env |
+|------|-----|----------------|
+| **`browser`** | Full Camoufox UI signup | default if unset |
+| **`hybrid`** | Short browser (castle + cookies) → protocol HTTP signup → materialize SSO → same OAuth/probe | `"register_mode": "hybrid"` or `GROK_REGISTER_MODE=hybrid` |
 
-1. Register on `accounts.x.ai`
-2. Wait for OTP via IMAP (header-only poll from x.ai when possible)
-3. Settle SSO cookies (brief wait before opening grok.com)
-4. Save SSO line under `sso/`
-5. If `grok_cli.enabled` (flash-aligned pipeline):
-   - **SETTLE** — idle after signup (`post_signup_settle_sec`, default 12s)
-   - **CONVERT** — browser **PKCE** with `referrer=grok-build` (same session); fallback device SSO
-   - **PROBE** — chat usable on `cli-chat-proxy` (`inject_policy=usable`); **403 DENIED → no inject**
-   - **PUSH** — only if usable → `POST /api/providers` as **`grok-cli`**
+Hybrid needs **`curl_cffi`** (in requirements). On failure, farm **falls back** to full browser UI automatically.
 
-Browser engine (`browser.engine` / `GROK_BROWSER_ENGINE`): **`chromium`** (default) or **`camoufox`**. Both use **native proxy** `{server, username, password}` (not user:pass in `--proxy-server`).
+Turnstile on Camoufox hybrid: native poll + inject widget (not Drission shadow click). Legacy path: `GROK_HYBRID_USE_DRISSION_TS=1`.
 
-Email: `email.local_style=human` → `first.last` style aliases (not pure random).
-6. Optional grok2api Web import if enabled
+---
 
-### 9router notes
+## Pipeline (per account)
 
-- Import must go through the **HTTP API** (sql.js in-memory: raw SQLite writes are invisible to the UI).
-- Dashboard → **Add Account → Grok CLI (Register)**: set **Total accounts** + concurrent; use **`0` for unlimited** (stop with Force stop).
-- Quota page (`/dashboard/quota`) for free Build accounts shows estimated **Free tokens (est. 24h)** ≈ local usage / 1,000,000 (same idea as grok2api free estimate).
+1. **Register** — `browser` or `hybrid` → SSO  
+2. **SETTLE** — `post_signup_settle_sec` (default **12s** bot hygiene)  
+3. **CONVERT** — PKCE `grok-build` on live session; prep tab after hybrid; device fallback fail-fast  
+4. **PROBE** — `cli-chat-proxy` model `grok-4.5` (default off critical path)  
+5. **PUSH** — only if **USABLE** (`inject_policy=usable`)
 
-### Concurrent isolation
+| Probe | Meaning |
+|-------|---------|
+| **200** + reply | USABLE → inject 9router |
+| **402** spending-limit | Token OK, no free credits — **not** injected |
+| **403** | Chat denied — not injected |
 
-Each worker process gets:
-
-- Unique CDP port (`GROK_DEBUG_PORT`, e.g. ~9320, ~9340)
-- Unique Chrome user-data-dir
-- Optional unique proxy (`GROK_BROWSER_PROXY`)
-- Separate logs / SSO files
-
-Do **not** share one Chrome profile across workers.
+Proxy failures during convert may retry **direct** (`proxy_fallback_direct`).
 
 ---
 
 ## Outputs
 
-```
+```text
 sso/
-  sso_<timestamp>_w<N>.txt    # SSO lines (per worker)
+  sso_<timestamp>_w<N>.txt
 logs/
-  run_<timestamp>_w<N>.log    # Per-worker run log
+  run_<timestamp>_w<N>.log
 ```
-
-Log lines include email/password and status (`CREATED`, etc.).
-
----
-
-## Project layout
-
-```
-├── DrissionPage_example.py   # Main farm (single process)
-├── run_pool.py               # Concurrent multi-process launcher
-├── farm_tui.py               # Terminal UI dashboard (Textual)
-├── email_register.py         # Catch-all + IMAP OTP
-├── sso_to_build.py           # SSO → Grok Build Device OAuth
-├── push_9router_grok_cli.py  # Push tokens to 9router grok-cli
-├── config.json               # Local config (not committed)
-├── config.example.json       # Template
-├── requirements.txt
-├── turnstilePatch/           # Chrome extension for Turnstile mouse coords
-├── sso/                      # SSO output (auto-created)
-└── logs/                     # Run logs (auto-created)
-```
-
----
-
-## Linux server tips
-
-- Prefer Playwright Chromium over snap Chromium (AppArmor).
-- If x.ai is blocked, set `browser_proxy` or `pool.proxies`.
-- Script auto-starts Xvfb on Linux when no `DISPLAY` (or `USE_XVFB=1`).
-- For larger concurrent farms: Linux + Xvfb + **1 residential proxy per worker** is safer than many workers on one home IP.
-
----
-
-## Quick start (Mac, small concurrent)
-
-```bash
-source .venv/bin/activate
-# ensure 9router is up if grok_cli.enabled
-python run_pool.py --dry-run
-python run_pool.py -n 2 -c 2 --offscreen
-# or unlimited until Ctrl+C:
-# python run_pool.py --unlimited -c 2 --offscreen
-```
-
-Watch logs:
 
 ```bash
 tail -f logs/run_*_w1.log
@@ -416,8 +395,73 @@ tail -f logs/run_*_w1.log
 
 ---
 
+## Project layout
+
+```text
+├── DrissionPage_example.py   # Main worker (register + OAuth + probe + push)
+├── farm_tui.py               # Textual multi-worker dashboard
+├── run_pool.py               # CLI multi-process launcher
+├── run_linux.sh              # Linux/VPS launcher (headless / xvfb)
+├── browser_engine.py         # Camoufox / Chromium session + asset-block
+├── hybrid/                   # Hybrid register (castle + protocol)
+├── sso_util.py               # SSO wrapper ↔ session materialize
+├── sso_to_build.py           # Device OAuth (HTTP) fail-fast
+├── build_oauth_pkce.py       # Browser PKCE referrer=grok-build
+├── push_9router_grok_cli.py  # 9router grok-cli import
+├── chat_usable.py            # Chat probe
+├── proxy_util.py / proxy_health.py
+├── config.example.json
+├── requirements.txt
+├── turnstilePatch/           # Chromium extension (optional path)
+├── sso/  logs/               # outputs (auto)
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---------|----------------|
+| Camoufox won't start | `python -m camoufox fetch`; non-root user; Linux libs |
+| `proxy … @null:10000` | Bad proxy export — need real host:port |
+| All proxies DROP | Format / plan / `curl -x … https://accounts.x.ai/` |
+| `get_turnstile_fn failed` (old) | Update to latest; hybrid uses inject path now |
+| PKCE `NS_BINDING_ABORTED` | Fixed via PKCE prep after hybrid; update main |
+| Device approve hang 7min | Fixed fail-fast (~45s); update main |
+| **402 spending-limit** | xAI free quota / policy — not a local crash |
+| Hybrid always fallback | Check logs for castle/OTP; `curl_cffi` installed? |
+| 9router empty after PASS | `grok_cli.base_url` + password; import only on USABLE |
+
+---
+
+## Quick starts
+
+**Mac**
+
+```bash
+source .venv/bin/activate
+python farm_tui.py -u -c 2 --offscreen --proxy-file proxy.txt --proxy-mode per_account
+```
+
+**Linux VPS**
+
+```bash
+source .venv/bin/activate
+./run_linux.sh farm_tui.py -u -c 2 --stagger 15 \
+  --display headless --proxy-file proxy.txt --proxy-mode per_account
+```
+
+**One account debug (headed)**
+
+```bash
+GROK_REGISTER_MODE=hybrid python farm_tui.py -c 1 --display headed --no-proxy-check
+```
+
+---
+
 ## Credits
 
-- [kevinr229/grok-maintainer](https://github.com/kevinr229/grok-maintainer) — original project
-- [grok2api](https://github.com/chenyme/grok2api) — Grok gateway / free-quota model reference
-- Catch-all + Gmail IMAP for verification codes
+- [kevinr229/grok-maintainer](https://github.com/kevinr229/grok-maintainer) — original project lineage  
+- flash-grok-farm / community OAuth + farm patterns  
+- [grok2api](https://github.com/chenyme/grok2api) — gateway / free-quota reference  
+- Catch-all + Gmail IMAP for verification codes  
