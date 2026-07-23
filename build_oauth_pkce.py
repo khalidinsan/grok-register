@@ -15,8 +15,11 @@ import hashlib
 import json
 import re
 import secrets
+import socket
+import threading
 import time
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -26,6 +29,8 @@ XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 XAI_AUTHORIZE = "https://auth.x.ai/oauth2/authorize"
 XAI_TOKEN = "https://auth.x.ai/oauth2/token"
 XAI_REDIRECT_URI = "http://127.0.0.1:56121/callback"
+_CALLBACK_HOST = "127.0.0.1"
+_CALLBACK_PORT = 56121
 # Match flash / 9router Grok Build (narrower than full conversations scopes)
 XAI_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 DEFAULT_REFERRER = "grok-build"
@@ -82,6 +87,89 @@ def extract_code_from_url(url: str) -> Optional[str]:
     if len(code) < 8:
         return None
     return code
+
+
+class _PkceCallbackServer:
+    """
+    Real HTTP listener on 127.0.0.1:56121 for Chromium/Drission PKCE.
+
+    Camoufox/Playwright intercepts the redirect with page.route() (fake fulfill).
+    Drission MixTab has NO route() — browser does a real navigation to localhost.
+    Without a listening server the redirect fails / never yields a code.
+    """
+
+    def __init__(self, captured: Dict[str, Optional[str]]):
+        self.captured = captured
+        self._httpd: Optional[HTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.port = _CALLBACK_PORT
+
+    def start(self) -> bool:
+        captured = self.captured
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: Any) -> None:
+                return  # quiet
+
+            def do_GET(self) -> None:  # noqa: N802
+                try:
+                    full = f"http://127.0.0.1:{outer.port}{self.path}"
+                    c = extract_code_from_url(full)
+                    if c:
+                        captured["code"] = c
+                    body = (
+                        b"<html><body><h3>OAuth callback OK</h3>"
+                        b"<p>You can close this tab.</p></body></html>"
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception:
+                    try:
+                        self.send_response(500)
+                        self.end_headers()
+                    except Exception:
+                        pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                self.do_GET()
+
+        # Prefer fixed port (must match XAI_REDIRECT_URI). If busy, try nearby.
+        for port in (_CALLBACK_PORT, _CALLBACK_PORT + 1, _CALLBACK_PORT + 2):
+            try:
+                httpd = HTTPServer((_CALLBACK_HOST, port), Handler)
+                self._httpd = httpd
+                self.port = port
+                t = threading.Thread(target=httpd.serve_forever, daemon=True)
+                t.start()
+                self._thread = t
+                return True
+            except OSError:
+                continue
+        return False
+
+    def stop(self) -> None:
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                self._httpd.server_close()
+            except Exception:
+                pass
+            self._httpd = None
+
+
+def _port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
 
 
 def _decode_jwt_claims(token: str) -> Dict[str, Any]:
@@ -524,8 +612,10 @@ def obtain_tokens_via_browser_pkce(
     _log(f"OAuth unwrap raw={type(raw).__name__} async={is_async}")
 
     captured: Dict[str, Optional[str]] = {"code": None}
+    cb_server: Optional[_PkceCallbackServer] = None
+    used_pw_route = False
 
-    # Install route BEFORE goto
+    # Install route BEFORE goto (Camoufox/Playwright intercepts redirect in-browser)
     if hasattr(raw, "route"):
         try:
             if is_async and loop is not None:
@@ -564,188 +654,218 @@ def obtain_tokens_via_browser_pkce(
 
                 raw.route("http://127.0.0.1:56121/**", _handle_sync)
                 raw.route("http://localhost:56121/**", _handle_sync)
-            _log("OAuth callback route installed (127.0.0.1:56121)")
+            used_pw_route = True
+            _log("OAuth callback route installed (127.0.0.1:56121) [playwright]")
         except Exception as e:
             _log(f"route setup warn: {e}")
+            used_pw_route = False
 
-    _page_goto(page, auth_url)
-    # Chromium/Drission consent paint slower than Camoufox
-    raw0, loop0, asy0 = _unwrap_page(page)
-    time.sleep(1.5 if not asy0 else 0.9)
+    # Chromium/Drission has no page.route() — need a real local HTTP server
+    if not used_pw_route:
+        cb_server = _PkceCallbackServer(captured)
+        if cb_server.start():
+            _log(
+                f"OAuth local callback server on "
+                f"http://127.0.0.1:{cb_server.port}/callback "
+                f"(Chromium/Drission path)"
+            )
+            if cb_server.port != _CALLBACK_PORT:
+                _log(
+                    f"WARN: listening on :{cb_server.port} but redirect_uri is "
+                    f":{_CALLBACK_PORT} — code capture may fail if port busy"
+                )
+        else:
+            _log(
+                "WARN: could not bind 127.0.0.1:56121 — "
+                "Chromium PKCE will not capture code (kill process using port)"
+            )
+            cb_server = None
 
-    t0 = time.time()
-    last = ""
-    allow_attempts = 0
-    last_allow_try = 0.0
+    try:
+        _page_goto(page, auth_url)
+        # Chromium/Drission consent paint slower than Camoufox
+        raw0, loop0, asy0 = _unwrap_page(page)
+        time.sleep(1.5 if not asy0 else 0.9)
 
-    while time.time() - t0 < timeout_sec:
-        if captured.get("code"):
-            break
+        t0 = time.time()
+        last = ""
+        allow_attempts = 0
+        last_allow_try = 0.0
 
-        code = _capture_code_from_pages(page)
-        if code:
-            captured["code"] = code
-            _log("OAuth code from page URL (localhost callback)")
-            break
+        while time.time() - t0 < timeout_sec:
+            if captured.get("code"):
+                break
 
-        cur = _page_url(page)
-        if not cur:
-            try:
-                cur = str(_run_page_js(page, "() => location.href") or "")
-            except Exception:
-                cur = ""
-        if cur != last:
-            _log(f"OAuth page (+{time.time() - t0:.0f}s): {cur[:140]}")
-            last = cur
+            code = _capture_code_from_pages(page) or captured.get("code")
+            if code:
+                captured["code"] = code
+                _log("OAuth code from page URL / callback server")
+                break
 
-        on_consent = (
-            "/oauth2/consent" in cur
-            or "auth.x.ai" in cur
-            or ("accounts.x.ai" in cur and "consent" in cur)
-        )
-        if try_consent_click and on_consent:
-            # Retry Allow every ~1.2s until redirect (do NOT stop after one silent fail)
-            if time.time() - last_allow_try >= 1.2:
-                last_allow_try = time.time()
-                allow_attempts += 1
-                # Optional identity confirm once early
-                if allow_attempts == 1:
-                    try:
-                        conf = _run_page_js(
-                            page,
-                            """() => {
-                              const nodes = [...document.querySelectorAll('button,[role="button"]')];
-                              for (const b of nodes) {
-                                const t = (b.innerText||'').replace(/\\s+/g,' ').trim().toLowerCase();
-                                if (t === 'confirm' || t === 'verify' || t === 'continue') {
-                                  const r = b.getBoundingClientRect();
-                                  if (r.width>0 && r.height>0) { b.click(); return t; }
-                                }
-                              }
-                              return '';
-                            }""",
-                        )
-                        if conf:
-                            _log(f"OAuth identity: {conf}")
-                            time.sleep(0.5)
-                    except Exception:
-                        pass
+            cur = _page_url(page)
+            if not cur:
+                try:
+                    cur = str(_run_page_js(page, "() => location.href") or "")
+                except Exception:
+                    cur = ""
+            if cur != last:
+                _log(f"OAuth page (+{time.time() - t0:.0f}s): {cur[:140]}")
+                last = cur
 
-                ok = _click_allow_hard(page, log=_log)
-                if ok:
-                    _log(f"OAuth Allow attempt #{allow_attempts} OK — wait callback…")
-                    # wait for localhost redirect (Playwright) or poll URL (Drission)
-                    try:
-                        raw2, loop2, asy2 = _unwrap_page(page)
-                        if hasattr(raw2, "wait_for_url"):
-                            _run(
-                                loop2,
-                                asy2,
-                                raw2.wait_for_url(
-                                    re.compile(
-                                        r"https?://(127\.0\.0\.1|localhost):56121/"
-                                    ),
-                                    timeout=10000,
-                                ),
+            on_consent = (
+                "/oauth2/consent" in cur
+                or "auth.x.ai" in cur
+                or ("accounts.x.ai" in cur and "consent" in cur)
+            )
+            if try_consent_click and on_consent:
+                # Retry Allow every ~1.2s until redirect
+                if time.time() - last_allow_try >= 1.2:
+                    last_allow_try = time.time()
+                    allow_attempts += 1
+                    if allow_attempts == 1:
+                        try:
+                            conf = _run_page_js(
+                                page,
+                                """() => {
+                                  const nodes = [...document.querySelectorAll('button,[role="button"]')];
+                                  for (const b of nodes) {
+                                    const t = (b.innerText||'').replace(/\\s+/g,' ').trim().toLowerCase();
+                                    if (t === 'confirm' || t === 'verify' || t === 'continue') {
+                                      const r = b.getBoundingClientRect();
+                                      if (r.width>0 && r.height>0) { b.click(); return t; }
+                                    }
+                                  }
+                                  return '';
+                                }""",
                             )
-                            c2 = _capture_code_from_pages(page) or captured.get("code")
-                            if c2:
-                                captured["code"] = c2
-                                break
-                        else:
-                            # Drission MixTab: poll location after click
-                            for _ in range(25):
-                                time.sleep(0.4)
-                                c2 = _capture_code_from_pages(page)
+                            if conf:
+                                _log(f"OAuth identity: {conf}")
+                                time.sleep(0.5)
+                        except Exception:
+                            pass
+
+                    ok = _click_allow_hard(page, log=_log)
+                    if ok:
+                        _log(
+                            f"OAuth Allow attempt #{allow_attempts} OK — wait callback…"
+                        )
+                        try:
+                            raw2, loop2, asy2 = _unwrap_page(page)
+                            if hasattr(raw2, "wait_for_url"):
+                                _run(
+                                    loop2,
+                                    asy2,
+                                    raw2.wait_for_url(
+                                        re.compile(
+                                            r"https?://(127\.0\.0\.1|localhost):56121/"
+                                        ),
+                                        timeout=10000,
+                                    ),
+                                )
+                                c2 = (
+                                    _capture_code_from_pages(page)
+                                    or captured.get("code")
+                                )
                                 if c2:
                                     captured["code"] = c2
                                     break
-                                u2 = _page_url(page) or str(
-                                    _run_page_js(page, "() => location.href") or ""
-                                )
-                                if "56121" in u2 or "code=" in u2:
-                                    c2 = extract_code_from_url(u2)
+                            else:
+                                # Drission: wait for real HTTP callback server or URL
+                                for _ in range(30):
+                                    time.sleep(0.35)
+                                    if captured.get("code"):
+                                        break
+                                    c2 = _capture_code_from_pages(page)
                                     if c2:
                                         captured["code"] = c2
                                         break
-                            if captured.get("code"):
-                                break
-                    except Exception:
-                        time.sleep(0.4)
-                else:
-                    if allow_attempts <= 3 or allow_attempts % 5 == 0:
-                        # one-line DOM dump to see why Chromium misses
-                        try:
-                            dump = _run_page_js(
-                                page,
-                                """() => [...document.querySelectorAll('button,[role=button],input[type=submit]')]
-                                  .slice(0,12).map(b => (b.innerText||b.value||'').replace(/\\s+/g,' ').trim())
-                                  .filter(Boolean).join(' | ')""",
-                            )
-                            if dump:
-                                _log(f"OAuth buttons visible: {str(dump)[:160]}")
+                                    u2 = _page_url(page) or str(
+                                        _run_page_js(page, "() => location.href") or ""
+                                    )
+                                    if "56121" in u2 or "code=" in u2:
+                                        c2 = extract_code_from_url(u2)
+                                        if c2:
+                                            captured["code"] = c2
+                                            break
+                                if captured.get("code"):
+                                    break
                         except Exception:
-                            pass
-                    _log(
-                        f"OAuth Allow attempt #{allow_attempts} MISS "
-                        f"(no button found / click failed)"
-                    )
+                            time.sleep(0.4)
+                    else:
+                        if allow_attempts <= 3 or allow_attempts % 5 == 0:
+                            try:
+                                dump = _run_page_js(
+                                    page,
+                                    """() => [...document.querySelectorAll('button,[role=button],input[type=submit]')]
+                                      .slice(0,12).map(b => (b.innerText||b.value||'').replace(/\\s+/g,' ').trim())
+                                      .filter(Boolean).join(' | ')""",
+                                )
+                                if dump:
+                                    _log(f"OAuth buttons visible: {str(dump)[:160]}")
+                            except Exception:
+                                pass
+                        _log(
+                            f"OAuth Allow attempt #{allow_attempts} MISS "
+                            f"(no button found / click failed)"
+                        )
 
-        time.sleep(0.35)
+            time.sleep(0.35)
 
-    if not captured.get("code"):
-        captured["code"] = _capture_code_from_pages(page)
+        if not captured.get("code"):
+            captured["code"] = _capture_code_from_pages(page)
 
-    # cleanup routes
-    try:
-        raw, loop, is_async = _unwrap_page(page)
-        if hasattr(raw, "unroute"):
-            if is_async and loop is not None:
-                loop.run_until_complete(raw.unroute("http://127.0.0.1:56121/**"))
-                loop.run_until_complete(raw.unroute("http://localhost:56121/**"))
-            else:
-                raw.unroute("http://127.0.0.1:56121/**")
-                raw.unroute("http://localhost:56121/**")
-    except Exception:
-        pass
-
-    code = captured.get("code")
-    if not code:
-        hint = ""
-        try:
-            raw, loop, is_async = _unwrap_page(page)
-            if hasattr(raw, "evaluate"):
+        code = captured.get("code")
+        if not code:
+            hint = ""
+            try:
                 hint = str(
-                    _run(
-                        loop,
-                        is_async,
-                        raw.evaluate(
-                            """() => (document.body && document.body.innerText || '')
-                                .replace(/\\s+/g, ' ').trim().slice(0, 160)"""
-                        ),
+                    _run_page_js(
+                        page,
+                        """() => (document.body && document.body.innerText || '')
+                            .replace(/\\s+/g, ' ').trim().slice(0, 160)""",
                     )
                     or ""
                 )
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"OAuth code not captured in {timeout_sec:.0f}s "
+                f"(allow_attempts={allow_attempts} last_url={_page_url(page)[:140]!r} "
+                f"hint={hint[:100]!r} route={used_pw_route} "
+                f"cb_server={'on' if cb_server else 'off'}). "
+                f"Need Allow → redirect 127.0.0.1:56121."
+            )
+
+        _log(
+            f"OAuth code OK in {time.time() - t0:.1f}s "
+            f"(len={len(code)} prefix={code[:8]}…) → token exchange"
+        )
+        tokens = exchange_code_for_tokens(code, verifier, proxy=proxy)
+        if not tokens.email and email:
+            tokens.email = email
+        _log(
+            f"tokens OK email={tokens.email or '-'} bot_flag={tokens.bot_flag_source!r} "
+            f"referrer={tokens.referrer!r} mode={tokens.auth_mode}"
+        )
+        return tokens
+    finally:
+        # cleanup playwright routes
+        try:
+            raw_c, loop_c, asy_c = _unwrap_page(page)
+            if used_pw_route and hasattr(raw_c, "unroute"):
+                if asy_c and loop_c is not None:
+                    loop_c.run_until_complete(raw_c.unroute("http://127.0.0.1:56121/**"))
+                    loop_c.run_until_complete(raw_c.unroute("http://localhost:56121/**"))
+                else:
+                    raw_c.unroute("http://127.0.0.1:56121/**")
+                    raw_c.unroute("http://localhost:56121/**")
         except Exception:
             pass
-        raise RuntimeError(
-            f"OAuth code not captured in {timeout_sec:.0f}s "
-            f"(allow_attempts={allow_attempts} last_url={_page_url(page)[:140]!r} "
-            f"hint={hint[:100]!r}). Need successful Allow click → redirect 127.0.0.1:56121."
-        )
-
-    _log(
-        f"OAuth code OK in {time.time() - t0:.1f}s "
-        f"(len={len(code)} prefix={code[:8]}…) → token exchange"
-    )
-    tokens = exchange_code_for_tokens(code, verifier, proxy=proxy)
-    if not tokens.email and email:
-        tokens.email = email
-    _log(
-        f"tokens OK email={tokens.email or '-'} bot_flag={tokens.bot_flag_source!r} "
-        f"referrer={tokens.referrer!r} mode={tokens.auth_mode}"
-    )
-    return tokens
+        if cb_server is not None:
+            try:
+                cb_server.stop()
+            except Exception:
+                pass
 
 
 def jwt_gate_decision(
