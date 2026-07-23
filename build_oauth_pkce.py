@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import secrets
 import socket
@@ -89,13 +90,83 @@ def extract_code_from_url(url: str) -> Optional[str]:
     return code
 
 
+# Cross-process lock so concurrent Chromium workers don't fight for :56121
+# (OAuth redirect_uri is fixed — cannot use alternate ports).
+_PKCE_PORT_LOCK_PATH = os.environ.get(
+    "GROK_PKCE_PORT_LOCK",
+    os.path.join(
+        os.environ.get("TMPDIR") or os.environ.get("TMP") or "/tmp",
+        "grok_pkce_56121.lock",
+    ),
+)
+
+
+class _PkcePortLock:
+    """Exclusive file lock for the fixed OAuth callback port (multi-worker safe)."""
+
+    def __init__(self, path: str = _PKCE_PORT_LOCK_PATH, timeout: float = 120.0):
+        self.path = path
+        self.timeout = timeout
+        self._fh: Any = None
+
+    def acquire(self) -> bool:
+        import os as _os
+
+        _os.makedirs(_os.path.dirname(self.path) or ".", exist_ok=True)
+        self._fh = open(self.path, "a+", encoding="utf-8")
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            try:
+                if _os.name == "nt":
+                    import msvcrt
+
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fh.seek(0)
+                self._fh.truncate()
+                self._fh.write(f"{_os.getpid()}\n")
+                self._fh.flush()
+                return True
+            except (OSError, BlockingIOError):
+                time.sleep(0.4)
+        return False
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            import os as _os
+
+            if _os.name == "nt":
+                import msvcrt
+
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
 class _PkceCallbackServer:
     """
-    Real HTTP listener on 127.0.0.1:56121 for Chromium/Drission PKCE.
+    Real HTTP listener on 127.0.0.1:56121 ONLY for Chromium/Drission PKCE.
 
     Camoufox/Playwright intercepts the redirect with page.route() (fake fulfill).
     Drission MixTab has NO route() — browser does a real navigation to localhost.
-    Without a listening server the redirect fails / never yields a code.
+    Port MUST be 56121 (matches registered redirect_uri). Alternate ports break OAuth.
+    Use _PkcePortLock so concurrent workers serialize on this port.
     """
 
     def __init__(self, captured: Dict[str, Optional[str]]):
@@ -103,8 +174,11 @@ class _PkceCallbackServer:
         self._httpd: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.port = _CALLBACK_PORT
+        self._lock = _PkcePortLock()
 
-    def start(self) -> bool:
+    def start(self, *, wait_lock_sec: float = 120.0) -> bool:
+        if not self._lock.acquire():
+            return False
         captured = self.captured
         outer = self
 
@@ -137,19 +211,22 @@ class _PkceCallbackServer:
             def do_POST(self) -> None:  # noqa: N802
                 self.do_GET()
 
-        # Prefer fixed port (must match XAI_REDIRECT_URI). If busy, try nearby.
-        for port in (_CALLBACK_PORT, _CALLBACK_PORT + 1, _CALLBACK_PORT + 2):
-            try:
-                httpd = HTTPServer((_CALLBACK_HOST, port), Handler)
-                self._httpd = httpd
-                self.port = port
-                t = threading.Thread(target=httpd.serve_forever, daemon=True)
-                t.start()
-                self._thread = t
-                return True
-            except OSError:
-                continue
-        return False
+        # ONLY :56121 — must match XAI_REDIRECT_URI exactly
+        try:
+
+            class _ReuseHTTPServer(HTTPServer):
+                allow_reuse_address = True
+
+            httpd = _ReuseHTTPServer((_CALLBACK_HOST, _CALLBACK_PORT), Handler)
+            self._httpd = httpd
+            self.port = _CALLBACK_PORT
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            self._thread = t
+            return True
+        except OSError:
+            self._lock.release()
+            return False
 
     def stop(self) -> None:
         if self._httpd is not None:
@@ -162,14 +239,7 @@ class _PkceCallbackServer:
             except Exception:
                 pass
             self._httpd = None
-
-
-def _port_open(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.3):
-            return True
-    except OSError:
-        return False
+        self._lock.release()
 
 
 def _decode_jwt_claims(token: str) -> Dict[str, Any]:
@@ -394,11 +464,13 @@ def _capture_code_from_pages(page: Any) -> Optional[str]:
     return None
 
 
+# STRICT: only real OAuth consent actions. Never cookies / sign-out / Google login.
 _ALLOW_CLICK_JS = r"""
 () => {
-  const prefer = ['allow', 'authorize', 'approve', 'accept', '继续', '允许', '授权'];
+  // exact labels only — 'accept' alone matched "Accept all cookies" and killed session
+  const exact = new Set(['allow', 'authorize', 'approve', '允许', '授权']);
   const nodes = [...document.querySelectorAll(
-    'button, [role="button"], input[type="submit"], a, [data-testid]'
+    'button, [role="button"], input[type="submit"]'
   )];
   const visible = (b) => {
     try {
@@ -412,37 +484,15 @@ _ALLOW_CLICK_JS = r"""
   };
   const label = (b) => (b.innerText || b.textContent || b.value || b.getAttribute('aria-label') || '')
     .replace(/\s+/g, ' ').trim().toLowerCase();
-  // pass 1: exact
-  for (const want of prefer) {
-    for (const b of nodes) {
-      if (!visible(b)) continue;
-      if (label(b) !== want) continue;
-      b.scrollIntoView({block: 'center', inline: 'center'});
-      b.click();
-      return want;
-    }
-  }
-  // pass 2: includes (not deny/cancel)
+  const banned = /cookie|sign out|sign-out|log out|logout|google|apple|microsoft|github|deny|cancel|reject|go back|continue with/;
   for (const b of nodes) {
     if (!visible(b)) continue;
     const txt = label(b);
-    if (!txt || /deny|cancel|sign out|go back|google|apple|reject|拒绝|取消/.test(txt)) continue;
-    if (!prefer.some(w => txt === w || txt.includes(w))) continue;
+    if (!txt || banned.test(txt)) continue;
+    if (!exact.has(txt)) continue;
     b.scrollIntoView({block: 'center', inline: 'center'});
     b.click();
     return txt;
-  }
-  // pass 3: primary/submit styling on consent
-  for (const b of nodes) {
-    if (!visible(b)) continue;
-    const cls = String(b.className || '').toLowerCase();
-    const t = label(b);
-    if (!t || t.length > 24) continue;
-    if (/deny|cancel|reject/.test(t)) continue;
-    if (cls.includes('primary') || cls.includes('solid') || b.type === 'submit') {
-      b.click();
-      return 'primary:' + t;
-    }
   }
   return '';
 }
@@ -490,18 +540,15 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
         if log:
             log(m)
 
-    # 1) exact role Allow / Authorize (async Camoufox)
+    # 1) exact role Allow / Authorize (async Camoufox) — NEVER "Accept" (cookies)
     if hasattr(raw, "get_by_role") and is_async and loop is not None:
-        for kw in ("Allow", "Authorize", "Approve", "Accept"):
+        for kw in ("Allow", "Authorize", "Approve"):
             try:
                 async def _click_kw(k=kw):
                     loc = raw.get_by_role(
                         "button", name=re.compile(rf"^{re.escape(k)}$", re.I)
                     )
                     n = await loc.count()
-                    if n <= 0:
-                        loc = raw.get_by_role("button", name=re.compile(k, re.I))
-                        n = await loc.count()
                     if n <= 0:
                         return False
                     btn = loc.first
@@ -532,7 +579,7 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
 
     # 3) sync playwright path
     if hasattr(raw, "get_by_role") and not is_async:
-        for kw in ("Allow", "Authorize", "Approve", "Accept"):
+        for kw in ("Allow", "Authorize", "Approve"):
             try:
                 loc = raw.get_by_role(
                     "button", name=re.compile(rf"^{re.escape(kw)}$", re.I)
@@ -545,7 +592,7 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
             except Exception:
                 continue
 
-    # 4) DrissionPage text / CSS selectors (Chromium MixTab fallback)
+    # 4) DrissionPage — exact text only (no Accept / no primary submit)
     for target in (page, raw):
         if not hasattr(target, "ele"):
             continue
@@ -553,13 +600,11 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
             "text:Allow",
             "text:Authorize",
             "text:Approve",
-            "text:Accept",
             "text:允许",
             "text:授权",
-            "css:button[type='submit']",
             "tag:button@@text():Allow",
-            "xpath://button[contains(translate(., 'ALLOW', 'allow'), 'allow')]",
-            "xpath://*[@role='button' and contains(translate(., 'ALLOW', 'allow'), 'allow')]",
+            "xpath://button[normalize-space(translate(., 'ALLOW', 'allow'))='allow']",
+            "xpath://*[@role='button' and normalize-space(translate(., 'ALLOW', 'allow'))='allow']",
         ):
             try:
                 el = target.ele(sel, timeout=0.6)
@@ -660,24 +705,20 @@ def obtain_tokens_via_browser_pkce(
             _log(f"route setup warn: {e}")
             used_pw_route = False
 
-    # Chromium/Drission has no page.route() — need a real local HTTP server
+    # Chromium/Drission has no page.route() — need real HTTP on EXACT :56121
+    # (multi-worker: file lock serializes; never use alternate ports)
     if not used_pw_route:
+        _log("OAuth waiting for exclusive :56121 callback lock (Chromium path)…")
         cb_server = _PkceCallbackServer(captured)
         if cb_server.start():
             _log(
-                f"OAuth local callback server on "
-                f"http://127.0.0.1:{cb_server.port}/callback "
-                f"(Chromium/Drission path)"
+                "OAuth local callback server on "
+                "http://127.0.0.1:56121/callback (Chromium/Drission path)"
             )
-            if cb_server.port != _CALLBACK_PORT:
-                _log(
-                    f"WARN: listening on :{cb_server.port} but redirect_uri is "
-                    f":{_CALLBACK_PORT} — code capture may fail if port busy"
-                )
         else:
             _log(
-                "WARN: could not bind 127.0.0.1:56121 — "
-                "Chromium PKCE will not capture code (kill process using port)"
+                "WARN: could not bind 127.0.0.1:56121 after lock wait — "
+                "Chromium PKCE will fail (another process holds the port)"
             )
             cb_server = None
 
@@ -744,6 +785,14 @@ def obtain_tokens_via_browser_pkce(
                         except Exception:
                             pass
 
+                    # Abort if session already lost (redirect to sign-in)
+                    cur_now = _page_url(page) or cur
+                    if "sign-in" in cur_now or "sign-up" in cur_now:
+                        _log(
+                            f"OAuth session lost (url has sign-in/up) — stop Allow spam"
+                        )
+                        break
+
                     ok = _click_allow_hard(page, log=_log)
                     if ok:
                         _log(
@@ -771,7 +820,7 @@ def obtain_tokens_via_browser_pkce(
                                     break
                             else:
                                 # Drission: wait for real HTTP callback server or URL
-                                for _ in range(30):
+                                for _ in range(40):
                                     time.sleep(0.35)
                                     if captured.get("code"):
                                         break
@@ -787,6 +836,9 @@ def obtain_tokens_via_browser_pkce(
                                         if c2:
                                             captured["code"] = c2
                                             break
+                                    if "sign-in" in u2:
+                                        _log("OAuth bounced to sign-in after Allow")
+                                        break
                                 if captured.get("code"):
                                     break
                         except Exception:
@@ -808,6 +860,10 @@ def obtain_tokens_via_browser_pkce(
                             f"OAuth Allow attempt #{allow_attempts} MISS "
                             f"(no button found / click failed)"
                         )
+                        # After a few misses on consent, don't thrash forever
+                        if allow_attempts >= 8:
+                            _log("OAuth Allow giving up after 8 misses on consent")
+                            break
 
             time.sleep(0.35)
 
