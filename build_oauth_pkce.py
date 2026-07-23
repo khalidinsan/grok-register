@@ -261,37 +261,7 @@ def _decode_jwt_claims(token: str) -> Dict[str, Any]:
         return {}
 
 
-def exchange_code_for_tokens(
-    code: str,
-    verifier: str,
-    *,
-    proxy: str = "",
-) -> BuildTokens:
-    form = {
-        "grant_type": "authorization_code",
-        "client_id": XAI_CLIENT_ID,
-        "code": code,
-        "redirect_uri": XAI_REDIRECT_URI,
-        "code_verifier": verifier,
-    }
-    proxies = None
-    if proxy:
-        proxies = {"http": proxy, "https": proxy}
-    resp = requests.post(
-        XAI_TOKEN,
-        data=form,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-        timeout=45,
-        proxies=proxies,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(
-            f"token exchange HTTP {resp.status_code}: {resp.text[:300]}"
-        )
-    data = resp.json() if resp.content else {}
+def _tokens_from_payload(data: Dict[str, Any]) -> BuildTokens:
     access = data.get("access_token") or ""
     refresh = data.get("refresh_token") or ""
     if not access or not refresh:
@@ -336,6 +306,262 @@ def exchange_code_for_tokens(
         },
         auth_mode="oidc_pkce",
     )
+
+
+def _page_api_request(
+    page: Any,
+) -> Any:
+    """Playwright APIRequestContext from page (no CORS, shares cookies)."""
+    raw, loop, is_async = _unwrap_page(page)
+    # page.request (Playwright Page)
+    req = getattr(raw, "request", None)
+    if req is not None:
+        return req, loop, is_async
+    ctx = getattr(raw, "context", None)
+    if ctx is not None:
+        req = getattr(ctx, "request", None)
+        if req is not None:
+            return req, loop, is_async
+    return None, loop, is_async
+
+
+def _exchange_via_browser_context(
+    page: Any,
+    code: str,
+    verifier: str,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    POST /oauth2/token using Playwright request context (Camoufox cookies, no CORS).
+
+    Host-side `requests` can get invalid_grant after xAI tightened code binding
+    to the browser session that completed consent.
+    """
+    def _log(m: str) -> None:
+        if log:
+            log(m)
+
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": XAI_CLIENT_ID,
+        "code": code,
+        "redirect_uri": XAI_REDIRECT_URI,
+        "code_verifier": verifier,
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "Origin": "https://accounts.x.ai",
+        "Referer": "https://accounts.x.ai/",
+    }
+
+    # 1) Playwright APIRequestContext (preferred — no CORS)
+    req, loop, is_async = _page_api_request(page)
+    if req is not None and hasattr(req, "post"):
+        try:
+            async def _post_async():
+                return await req.post(
+                    XAI_TOKEN,
+                    form=form,
+                    headers=headers,
+                    timeout=45000,
+                )
+
+            if is_async and loop is not None:
+                resp = loop.run_until_complete(_post_async())
+            else:
+                # sync playwright
+                resp = req.post(
+                    XAI_TOKEN,
+                    form=form,
+                    headers=headers,
+                    timeout=45000,
+                )
+            # Playwright APIResponse (sync or async)
+            status = int(getattr(resp, "status", 0) or 0)
+            text = ""
+            try:
+                body = resp.text()
+                if asyncio_is_coro(body) and loop is not None:
+                    text = loop.run_until_complete(body)
+                else:
+                    text = body
+            except Exception:
+                try:
+                    body = resp.body()
+                    if asyncio_is_coro(body) and loop is not None:
+                        body = loop.run_until_complete(body)
+                    text = (
+                        body.decode("utf-8", "replace")
+                        if isinstance(body, (bytes, bytearray))
+                        else str(body or "")
+                    )
+                except Exception:
+                    text = ""
+            text = str(text or "")
+            _log(f"browser-context token exchange status={status} via=pw_request")
+            if status < 200 or status >= 300:
+                return {"_error": f"HTTP {status}: {text[:300]}", "_status": status}
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            _log(f"pw request token exchange warn: {e}")
+
+    # 2) In-page fetch from accounts.x.ai origin (avoid CORS from 127.0.0.1)
+    try:
+        cur = _page_url(page) or ""
+        if "127.0.0.1" in cur or "localhost" in cur:
+            try:
+                _page_goto(page, "https://accounts.x.ai/account", timeout_ms=20000)
+            except Exception as e:
+                _log(f"goto accounts for token exchange warn: {e}")
+        js = r"""
+async (args) => {
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: args.clientId,
+      code: args.code,
+      redirect_uri: args.redirectUri,
+      code_verifier: args.verifier,
+    });
+    const r = await fetch(args.tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'Origin': 'https://accounts.x.ai',
+        'Referer': 'https://accounts.x.ai/',
+      },
+      body: body.toString(),
+      credentials: 'include',
+    });
+    const text = await r.text();
+    return { status: r.status, text: text.slice(0, 8000) };
+  } catch (e) {
+    return { status: 0, text: String(e && e.message || e) };
+  }
+}
+"""
+        raw, loop, is_async = _unwrap_page(page)
+        args = {
+            "clientId": XAI_CLIENT_ID,
+            "code": code,
+            "redirectUri": XAI_REDIRECT_URI,
+            "verifier": verifier,
+            "tokenUrl": XAI_TOKEN,
+        }
+        result = None
+        if hasattr(raw, "evaluate"):
+            result = _run(loop, is_async, raw.evaluate(js, args))
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status") or 0)
+        text = str(result.get("text") or "")
+        _log(f"browser-context token exchange status={status} via=page_fetch")
+        if status < 200 or status >= 300:
+            return {"_error": f"HTTP {status}: {text[:300]}", "_status": status}
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        if log:
+            log(f"browser token exchange failed: {e}")
+        return None
+
+
+def asyncio_is_coro(obj: Any) -> bool:
+    try:
+        import asyncio
+
+        return asyncio.iscoroutine(obj)
+    except Exception:
+        return False
+
+
+def exchange_code_for_tokens(
+    code: str,
+    verifier: str,
+    *,
+    proxy: str = "",
+    page: Any = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> BuildTokens:
+    """
+    Exchange auth code → access/refresh.
+
+    Prefer Playwright/browser context (Camoufox cookies + same network path)
+    when page is provided; fall back to Python requests.
+    """
+    def _log(m: str) -> None:
+        if log:
+            log(m)
+
+    # 1) Browser-context exchange (fixes invalid_grant when host requests is denied)
+    if page is not None:
+        br = _exchange_via_browser_context(page, code, verifier, log=log)
+        if isinstance(br, dict) and br.get("access_token"):
+            _log("token exchange OK via browser context")
+            return _tokens_from_payload(br)
+        if isinstance(br, dict) and br.get("_error"):
+            _log(f"browser exchange fail: {br.get('_error')[:160]} — try host HTTP")
+
+    # 2) Host HTTP exchange
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": XAI_CLIENT_ID,
+        "code": code,
+        "redirect_uri": XAI_REDIRECT_URI,
+        "code_verifier": verifier,
+    }
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+    # Forward browser SSO cookies if available (helps when code is session-bound)
+    cookie_header = ""
+    if page is not None:
+        try:
+            raw, loop, is_async = _unwrap_page(page)
+            ctx = getattr(raw, "context", None)
+            cookies = []
+            if ctx is not None and hasattr(ctx, "cookies"):
+                if is_async and loop is not None:
+                    cookies = loop.run_until_complete(ctx.cookies()) or []
+                else:
+                    cookies = ctx.cookies() or []
+            parts = []
+            for c in cookies:
+                name = str(c.get("name") or "")
+                if name in ("sso", "sso-rw", "cf_clearance", "__cf_bm"):
+                    parts.append(f"{name}={c.get('value')}")
+            cookie_header = "; ".join(parts)
+        except Exception:
+            cookie_header = ""
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+        ),
+        "Origin": "https://accounts.x.ai",
+        "Referer": "https://accounts.x.ai/",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    resp = requests.post(
+        XAI_TOKEN,
+        data=form,
+        headers=headers,
+        timeout=45,
+        proxies=proxies,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"token exchange HTTP {resp.status_code}: {resp.text[:300]}"
+        )
+    data = resp.json() if resp.content else {}
+    return _tokens_from_payload(data)
 
 
 def build_authorize_url(
@@ -716,6 +942,85 @@ def _run_page_js(page: Any, script: str) -> Any:
     return None
 
 
+def _dismiss_oauth_cookie_banner(
+    page: Any, log: Optional[Callable[[str], None]] = None
+) -> bool:
+    """Dismiss cookie bar that can block / confuse OAuth Allow clicks."""
+    js = r"""
+() => {
+  const want = /accept all cookies|accept all|allow all cookies|allow all|reject all/;
+  const banned = /sign out|log out|google|apple|deny(?! all)/i;
+  for (const b of document.querySelectorAll('button, [role="button"]')) {
+    try {
+      const t = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!t || banned.test(t)) continue;
+      if (!want.test(t)) continue;
+      const r = b.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      b.click();
+      return t;
+    } catch (e) {}
+  }
+  return '';
+}
+"""
+    try:
+        hit = _run_page_js(page, js)
+        if hit:
+            if log:
+                log(f"OAuth cookie banner dismissed ({hit!r})")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _oauth_page_is_access_denied(page: Any) -> Optional[str]:
+    """Detect xAI 'Failed to generate authentication code / Access denied' dead-end."""
+    try:
+        body = str(
+            _run_page_js(
+                page,
+                """() => (document.body && document.body.innerText || '')
+                    .replace(/\\s+/g, ' ').trim().slice(0, 400)""",
+            )
+            or ""
+        )
+    except Exception:
+        body = ""
+    low = body.lower()
+    if (
+        "failed to generate authentication code" in low
+        or ("access denied" in low and "authentication" in low)
+        or ("access denied" in low and "generate" in low)
+    ):
+        return body[:160]
+    # Also URL error query
+    try:
+        cur = _page_url(page) or ""
+        if "error=access_denied" in cur.lower() or "error=access_denied" in low:
+            return f"url/body access_denied: {cur[:120]}"
+    except Exception:
+        pass
+    return None
+
+
+def _oauth_page_connection_successful(page: Any) -> bool:
+    """True when consent UI shows 'Connection successful' (code already issued)."""
+    try:
+        body = str(
+            _run_page_js(
+                page,
+                """() => (document.body && document.body.innerText || '')
+                    .toLowerCase().slice(0, 300)""",
+            )
+            or ""
+        )
+    except Exception:
+        return False
+    return "connection successful" in body or "happy building" in body
+
+
 def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) -> bool:
     """
     Aggressively click Allow / Authorize on consent.
@@ -729,6 +1034,9 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
     def _log(m: str) -> None:
         if log:
             log(m)
+
+    # Cookie bar first — "Allow All" is cookies, not OAuth Allow
+    _dismiss_oauth_cookie_banner(page, log=_log)
 
     # 1) exact role Allow / Authorize (async Camoufox) — NEVER "Accept" (cookies)
     if hasattr(raw, "get_by_role") and is_async and loop is not None:
@@ -923,15 +1231,32 @@ def obtain_tokens_via_browser_pkce(
         # Chromium/Drission consent paint slower than Camoufox
         raw0, loop0, asy0 = _unwrap_page(page)
         time.sleep(1.5 if not asy0 else 0.9)
+        # Cookie banner can sit under / over Allow — dismiss once early
+        _dismiss_oauth_cookie_banner(page, log=_log)
 
         t0 = time.time()
         last = ""
         allow_attempts = 0
         last_allow_try = 0.0
+        denied_hits = 0
 
         while time.time() - t0 < timeout_sec:
             if captured.get("code"):
                 break
+
+            # xAI hard-deny: "Failed to generate authentication code / Access denied"
+            # — no amount of re-clicking Allow will produce a code. Fail fast.
+            denied = _oauth_page_is_access_denied(page)
+            if denied:
+                denied_hits += 1
+                if denied_hits >= 2:
+                    raise RuntimeError(
+                        f"OAuth access denied by xAI (no auth code generated): "
+                        f"{denied[:140]}"
+                    )
+                _log(f"OAuth access-denied UI detected — short wait then recheck")
+                time.sleep(0.8)
+                continue
 
             code = _capture_code_from_pages(page) or captured.get("code")
             if code:
@@ -999,6 +1324,23 @@ def obtain_tokens_via_browser_pkce(
                     captured["code"] = ui_code
                     _log(f"OAuth code from copy-code UI len={len(ui_code)}")
                     break
+                time.sleep(0.5)
+                continue
+
+            # Code already issued — stop Allow spam; wait for route/capture only
+            if _oauth_page_connection_successful(page):
+                if captured.get("code"):
+                    break
+                time.sleep(0.4)
+                c2 = (
+                    _capture_code_from_pages(page)
+                    or captured.get("code")
+                    or _capture_code_from_display_ui(page)
+                )
+                if c2:
+                    captured["code"] = c2
+                    break
+                # stay on this UI up to a few seconds then keep looping
                 time.sleep(0.5)
                 continue
 
@@ -1144,7 +1486,12 @@ def obtain_tokens_via_browser_pkce(
             f"OAuth code OK in {time.time() - t0:.1f}s "
             f"(len={len(code)} prefix={code[:8]}…) → token exchange"
         )
-        tokens = exchange_code_for_tokens(code, verifier, proxy=proxy)
+        # Prefer in-browser exchange (Camoufox TLS + SSO cookies). Host-only
+        # requests has started returning invalid_grant / Access denied even
+        # with a real code (xAI tightened session binding).
+        tokens = exchange_code_for_tokens(
+            code, verifier, proxy=proxy, page=page, log=_log
+        )
         if not tokens.email and email:
             tokens.email = email
         _log(

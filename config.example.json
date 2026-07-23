@@ -38,6 +38,10 @@
     "browser": {
         "engine": "camoufox"
     },
+    "account": {
+        "password": "Nfarm!a7#GrokBuild26",
+        "_comment_password": "Fixed password for ALL farmed accounts (not random). Override with env GROK_ACCOUNT_PASSWORD. Saved to accounts/email_pass.txt + accounts/accounts.jsonl"
+    },
     "grok_cli": {
         "enabled": true,
         "base_url": "https://ai.khalid.id",

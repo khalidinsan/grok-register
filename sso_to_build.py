@@ -151,13 +151,26 @@ def _cookies_to_items(cookies: Any) -> List[Dict[str, Any]]:
 
 
 def _looks_rate_limited(status: int, body: bytes | str = b"", err_text: str = "") -> bool:
-    text = err_text
-    if isinstance(body, bytes):
-        text = (text + " " + body.decode("utf-8", errors="replace")).lower()
-    else:
-        text = (text + " " + str(body or "")).lower()
+    """Detect real rate limits — NOT static i18n strings in accounts.x.ai HTML.
+
+    The Next.js account pages embed \"try again later\" in locale bundles, which
+    previously false-triggered 8s backoffs on every SSO check / verify page load.
+    """
     if status == 429:
         return True
+    if isinstance(body, bytes):
+        raw = body.decode("utf-8", errors="replace")
+    else:
+        raw = str(body or "")
+    text = (str(err_text or "") + " " + raw).lower()
+    # Huge HTML shells: only trust explicit error query / short API bodies
+    if len(raw) > 4000 and ("<!doctype" in text or "<html" in text):
+        # e.g. /oauth2/device?error=rate_limited
+        if "error=rate_limited" in text or "error=rate_limit" in text:
+            return True
+        if '"error":"rate_limit"' in text or '"error":"slow_down"' in text:
+            return True
+        return False
     return any(
         k in text
         for k in (
@@ -166,7 +179,7 @@ def _looks_rate_limited(status: int, body: bytes | str = b"", err_text: str = ""
             "ratelimit",
             "slow_down",
             "too many requests",
-            "try again later",
+            "error=rate_limited",
         )
     )
 
@@ -407,19 +420,22 @@ class SsoBuildFlow:
             print(f"[Build] warn: verify final_url={final_url} (expected consent)")
 
         print("[Build] Approving device flow ...")
+        # xAI rejects empty principal_id with "Invalid action".
+        # Working payload (manual + probe 2026-07-23): user_code + action=allow only.
         status, final_url, body = self._do_with_rl_retry(
             "POST",
             APPROVE_URL,
             {
                 "user_code": user_code,
                 "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
             },
             label="approve",
         )
         if status < 200 or status >= 400:
-            raise RuntimeError(f"approve failed HTTP {status} url={final_url}")
+            snippet = body[:200].decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)[:200]
+            raise RuntimeError(
+                f"approve failed HTTP {status} url={final_url} body={snippet!r}"
+            )
         if "done" not in final_url:
             print(f"[Build] warn: approve final_url={final_url}")
 

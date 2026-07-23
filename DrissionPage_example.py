@@ -565,8 +565,12 @@ except Exception:
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 _sso_dir = os.path.join(os.path.dirname(__file__), "sso")
+_accounts_dir = os.path.join(os.path.dirname(__file__), "accounts")
 _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
+# Full account records (email/password + SSO meta). Output-only — not read by farm loop.
+DEFAULT_ACCOUNTS_JSONL = os.path.join(_accounts_dir, "accounts.jsonl")
+DEFAULT_EMAIL_PASS_TXT = os.path.join(_accounts_dir, "email_pass.txt")
 
 
 def _playwright_cache_roots() -> list[str]:
@@ -1952,10 +1956,35 @@ def _next_display_name() -> tuple:
         return given, family
 
 
+def _account_password_from_config() -> str:
+    """
+    Shared signup password for all farmed accounts (easier to reuse later).
+
+    Priority:
+      1. env GROK_ACCOUNT_PASSWORD
+      2. config account.password
+      3. default fixed password (meets xAI complexity rules)
+    """
+    env = (os.environ.get("GROK_ACCOUNT_PASSWORD") or "").strip()
+    if env:
+        return env
+    try:
+        conf = _load_config()
+        acct = conf.get("account") if isinstance(conf.get("account"), dict) else {}
+        pwd = str((acct or {}).get("password") or "").strip()
+        if pwd:
+            return pwd
+    except Exception:
+        pass
+    # Default: same for every account unless config/env overrides
+    return "Nfarm!a7#GrokBuild26"
+
+
 def build_profile():
     # Generate signup profile; display name rotated from name.txt.
+    # Password is FIXED (config account.password) — not random.
     given_name, family_name = _next_display_name()
-    password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
+    password = _account_password_from_config()
     return given_name, family_name, password
 
 
@@ -3041,6 +3070,7 @@ def wait_for_sso_cookie(timeout=90, no_sso_deadline=22):
 
 def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     # One line per account. Prefer full cookie header string.
+    # OUTPUT ONLY — farm never reads sso/ back (reconvert tools may).
     if isinstance(sso_value, dict):
         normalized = str(
             sso_value.get("cookie_header")
@@ -3053,11 +3083,229 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     if not normalized:
         raise Exception("SSO value is empty; nothing to write")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "a", encoding="utf-8") as file:
         file.write(normalized + "\n")
 
     print(f"[*] Appended SSO to file: {output_path}")
+    return normalized
+
+
+# Account pipeline statuses (accounts/accounts.jsonl).
+# created      = register+SSO OK (has email/password/cookie)
+# oauth_ok     = Build OAuth tokens minted
+# usable       = chat probe 200 (not yet pushed, rare intermediate)
+# injected     = pushed to 9router (full SUCCESS)
+# failed_oauth = SSO OK but OAuth/PKCE/device failed
+# failed_probe = OAuth OK but chat 402/403/denied (token may still be good later)
+# failed_push  = usable but 9router import failed
+ACCOUNT_STATUS_CREATED = "created"
+ACCOUNT_STATUS_OAUTH_OK = "oauth_ok"
+ACCOUNT_STATUS_USABLE = "usable"
+ACCOUNT_STATUS_INJECTED = "injected"
+ACCOUNT_STATUS_FAILED_OAUTH = "failed_oauth"
+ACCOUNT_STATUS_FAILED_PROBE = "failed_probe"
+ACCOUNT_STATUS_FAILED_PUSH = "failed_push"
+
+_ACCOUNTS_LOCK_PATH = os.path.join(_accounts_dir, ".accounts.lock")
+
+
+def _with_accounts_lock(fn):
+    """Cross-process lock for accounts.jsonl updates (multi-worker safe)."""
+    os.makedirs(_accounts_dir, exist_ok=True)
+    fh = None
+    try:
+        fh = open(_ACCOUNTS_LOCK_PATH, "a+", encoding="utf-8")
+        try:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            try:
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            except Exception:
+                pass
+        return fn()
+    finally:
+        if fh is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def append_account_record(
+    *,
+    email: str,
+    password: str,
+    given_name: str = "",
+    family_name: str = "",
+    sso_cookie: str = "",
+    mode: str = "",
+    sso_file: str = "",
+    status: str = ACCOUNT_STATUS_CREATED,
+    extra: dict | None = None,
+) -> None:
+    """
+    Persist email + password (+ SSO cookie snapshot) for later login / reconvert.
+
+    Writes:
+      accounts/accounts.jsonl  — one JSON object per line (status evolves over pipeline)
+      accounts/email_pass.txt  — email:password for ALL created accounts (login stock)
+
+    Status is updated later via update_account_status() after OAuth/probe/push.
+    """
+    email = (email or "").strip()
+    password = (password or "").strip()
+    if not email:
+        return
+    os.makedirs(_accounts_dir, exist_ok=True)
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "email": email,
+        "password": password,
+        "given_name": (given_name or "").strip(),
+        "family_name": (family_name or "").strip(),
+        "mode": mode or "",
+        "status": status or ACCOUNT_STATUS_CREATED,
+        "sso_file": os.path.basename(sso_file) if sso_file else "",
+        "sso_cookie": (sso_cookie or "").strip(),
+        "worker": WORKER_ID or "",
+        "error": "",
+        "probe_status": None,
+        "injected": False,
+        "has_oauth": False,
+    }
+    if extra:
+        for k, v in extra.items():
+            if v is not None:
+                rec[k] = v
+
+    def _write():
+        with open(DEFAULT_ACCOUNTS_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # email:pass for every created account (even if later OAuth/probe fails)
+        with open(DEFAULT_EMAIL_PASS_TXT, "a", encoding="utf-8") as f:
+            f.write(f"{email}:{password}\n")
+
+    try:
+        _with_accounts_lock(_write)
+        print(f"[*] Appended account email={email} status={rec['status']} → accounts/")
+    except Exception as e:
+        print(f"[warn] account write failed: {e}")
+
+
+def update_account_status(
+    email: str,
+    status: str,
+    *,
+    error: str = "",
+    probe_status: Any = None,
+    injected: bool | None = None,
+    has_oauth: bool | None = None,
+    extra: dict | None = None,
+) -> None:
+    """
+    Update the latest accounts.jsonl row for this email (multi-worker locked).
+
+    Used after OAuth / chat probe / 9router inject so success vs fail is queryable.
+    """
+    email = (email or "").strip().lower()
+    if not email or not os.path.isfile(DEFAULT_ACCOUNTS_JSONL):
+        return
+
+    def _update():
+        try:
+            lines = open(DEFAULT_ACCOUNTS_JSONL, encoding="utf-8").read().splitlines()
+        except Exception:
+            return
+        if not lines:
+            return
+        # Find last row with this email
+        idx = -1
+        rec = None
+        for i in range(len(lines) - 1, -1, -1):
+            try:
+                r = json.loads(lines[i])
+            except Exception:
+                continue
+            if str(r.get("email") or "").strip().lower() == email:
+                idx = i
+                rec = r
+                break
+        if rec is None or idx < 0:
+            return
+        rec["status"] = status
+        rec["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        if error:
+            rec["error"] = str(error)[:400]
+        if probe_status is not None:
+            rec["probe_status"] = probe_status
+        if injected is not None:
+            rec["injected"] = bool(injected)
+        if has_oauth is not None:
+            rec["has_oauth"] = bool(has_oauth)
+        if extra:
+            for k, v in extra.items():
+                if v is not None:
+                    rec[k] = v
+        lines[idx] = json.dumps(rec, ensure_ascii=False)
+        tmp = DEFAULT_ACCOUNTS_JSONL + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, DEFAULT_ACCOUNTS_JSONL)
+
+    try:
+        _with_accounts_lock(_update)
+        print(f"[*] Account status email={email} → {status}")
+    except Exception as e:
+        print(f"[warn] account status update failed: {e}")
+
+
+def _sync_account_status_from_result(
+    email: str,
+    *,
+    status: str,
+    error: str = "",
+    result: dict | None = None,
+) -> None:
+    """Map pipeline outcome onto accounts.jsonl status fields."""
+    result = result or {}
+    probe = result.get("chat_probe") if isinstance(result.get("chat_probe"), dict) else {}
+    has_oauth = bool(
+        result.get("build_refresh_token")
+        or result.get("build_access_token")
+        or result.get("_build_tokens")
+    )
+    update_account_status(
+        email,
+        status,
+        error=error,
+        probe_status=probe.get("status"),
+        injected=(status == ACCOUNT_STATUS_INJECTED),
+        has_oauth=has_oauth or status
+        in (
+            ACCOUNT_STATUS_OAUTH_OK,
+            ACCOUNT_STATUS_USABLE,
+            ACCOUNT_STATUS_INJECTED,
+            ACCOUNT_STATUS_FAILED_PROBE,
+            ACCOUNT_STATUS_FAILED_PUSH,
+        ),
+        extra={
+            "build_email": result.get("build_email") or "",
+            "build_user_id": result.get("build_user_id") or "",
+            "probe_err": (str(probe.get("err") or "")[:200] if probe else ""),
+        },
+    )
 
 
 def _load_config() -> dict:
@@ -3539,7 +3787,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                 slog("HYBRID", "using browser-materialized SSO cookies")
         except Exception as e:
             slog("HYBRID", f"SSO wait after hybrid (using protocol sso): {e}", level="warn")
-        append_sso_to_txt(sso_cred, output_path)
+        sso_line = append_sso_to_txt(sso_cred, output_path)
         result = {
             "email": email,
             "sso": sso_cred.get("sso_token") or sso_cred.get("apiKey") or hybrid_result.get("sso") or "",
@@ -3548,12 +3796,22 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             "sso_rw": sso_cred.get("sso_rw") or hybrid_result.get("sso_rw") or "",
             "cookie_header": sso_cred.get("cookie_header")
             or sso_cred.get("apiKey")
+            or sso_line
             or "",
             "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
             "providerSpecificData": sso_cred.get("providerSpecificData") or {},
             "hybrid": True,
             **profile,
         }
+        append_account_record(
+            email=email,
+            password=str(profile.get("password") or ""),
+            given_name=str(profile.get("given_name") or ""),
+            family_name=str(profile.get("family_name") or ""),
+            sso_cookie=sso_line or str(result.get("cookie_header") or ""),
+            mode="hybrid",
+            sso_file=output_path,
+        )
     else:
         slog("FLOW", "① open sign-up")
         open_signup_page()
@@ -3565,7 +3823,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         profile = fill_profile_and_submit()
         slog("FLOW", "⑤ wait SSO cookies")
         sso_cred = wait_for_sso_cookie()  # dict: apiKey / sso_token / providerSpecificData
-        append_sso_to_txt(sso_cred, output_path)
+        sso_line = append_sso_to_txt(sso_cred, output_path)
 
         if extract_numbers:
             extract_visible_numbers()
@@ -3578,7 +3836,10 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                 "apiKey": sso_cred.get("apiKey") or "",
                 "sso_token": sso_cred.get("sso_token") or "",
                 "sso_rw": sso_cred.get("sso_rw") or "",
-                "cookie_header": sso_cred.get("cookie_header") or sso_cred.get("apiKey") or "",
+                "cookie_header": sso_cred.get("cookie_header")
+                or sso_cred.get("apiKey")
+                or sso_line
+                or "",
                 "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
                 "providerSpecificData": sso_cred.get("providerSpecificData") or {},
                 **profile,
@@ -3592,11 +3853,20 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                 "apiKey": cred.get("apiKey") or str(sso_cred),
                 "sso_token": cred.get("sso_token") or "",
                 "sso_rw": cred.get("sso_rw") or "",
-                "cookie_header": cred.get("apiKey") or str(sso_cred),
+                "cookie_header": cred.get("apiKey") or str(sso_cred) or sso_line or "",
                 "cloudflare_cookies": cred.get("cloudflare_cookies") or "",
                 "providerSpecificData": cred.get("providerSpecificData") or {},
                 **profile,
             }
+        append_account_record(
+            email=email,
+            password=str(profile.get("password") or ""),
+            given_name=str(profile.get("given_name") or ""),
+            family_name=str(profile.get("family_name") or ""),
+            sso_cookie=sso_line or str(result.get("cookie_header") or ""),
+            mode="browser",
+            sso_file=output_path,
+        )
 
     slog(
         "CREATED",
@@ -3609,6 +3879,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     # ANY failure here must raise so main() counts FAIL (not OK).
     # When GROK_CHAT_PROBE_OFF_CRITICAL (default on): OAuth on browser path,
     # soft-reset, then HTTP probe+push so browser is not held during probe.
+    # Account row already written as status=created; updated on oauth/probe/push.
     try:
         conf = _load_config()
         gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
@@ -3617,6 +3888,9 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE  (PROBE deferred off critical)")
             tokens = convert_grok_cli_tokens(result)
             if tokens is not None:
+                _sync_account_status_from_result(
+                    email, status=ACCOUNT_STATUS_OAUTH_OK, result=result
+                )
                 slog("PROBE", "deferred (off critical path)")
                 result["inject_pending_probe"] = True
                 try:
@@ -3631,17 +3905,25 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                 slog("FLOW", "⑧ PROBE → ⑨ PUSH")
                 probe_and_push_grok_cli(result, tokens)
                 result["inject_pending_probe"] = False
+            else:
+                # convert returned None (disabled) — keep created
+                pass
         else:
             slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
             convert_and_push_grok_cli(result)
+        _sync_account_status_from_result(
+            email, status=ACCOUNT_STATUS_INJECTED, result=result
+        )
         slog("PUSH", "9router import OK")
     except Exception as e:
         err = str(e)
         el = err.lower()
         if "denied" in el or "probe" in el or "usable" in el or "smoke" in el:
             phase = "PROBE"
+            acct_status = ACCOUNT_STATUS_FAILED_PROBE
         elif "jwt gate" in el or "bot_flag" in el:
             phase = "CONVERT"
+            acct_status = ACCOUNT_STATUS_FAILED_OAUTH
         elif (
             "convert" in el
             or "sso" in el
@@ -3652,15 +3934,27 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             or "proxy" in el
             or "accounts.x.ai" in el
             or "auth.x.ai" in el
+            or "invalid_grant" in el
+            or "access denied" in el
         ):
             phase = "CONVERT"
+            acct_status = ACCOUNT_STATUS_FAILED_OAUTH
         else:
             phase = "PUSH"
+            acct_status = ACCOUNT_STATUS_FAILED_PUSH
+        # If we already minted tokens then failed probe, keep has_oauth=true
+        if phase == "PROBE" and (
+            result.get("build_refresh_token") or result.get("_build_tokens")
+        ):
+            acct_status = ACCOUNT_STATUS_FAILED_PROBE
+        _sync_account_status_from_result(
+            email, status=acct_status, error=err, result=result
+        )
         slog(phase, f"FAILED: {e}", level="error")
         slog(
             "FAIL",
             f"pipeline stop at {phase}  email={email}  "
-            f"(will count as ✗ — not imported)",
+            f"(will count as ✗ — not imported)  accounts.status={acct_status}",
             level="error",
         )
         raise RuntimeError(f"{phase}: {e}") from e
@@ -4007,6 +4301,25 @@ def convert_grok_cli_tokens(result: dict):
                     level="warn",
                 )
                 tokens = None
+                err_l = str(e).lower()
+                # Terminal: xAI denied code/grant — second PKCE try wastes ~90s
+                # and can burn the same SSO for device fallback.
+                terminal = any(
+                    k in err_l
+                    for k in (
+                        "invalid_grant",
+                        "access denied",
+                        "failed to generate authentication code",
+                        "no auth code generated",
+                    )
+                )
+                if terminal:
+                    slog(
+                        "CONVERT",
+                        "PKCE terminal deny — skip retry, go device SSO",
+                        level="warn",
+                    )
+                    break
                 if pkce_try >= (2 if from_hybrid else 1):
                     break
 
