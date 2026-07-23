@@ -104,9 +104,15 @@ _PKCE_PORT_LOCK_PATH = os.environ.get(
 class _PkcePortLock:
     """Exclusive file lock for the fixed OAuth callback port (multi-worker safe)."""
 
-    def __init__(self, path: str = _PKCE_PORT_LOCK_PATH, timeout: float = 120.0):
+    def __init__(self, path: str = _PKCE_PORT_LOCK_PATH, timeout: float = 8.0):
         self.path = path
-        self.timeout = timeout
+        # Default short: multi-worker Chromium used to burn 120s waiting here.
+        # Copy-code UI scrape does not need the lock/server.
+        try:
+            env_t = float(os.environ.get("GROK_PKCE_LOCK_WAIT_SEC") or timeout)
+        except (TypeError, ValueError):
+            env_t = timeout
+        self.timeout = max(0.5, env_t)
         self._fh: Any = None
 
     def acquire(self) -> bool:
@@ -132,7 +138,7 @@ class _PkcePortLock:
                 self._fh.flush()
                 return True
             except (OSError, BlockingIOError):
-                time.sleep(0.4)
+                time.sleep(0.25)
         return False
 
     def release(self) -> None:
@@ -176,7 +182,9 @@ class _PkceCallbackServer:
         self.port = _CALLBACK_PORT
         self._lock = _PkcePortLock()
 
-    def start(self, *, wait_lock_sec: float = 120.0) -> bool:
+    def start(self, *, wait_lock_sec: float | None = None) -> bool:
+        if wait_lock_sec is not None:
+            self._lock.timeout = max(0.5, float(wait_lock_sec))
         if not self._lock.acquire():
             return False
         captured = self.captured
@@ -887,20 +895,26 @@ def obtain_tokens_via_browser_pkce(
             _log(f"route setup warn: {e}")
             used_pw_route = False
 
-    # Chromium/Drission has no page.route() — need real HTTP on EXACT :56121
-    # (multi-worker: file lock serializes; never use alternate ports)
+    # Chromium/Drission: try real HTTP on :56121 briefly; if busy, skip server
+    # and rely on xAI copy-code UI scrape (works without localhost).
     if not used_pw_route:
-        _log("OAuth waiting for exclusive :56121 callback lock (Chromium path)…")
+        try:
+            lock_wait = float(os.environ.get("GROK_PKCE_LOCK_WAIT_SEC") or "8")
+        except (TypeError, ValueError):
+            lock_wait = 8.0
+        _log(
+            f"OAuth Chromium path: try :56121 lock ≤{lock_wait:.0f}s "
+            f"(else copy-code UI only)…"
+        )
         cb_server = _PkceCallbackServer(captured)
-        if cb_server.start():
+        if cb_server.start(wait_lock_sec=lock_wait):
             _log(
                 "OAuth local callback server on "
                 "http://127.0.0.1:56121/callback (Chromium/Drission path)"
             )
         else:
             _log(
-                "WARN: could not bind 127.0.0.1:56121 after lock wait — "
-                "Chromium PKCE will fail (another process holds the port)"
+                "OAuth :56121 busy — skip callback server, use copy-code UI scrape"
             )
             cb_server = None
 

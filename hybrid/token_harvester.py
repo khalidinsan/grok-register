@@ -795,7 +795,8 @@ return {
                 self._lg(f"[hybrid] host turnstile skip: {e}")
 
         t0 = time.time()
-        native_budget = min(10.0, max(4.0, float(timeout) * 0.25))
+        # Inject path succeeds in ~1s; keep native poll short (was ~10s dead wait)
+        native_budget = min(4.0, max(2.0, float(timeout) * 0.1))
         # Phase A — native widget already on page (if any)
         self._lg("[hybrid] turnstile: native poll + nudge")
         while time.time() - t0 < native_budget:
