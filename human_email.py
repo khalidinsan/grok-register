@@ -84,6 +84,51 @@ def _pick_names(pairs: List[Tuple[str, str]]) -> Tuple[str, str]:
     return pick_names(pairs)
 
 
+def _rand_digits(n: int = 0) -> str:
+    """n=0 → length 2–4 random."""
+    if n <= 0:
+        n = random.randint(2, 4)
+    return "".join(random.choice(string.digits) for _ in range(n))
+
+
+def _rand_alnum(n: int = 0, *, start_letter: bool = False) -> str:
+    """Random a-z0-9 suffix for uniqueness (not digits-only)."""
+    if n <= 0:
+        n = random.randint(3, 6)
+    alphabet = string.ascii_lowercase + string.digits
+    if start_letter or n >= 1:
+        first = random.choice(string.ascii_lowercase)
+        rest = "".join(random.choice(alphabet) for _ in range(max(0, n - 1)))
+        return first + rest
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
+def _unique_tail() -> str:
+    """
+    Trailing uniqueness blob: mix of digits and alnum strings.
+    Examples: 42k9, x7m2, 8831a, k3p9q1
+    """
+    kind = random.choices(
+        ("alnum", "digits_alnum", "alnum_digits", "digits", "long_alnum"),
+        weights=(28, 24, 22, 12, 14),
+        k=1,
+    )[0]
+    if kind == "alnum":
+        return _rand_alnum(random.randint(3, 6), start_letter=True)
+    if kind == "digits_alnum":
+        return _rand_digits(random.randint(2, 3)) + _rand_alnum(
+            random.randint(2, 4), start_letter=True
+        )
+    if kind == "alnum_digits":
+        return _rand_alnum(random.randint(2, 4), start_letter=True) + _rand_digits(
+            random.randint(2, 3)
+        )
+    if kind == "long_alnum":
+        return _rand_alnum(random.randint(5, 8), start_letter=True)
+    # digits-only still allowed sometimes (looks natural after year/name)
+    return _rand_digits(random.randint(3, 5))
+
+
 def human_local_part(
     *,
     given: str = "",
@@ -102,40 +147,41 @@ def human_local_part(
 
     fi, li = first[0], last[0]
     yy = random.randint(1988, 2005)
-    nn = random.randint(1, 99)
-    nnn = random.randint(10, 999)
+    # Unique tail: digits + alnum mix (not digits-only)
+    tail = _unique_tail()
 
-    # Always end with digits for uniqueness (user request)
-    digits = str(random.randint(10, 9999))
     patterns = [
-        (20, lambda: f"{first}.{last}{digits}"),
-        (16, lambda: f"{first}{last}{digits}"),
-        (12, lambda: f"{first}_{last}{digits}"),
-        (10, lambda: f"{fi}.{last}{digits}"),
-        (10, lambda: f"{first}.{li}{digits}"),
-        (8, lambda: f"{first}.{last}.{digits}"),
-        (8, lambda: f"{first}-{last}{digits}"),
-        (6, lambda: f"{first}{yy}{nn}"),
-        (6, lambda: f"{first}{nnn}"),
+        (20, lambda: f"{first}.{last}{tail}"),
+        (16, lambda: f"{first}{last}{tail}"),
+        (12, lambda: f"{first}_{last}{tail}"),
+        (10, lambda: f"{fi}.{last}{tail}"),
+        (10, lambda: f"{first}.{li}{tail}"),
+        (8, lambda: f"{first}.{last}.{tail}"),
+        (8, lambda: f"{first}-{last}{tail}"),
+        (6, lambda: f"{first}{yy}{tail}"),
+        (6, lambda: f"{first}{tail}"),
+        (4, lambda: f"{first}.{tail}"),
     ]
     weights = [w for w, _ in patterns]
     builders = [b for _, b in patterns]
     local = random.choices(builders, weights=weights, k=1)[0]()
     local = re.sub(r"[^a-z0-9._+-]", "", local.lower())
     local = re.sub(r"[._+-]{2,}", ".", local).strip("._+-")
-    # force trailing digits if missing
-    if not re.search(r"\d+$", local):
-        local = f"{local}{random.randint(10, 9999)}"
+    # ensure some uniqueness suffix (digit or alnum) remains
+    if not re.search(r"[a-z0-9]{2,}$", local) or len(local) < 6:
+        local = f"{local}{_unique_tail()}"
     if len(local) < 5:
-        local = f"{first}{random.randint(100, 9999)}"
+        local = f"{first}{_unique_tail()}"
     if len(local) > 32:
-        # keep trailing digits
-        m = re.search(r"(\d+)$", local)
-        dig = m.group(1) if m else str(random.randint(10, 99))
+        # keep trailing uniqueness chunk
+        m = re.search(r"([a-z0-9]{2,})$", local)
+        dig = m.group(1) if m else _unique_tail()
+        if len(dig) > 10:
+            dig = dig[-8:]
         local = local[: 32 - len(dig)].rstrip("._+-") + dig
     if local and not local[0].isalnum():
         local = "u" + local
-    return local or f"user{random.randint(1000, 9999)}"
+    return local or f"user{_unique_tail()}"
 
 
 def human_catchall_email(
