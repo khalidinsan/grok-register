@@ -465,18 +465,52 @@ def _capture_code_from_pages(page: Any) -> Optional[str]:
     return _capture_code_from_display_ui(page)
 
 
+# UI chrome that got glued into false "codes" (e.g. Makeauthorizationcode…)
+_FAKE_CODE_MARKERS = (
+    "makeauth",
+    "authorization",
+    "authorisation",
+    "copythecode",
+    "finishsigning",
+    "enterthecode",
+    "intogrok",
+    "donotrefresh",
+    "please",
+    "signing",
+    "successfully",
+    "callback",
+    "redirect",
+    "localhost",
+)
+
+
 def _looks_like_oauth_auth_code(code: str) -> bool:
     """
-    Real authorize codes are long (typically 30–120 chars), mixed alnum + - _
-    Reject short email OTPs like CW9-AM9 / BQ4L3J.
+    Real authorize codes: long, mixed alnum + - _, high entropy.
+    Reject short email OTPs and UI text globs (Makeauth…).
     """
     c = (code or "").strip()
-    if len(c) < 24 or len(c) > 200:
+    if len(c) < 28 or len(c) > 200:
         return False
     if not re.match(r"^[A-Za-z0-9_-]+$", c):
         return False
-    # must have some letters (not pure digits)
     if not re.search(r"[A-Za-z]", c):
+        return False
+    low = c.lower()
+    if any(m in low for m in _FAKE_CODE_MARKERS):
+        return False
+    # Reject mostly-vowel English-looking blobs / repeated words
+    letters = re.sub(r"[^a-zA-Z]", "", c)
+    if letters and letters.lower() == letters:  # all lowercase letters part
+        # real codes are usually mixed case (base64url-ish)
+        if len(letters) > 20 and not re.search(r"[0-9]", c):
+            return False
+    # Need some digit OR mixed case OR hyphen (entropy signal)
+    has_digit = bool(re.search(r"[0-9]", c))
+    has_upper = bool(re.search(r"[A-Z]", c))
+    has_lower = bool(re.search(r"[a-z]", c))
+    has_hyphen = "-" in c or "_" in c
+    if not (has_digit or (has_upper and has_lower) or has_hyphen):
         return False
     return True
 
@@ -491,45 +525,108 @@ _SCRAPE_CODE_JS = r"""
     || low.includes('copy the code')
     || low.includes('into grok build')
     || low.includes('enter this code')
-    || low.includes('successfully authorized')
     || low.includes('do not refresh')
+    || low.includes("don't refresh")
   );
+  if (!isCopyUi) {
+    return { code: '', copyUi: false, n: 0, source: 'not-copy-ui' };
+  }
 
-  const candidates = [];
-  // input / readonly fields
-  for (const el of document.querySelectorAll('input, textarea, code, pre, [data-testid], span, p, div')) {
+  const banned = /makeauth|authorization|copythe|finishsign|enterthe|intogrok|donotrefresh|please|signing|successfully|localhost|callback/;
+  const ok = (v) => {
+    if (!v || v.length < 28 || v.length > 160) return false;
+    if (!/^[A-Za-z0-9_-]+$/.test(v)) return false;
+    if (banned.test(v.toLowerCase())) return false;
+    // entropy: digit or mixed case or hyphen
+    const hasDigit = /[0-9]/.test(v);
+    const hasUpper = /[A-Z]/.test(v);
+    const hasLower = /[a-z]/.test(v);
+    const hasSep = /[-_]/.test(v);
+    if (!(hasDigit || (hasUpper && hasLower) || hasSep)) return false;
+    return true;
+  };
+
+  const fromInputs = [];
+  // Prefer dedicated code field (input/textarea/code) — NOT whole div paragraphs
+  for (const el of document.querySelectorAll('input, textarea, code, pre, [role="textbox"]')) {
     try {
       const r = el.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) continue;
       let v = '';
-      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') v = String(el.value || '');
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') v = String(el.value || el.getAttribute('value') || '');
       else v = String(el.innerText || el.textContent || '');
       v = v.replace(/\s+/g, '').trim();
-      if (v.length >= 24 && v.length <= 200 && /^[A-Za-z0-9_-]+$/.test(v)) {
-        candidates.push(v);
-      }
+      if (ok(v)) fromInputs.push(v);
     } catch (e) {}
   }
-  // regex over full body (codes often have hyphens)
-  const re = /[A-Za-z0-9_-]{28,120}/g;
-  let m;
-  while ((m = re.exec(body.replace(/\s+/g, ' '))) !== null) {
-    const v = m[0].trim();
-    if (/[A-Za-z]/.test(v) && v.length >= 24) candidates.push(v);
+
+  // Monospace / code-looking single-line elements near the copy UI
+  const fromMono = [];
+  for (const el of document.querySelectorAll('span, p, div, button')) {
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      // only leaf-ish short nodes (the code chip), not giant containers
+      if ((el.children && el.children.length > 2)) continue;
+      let v = String(el.innerText || el.textContent || '').replace(/\s+/g, '').trim();
+      if (!ok(v)) continue;
+      // skip if element text is huge page dump
+      if (v.length > 120) continue;
+      const st = window.getComputedStyle(el);
+      const mono = (st.fontFamily || '').toLowerCase().includes('mono')
+        || (st.fontFamily || '').toLowerCase().includes('menlo')
+        || (st.fontFamily || '').toLowerCase().includes('consolas');
+      fromMono.push({ v, mono, w: r.width });
+    } catch (e) {}
   }
-  // prefer longest unique
-  const uniq = [...new Set(candidates)].sort((a, b) => b.length - a.length);
-  if (uniq.length) return { code: uniq[0], copyUi: isCopyUi, n: uniq.length };
-  return { code: '', copyUi: isCopyUi, n: 0 };
+
+  // Prefer: input value > mono chip > others; then longer with hyphens
+  const score = (v, mono) => {
+    let s = v.length;
+    if (mono) s += 50;
+    if (v.includes('-')) s += 30;
+    if (/[0-9]/.test(v)) s += 10;
+    if (/[A-Z]/.test(v) && /[a-z]/.test(v)) s += 10;
+    return s;
+  };
+
+  let best = '';
+  let bestS = -1;
+  for (const v of fromInputs) {
+    const s = score(v, true) + 100;
+    if (s > bestS) { bestS = s; best = v; }
+  }
+  for (const { v, mono } of fromMono) {
+    const s = score(v, mono);
+    if (s > bestS) { bestS = s; best = v; }
+  }
+
+  // Last resort: regex only on short lines of body (not full glue)
+  if (!best) {
+    for (const line of body.split(/\\n|\\r/)) {
+      const t = line.replace(/\\s+/g, '').trim();
+      if (ok(t) && t.length <= 100) {
+        const s = score(t, false);
+        if (s > bestS) { bestS = s; best = t; }
+      }
+    }
+  }
+
+  return {
+    code: best || '',
+    copyUi: true,
+    n: fromInputs.length + fromMono.length,
+    src: fromInputs.length ? 'input' : (best ? 'dom' : 'none'),
+  };
 }
 """
 
 
 def _capture_code_from_display_ui(page: Any) -> Optional[str]:
     """
-    When redirect to 127.0.0.1 fails (esp. Chromium headless / multi-worker),
-    xAI shows a page: "Enter this code to finish signing in" with a long code.
-    That code IS the OAuth authorization code — exchange it the same way.
+    When redirect to 127.0.0.1 fails (esp. Chromium),
+    xAI shows: "Enter this code to finish signing in" with a long code chip.
+    Scrape ONLY that chip — not random page text (was capturing "Makeauth…").
     """
     try:
         data = _run_page_js(page, _SCRAPE_CODE_JS)
@@ -538,6 +635,8 @@ def _capture_code_from_display_ui(page: Any) -> Optional[str]:
     if not data:
         return None
     if isinstance(data, dict):
+        if not data.get("copyUi"):
+            return None
         code = str(data.get("code") or "").strip()
     else:
         code = str(data or "").strip()
