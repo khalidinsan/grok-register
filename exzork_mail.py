@@ -252,6 +252,22 @@ def _message_text(msg: dict) -> str:
 # ── public API used by email_register ───────────────────────────────
 
 
+def _host_of(addr: str) -> str:
+    a = (addr or "").strip().lower()
+    if "@" not in a:
+        return ""
+    return a.rsplit("@", 1)[-1]
+
+
+def _is_subdomain_of(host: str, apex: str) -> bool:
+    """True if host is strictly under apex (foo.apex), not apex itself."""
+    host = (host or "").lower().strip(".")
+    apex = (apex or "").lower().strip(".")
+    if not host or not apex or host == apex:
+        return False
+    return host.endswith("." + apex)
+
+
 def create_mailbox(
     given: str = "",
     family: str = "",
@@ -280,26 +296,68 @@ def create_mailbox(
     else:
         host = apex
     address = f"{local}@{host}"
+    print(
+        f"[exzork] create want_sub={want_sub} requested={address} "
+        f"apex={apex}"
+    )
 
-    # Try explicit address first (best control over subdomain)
-    for attempt, body in enumerate(
-        (
+    # Body shapes — NEVER fall back to apex-only when want_sub (that was the bug:
+    # attempt 4 random+apex returned oswaz…@koew.tech and we accepted it).
+    if want_sub:
+        attempts: list[dict] = [
             {"address": address},
             {"email": address},
+            {"mailbox": address},
             {"random": True, "domain": host},
+            {"domain": host, "local": local},
+            {"domain": host, "local_part": local},
+            # some APIs want wildcard domain label
+            {"address": address, "domain": f"*.{apex}"},
+            {"random": True, "domain": f"*.{apex}"},
+        ]
+    else:
+        attempts = [
+            {"address": address},
+            {"email": address},
             {"random": True, "domain": apex},
-        ),
-        start=1,
-    ):
+            {"domain": apex, "local": local},
+        ]
+
+    last_err = ""
+    for attempt, body in enumerate(attempts, start=1):
         code, data = _request("POST", "/api/v1/mailboxes", body=body)
         if 200 <= code < 300:
-            got = _extract_address(data) or address
+            got = _extract_address(data) or ""
+            # Prefer our requested address if API returns empty / incomplete
+            if not got or "@" not in got:
+                got = address
+            got_host = _host_of(got)
+            if want_sub:
+                # Reject apex-only success — force real subdomain
+                if not _is_subdomain_of(got_host, apex):
+                    # If API ignored subdomain but accepted create, try keep requested
+                    if _is_subdomain_of(_host_of(address), apex):
+                        # Verify requested might still work as inbox key
+                        print(
+                            f"[exzork] API returned apex {got!r} but we requested "
+                            f"subdomain {address!r} — using requested address"
+                        )
+                        got = address
+                    else:
+                        print(
+                            f"[exzork] create try={attempt} got apex {got!r}, "
+                            f"need subdomain — retry"
+                        )
+                        last_err = f"apex_not_sub:{got}"
+                        continue
             print(f"[exzork] mailbox OK ({attempt}) {got}")
             return got
-        # 4xx on explicit → try next shape
-        print(f"[exzork] create try={attempt} HTTP {code} body={str(data)[:160]}")
+        last_err = f"HTTP {code} {str(data)[:160]}"
+        print(f"[exzork] create try={attempt} {last_err}")
 
-    raise RuntimeError(f"exzork create mailbox failed for domain={apex}")
+    raise RuntimeError(
+        f"exzork create mailbox failed want_sub={want_sub} apex={apex} last={last_err}"
+    )
 
 
 def list_messages(address: str) -> List[dict]:
