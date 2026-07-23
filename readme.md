@@ -5,7 +5,7 @@ Automated **xAI / Grok** account registration farm: signup → SSO → **Grok Bu
 Default browser engine: **Camoufox** (anti-detect Firefox). Optional **Chromium** (Playwright) fallback.
 
 ```text
-catch-all email + IMAP OTP
+email (IMAP catch-all **or** mailer.exzork.me API)
   → register (browser full UI  |  hybrid: short browser + protocol HTTP)
   → SSO cookies (wrapper → session materialize if needed)
   → SETTLE (bot hygiene, default 12s)
@@ -26,7 +26,7 @@ catch-all email + IMAP OTP
 |------|--------|
 | **Engines** | Camoufox (default) · Playwright Chromium fallback |
 | **Register modes** | `browser` full UI · `hybrid` (castle harvest + protocol HTTP) |
-| **Mail** | Catch-all domain + Gmail IMAP OTP · humanized local-parts |
+| **Mail** | IMAP Gmail catch-all **or** [exzork](https://mailer.exzork.me/) API (wildcard subdomains) · humanized local-parts |
 | **OAuth** | Browser **PKCE** `referrer=grok-build` · device SSO fallback (fail-fast) |
 | **Inject policy** | `usable` — chat probe **200** only; **402/403 DENIED never inject** |
 | **Proxy** | Pool file, `per_account` / `per_worker`, health check, retry → direct |
@@ -231,7 +231,7 @@ cp config.example.json config.json
 }
 ```
 
-Env overrides for email: `EMAIL_DOMAIN`, `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, `IMAP_PORT`.
+Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API_KEY`, `EXZORK_USE_SUBDOMAIN`.
 
 ### Important fields
 
@@ -275,12 +275,62 @@ Env overrides for email: `EMAIL_DOMAIN`, `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, 
 
 ---
 
-## Email setup (catch-all + IMAP)
+## Email setup
 
-1. Point domain to Cloudflare Email Routing (or similar).
-2. Enable **Catch-All** → forward to Gmail.
-3. Google 2FA → [App Password](https://myaccount.google.com/apppasswords).
-4. Fill `email.*` in `config.json`.
+### A) IMAP catch-all (default)
+
+1. Cloudflare Email Routing (or similar) catch-all → Gmail.
+2. Google 2FA → [App Password](https://myaccount.google.com/apppasswords).
+3. Config:
+
+```json
+"email": {
+  "provider": "imap",
+  "domain": "yourdomain.com",
+  "imap_user": "you@gmail.com",
+  "imap_pass": "app-password",
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "local_style": "human"
+}
+```
+
+### B) mailer.exzork.me (`provider: exzork`)
+
+Receive-only API with **wildcard subdomains** (`user@rand.yourdomain.com`).
+
+1. DNS (Cloudflare DNS only, not Email Routing MX):
+
+```text
+@  MX  10  mailer.exzork.me
+*  MX  10  mailer.exzork.me
+```
+
+2. Claim apex + wildcard at https://mailer.exzork.me/ — **save API key once**.
+3. Config / env (prefer env for the key):
+
+```bash
+export EXZORK_API_KEY='tm_...'
+```
+
+```json
+"email": {
+  "provider": "exzork",
+  "domain": "koew.tech",
+  "local_style": "human",
+  "exzork_base_url": "https://mailer.exzork.me",
+  "exzork_use_subdomain": true,
+  "exzork_api_key": ""
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `provider` | `imap` \| `exzork` |
+| `exzork_use_subdomain` | `true` → `local@<random>.domain.com` (needs wildcard MX) |
+| `EXZORK_API_KEY` | Preferred over putting key in config |
+
+Never commit API keys.
 
 ---
 

@@ -41,6 +41,20 @@ IMAP_PASS = _cfg("imap_pass", "IMAP_PASS")
 IMAP_HOST = _cfg("imap_host", "IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(_cfg("imap_port", "IMAP_PORT", "993") or "993")
 
+# Provider: imap (default, Gmail catch-all) | exzork (mailer.exzork.me API)
+def _email_provider() -> str:
+    raw = (
+        _cfg("provider", "EMAIL_PROVIDER")
+        or _cfg("email_provider", "EMAIL_PROVIDER")
+        or "imap"
+    ).strip().lower()
+    if raw in ("exzork", "mailer", "mailer.exzork", "exzork_mail", "tm"):
+        return "exzork"
+    if raw in ("imap", "gmail", "catchall", "catch-all", ""):
+        return "imap"
+    return raw
+
+
 # ============================================================
 # Adapter for DrissionPage_example.py
 # ============================================================
@@ -52,7 +66,27 @@ def get_email_and_token(
     given: str = "",
     family: str = "",
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Generate humanized catch-all alias. Returns (email, token) — token == email for IMAP."""
+    """
+    Create/register address for OTP.
+
+    Returns (email, token):
+      - imap:   token == email (poll by alias)
+      - exzork: token == email (poll API by address)
+    """
+    provider = _email_provider()
+    if provider == "exzork":
+        try:
+            from exzork_mail import get_email_and_token as _exzork_get
+
+            email_addr, tok = _exzork_get(given=given, family=family)
+            if email_addr:
+                _temp_email_cache[email_addr] = tok or email_addr
+                return email_addr, tok or email_addr
+            return None, None
+        except Exception as e:
+            print(f"[email] exzork create failed: {e}")
+            return None, None
+
     email_addr = create_temp_email(given=given, family=family)
     if email_addr:
         _temp_email_cache[email_addr] = email_addr
@@ -61,10 +95,24 @@ def get_email_and_token(
 
 
 def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str]:
-    """Poll IMAP for Grok/x.ai OTP. Strips hyphens for form fill."""
+    """Poll for Grok/x.ai OTP (IMAP or exzork). Strips hyphens for form fill."""
     target = (email or dev_token or "").strip()
     if not target:
         return None
+
+    provider = _email_provider()
+    if provider == "exzork":
+        try:
+            from exzork_mail import get_oai_code as _exzork_code
+
+            code = _exzork_code(dev_token, email, timeout=timeout)
+            if code:
+                return code.replace("-", "")
+            return None
+        except Exception as e:
+            print(f"[email] exzork OTP poll failed: {e}")
+            return None
+
     code = wait_for_verification_code(target_email=target, timeout=timeout)
     if code:
         code = code.replace("-", "")
@@ -72,7 +120,7 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str
 
 
 # ============================================================
-# Core
+# Core (IMAP catch-all)
 # ============================================================
 
 def _require_imap_config() -> None:

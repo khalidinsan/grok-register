@@ -21,12 +21,17 @@
         "block_assets": true
     },
     "email": {
+        "provider": "imap",
         "domain": "yourdomain.com",
+        "local_style": "human",
         "imap_user": "you@gmail.com",
         "imap_pass": "abcd efgh ijkl mnop",
         "imap_host": "imap.gmail.com",
         "imap_port": 993,
-        "local_style": "human"
+        "exzork_api_key": "",
+        "exzork_base_url": "https://mailer.exzork.me",
+        "exzork_use_subdomain": true,
+        "_comment_provider": "imap = Gmail catch-all | exzork = mailer.exzork.me (wildcard MX). Prefer env EXZORK_API_KEY over config key."
     },
     "proxy": "",
     "browser_proxy": "",
