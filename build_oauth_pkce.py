@@ -274,8 +274,19 @@ def _capture_code_from_pages(page: Any) -> Optional[str]:
     """ONLY localhost callback URLs — never scrape consent page DOM (false codes)."""
     raw, loop, is_async = _unwrap_page(page)
     urls = []
+    for obj in (raw, page):
+        try:
+            u = getattr(obj, "url", None)
+            if callable(u):
+                u = u()
+            if u:
+                urls.append(str(u))
+        except Exception:
+            pass
     try:
-        urls.append(str(getattr(raw, "url", "") or ""))
+        href = _run_page_js(page, "() => location.href")
+        if href:
+            urls.append(str(href))
     except Exception:
         pass
     try:
@@ -295,10 +306,95 @@ def _capture_code_from_pages(page: Any) -> Optional[str]:
     return None
 
 
+_ALLOW_CLICK_JS = r"""
+() => {
+  const prefer = ['allow', 'authorize', 'approve', 'accept', '继续', '允许', '授权'];
+  const nodes = [...document.querySelectorAll(
+    'button, [role="button"], input[type="submit"], a, [data-testid]'
+  )];
+  const visible = (b) => {
+    try {
+      const r = b.getBoundingClientRect();
+      const st = window.getComputedStyle(b);
+      if (r.width <= 0 || r.height <= 0) return false;
+      if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+      if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+      return true;
+    } catch (e) { return false; }
+  };
+  const label = (b) => (b.innerText || b.textContent || b.value || b.getAttribute('aria-label') || '')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+  // pass 1: exact
+  for (const want of prefer) {
+    for (const b of nodes) {
+      if (!visible(b)) continue;
+      if (label(b) !== want) continue;
+      b.scrollIntoView({block: 'center', inline: 'center'});
+      b.click();
+      return want;
+    }
+  }
+  // pass 2: includes (not deny/cancel)
+  for (const b of nodes) {
+    if (!visible(b)) continue;
+    const txt = label(b);
+    if (!txt || /deny|cancel|sign out|go back|google|apple|reject|拒绝|取消/.test(txt)) continue;
+    if (!prefer.some(w => txt === w || txt.includes(w))) continue;
+    b.scrollIntoView({block: 'center', inline: 'center'});
+    b.click();
+    return txt;
+  }
+  // pass 3: primary/submit styling on consent
+  for (const b of nodes) {
+    if (!visible(b)) continue;
+    const cls = String(b.className || '').toLowerCase();
+    const t = label(b);
+    if (!t || t.length > 24) continue;
+    if (/deny|cancel|reject/.test(t)) continue;
+    if (cls.includes('primary') || cls.includes('solid') || b.type === 'submit') {
+      b.click();
+      return 'primary:' + t;
+    }
+  }
+  return '';
+}
+"""
+
+
+def _run_page_js(page: Any, script: str) -> Any:
+    """Run JS on Playwright (evaluate) or DrissionPage MixTab (run_js)."""
+    raw, loop, is_async = _unwrap_page(page)
+    # Playwright / Camoufox adapter
+    if hasattr(raw, "evaluate"):
+        try:
+            return _run(loop, is_async, raw.evaluate(script))
+        except Exception:
+            pass
+    # DrissionPage Chromium MixTab / PwPageAdapter
+    for target in (page, raw):
+        if hasattr(target, "run_js"):
+            try:
+                # Drission: run_js body without outer function sometimes preferred
+                body = script.strip()
+                if body.startswith("() =>") or body.startswith("()=>"):
+                    body = body.split("{", 1)[-1].rsplit("}", 1)[0]
+                    return target.run_js(body)
+                return target.run_js(script)
+            except Exception:
+                try:
+                    return target.run_js(script)
+                except Exception:
+                    pass
+    return None
+
+
 def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) -> bool:
     """
-    Aggressively click Allow / Authorize on consent (flash click_text_button + JS).
-    Must run on raw Playwright page via async loop for Camoufox.
+    Aggressively click Allow / Authorize on consent.
+
+    Supports:
+      - Camoufox / Playwright async (get_by_role + evaluate)
+      - Chromium DrissionPage MixTab (run_js + text: selectors)
     """
     raw, loop, is_async = _unwrap_page(page)
 
@@ -325,7 +421,6 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
                         await btn.scroll_into_view_if_needed(timeout=2000)
                     except Exception:
                         pass
-                    # try normal then force
                     try:
                         await btn.click(timeout=3000)
                     except Exception:
@@ -338,65 +433,62 @@ def _click_allow_hard(page: Any, log: Optional[Callable[[str], None]] = None) ->
             except Exception as e:
                 _log(f"role click {kw!r} warn: {e}")
 
-    # 2) JS exact match first (most reliable for React consent)
-    if hasattr(raw, "evaluate"):
-        try:
-            clicked = _run(
-                loop,
-                is_async,
-                raw.evaluate(
-                    """() => {
-                        const prefer = ['allow', 'authorize', 'approve', 'accept'];
-                        const nodes = [...document.querySelectorAll(
-                            'button, [role="button"], input[type="submit"], a'
-                        )];
-                        // pass 1: exact
-                        for (const want of prefer) {
-                          for (const b of nodes) {
-                            const txt = (b.innerText || b.textContent || b.value || '')
-                              .replace(/\\s+/g, ' ').trim().toLowerCase();
-                            if (txt !== want) continue;
-                            const r = b.getBoundingClientRect();
-                            if (r.width <= 0 || r.height <= 0) continue;
-                            if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
-                            b.click();
-                            return txt;
-                          }
-                        }
-                        // pass 2: includes (but not deny/cancel)
-                        for (const b of nodes) {
-                          const txt = (b.innerText || b.textContent || b.value || '')
-                            .replace(/\\s+/g, ' ').trim().toLowerCase();
-                          if (!txt || /deny|cancel|sign out|go back|google|apple/.test(txt)) continue;
-                          if (!prefer.some(w => txt === w || txt.includes(w))) continue;
-                          const r = b.getBoundingClientRect();
-                          if (r.width <= 0 || r.height <= 0) continue;
-                          b.click();
-                          return txt;
-                        }
-                        return '';
-                    }"""
-                ),
-            )
-            if clicked:
-                _log(f"clicked Allow via JS ({clicked!r})")
-                return True
-        except Exception as e:
-            _log(f"JS Allow click warn: {e}")
+    # 2) JS click — works on Playwright evaluate AND Drission run_js
+    try:
+        clicked = _run_page_js(page, _ALLOW_CLICK_JS)
+        if clicked:
+            _log(f"clicked Allow via JS ({clicked!r})")
+            return True
+    except Exception as e:
+        _log(f"JS Allow click warn: {e}")
 
     # 3) sync playwright path
     if hasattr(raw, "get_by_role") and not is_async:
-        for kw in ("Allow", "Authorize", "Approve"):
+        for kw in ("Allow", "Authorize", "Approve", "Accept"):
             try:
                 loc = raw.get_by_role(
                     "button", name=re.compile(rf"^{re.escape(kw)}$", re.I)
                 ).first
-                if loc.count() > 0:
+                n = loc.count() if hasattr(loc, "count") else 1
+                if n and n > 0:
                     loc.click(timeout=3000, force=True)
                     _log(f"clicked Allow sync role({kw!r})")
                     return True
             except Exception:
                 continue
+
+    # 4) DrissionPage text / CSS selectors (Chromium MixTab fallback)
+    for target in (page, raw):
+        if not hasattr(target, "ele"):
+            continue
+        for sel in (
+            "text:Allow",
+            "text:Authorize",
+            "text:Approve",
+            "text:Accept",
+            "text:允许",
+            "text:授权",
+            "css:button[type='submit']",
+            "tag:button@@text():Allow",
+            "xpath://button[contains(translate(., 'ALLOW', 'allow'), 'allow')]",
+            "xpath://*[@role='button' and contains(translate(., 'ALLOW', 'allow'), 'allow')]",
+        ):
+            try:
+                el = target.ele(sel, timeout=0.6)
+                if el:
+                    try:
+                        el.click()
+                    except Exception:
+                        try:
+                            el.click(by_js=True)
+                        except Exception:
+                            continue
+                    _log(f"clicked Allow via Drission ele({sel!r})")
+                    return True
+            except Exception:
+                continue
+        break
+
     return False
 
 
@@ -477,7 +569,9 @@ def obtain_tokens_via_browser_pkce(
             _log(f"route setup warn: {e}")
 
     _page_goto(page, auth_url)
-    time.sleep(0.8)  # let consent paint
+    # Chromium/Drission consent paint slower than Camoufox
+    raw0, loop0, asy0 = _unwrap_page(page)
+    time.sleep(1.5 if not asy0 else 0.9)
 
     t0 = time.time()
     last = ""
@@ -495,11 +589,20 @@ def obtain_tokens_via_browser_pkce(
             break
 
         cur = _page_url(page)
+        if not cur:
+            try:
+                cur = str(_run_page_js(page, "() => location.href") or "")
+            except Exception:
+                cur = ""
         if cur != last:
             _log(f"OAuth page (+{time.time() - t0:.0f}s): {cur[:140]}")
             last = cur
 
-        on_consent = "/oauth2/consent" in cur or "auth.x.ai" in cur
+        on_consent = (
+            "/oauth2/consent" in cur
+            or "auth.x.ai" in cur
+            or ("accounts.x.ai" in cur and "consent" in cur)
+        )
         if try_consent_click and on_consent:
             # Retry Allow every ~1.2s until redirect (do NOT stop after one silent fail)
             if time.time() - last_allow_try >= 1.2:
@@ -507,27 +610,20 @@ def obtain_tokens_via_browser_pkce(
                 allow_attempts += 1
                 # Optional identity confirm once early
                 if allow_attempts == 1:
-                    if _click_allow_hard.__doc__:
-                        pass
-                    # identity buttons (Confirm) — only if present, via same JS path
                     try:
-                        raw2, loop2, asy2 = _unwrap_page(page)
-                        conf = _run(
-                            loop2,
-                            asy2,
-                            raw2.evaluate(
-                                """() => {
-                                    const nodes = [...document.querySelectorAll('button,[role="button"]')];
-                                    for (const b of nodes) {
-                                      const t = (b.innerText||'').replace(/\\s+/g,' ').trim().toLowerCase();
-                                      if (t === 'confirm' || t === 'verify' || t === 'continue') {
-                                        const r = b.getBoundingClientRect();
-                                        if (r.width>0 && r.height>0) { b.click(); return t; }
-                                      }
-                                    }
-                                    return '';
-                                }"""
-                            ),
+                        conf = _run_page_js(
+                            page,
+                            """() => {
+                              const nodes = [...document.querySelectorAll('button,[role="button"]')];
+                              for (const b of nodes) {
+                                const t = (b.innerText||'').replace(/\\s+/g,' ').trim().toLowerCase();
+                                if (t === 'confirm' || t === 'verify' || t === 'continue') {
+                                  const r = b.getBoundingClientRect();
+                                  if (r.width>0 && r.height>0) { b.click(); return t; }
+                                }
+                              }
+                              return '';
+                            }""",
                         )
                         if conf:
                             _log(f"OAuth identity: {conf}")
@@ -538,7 +634,7 @@ def obtain_tokens_via_browser_pkce(
                 ok = _click_allow_hard(page, log=_log)
                 if ok:
                     _log(f"OAuth Allow attempt #{allow_attempts} OK — wait callback…")
-                    # wait for localhost redirect
+                    # wait for localhost redirect (Playwright) or poll URL (Drission)
                     try:
                         raw2, loop2, asy2 = _unwrap_page(page)
                         if hasattr(raw2, "wait_for_url"):
@@ -556,9 +652,40 @@ def obtain_tokens_via_browser_pkce(
                             if c2:
                                 captured["code"] = c2
                                 break
+                        else:
+                            # Drission MixTab: poll location after click
+                            for _ in range(25):
+                                time.sleep(0.4)
+                                c2 = _capture_code_from_pages(page)
+                                if c2:
+                                    captured["code"] = c2
+                                    break
+                                u2 = _page_url(page) or str(
+                                    _run_page_js(page, "() => location.href") or ""
+                                )
+                                if "56121" in u2 or "code=" in u2:
+                                    c2 = extract_code_from_url(u2)
+                                    if c2:
+                                        captured["code"] = c2
+                                        break
+                            if captured.get("code"):
+                                break
                     except Exception:
                         time.sleep(0.4)
                 else:
+                    if allow_attempts <= 3 or allow_attempts % 5 == 0:
+                        # one-line DOM dump to see why Chromium misses
+                        try:
+                            dump = _run_page_js(
+                                page,
+                                """() => [...document.querySelectorAll('button,[role=button],input[type=submit]')]
+                                  .slice(0,12).map(b => (b.innerText||b.value||'').replace(/\\s+/g,' ').trim())
+                                  .filter(Boolean).join(' | ')""",
+                            )
+                            if dump:
+                                _log(f"OAuth buttons visible: {str(dump)[:160]}")
+                        except Exception:
+                            pass
                     _log(
                         f"OAuth Allow attempt #{allow_attempts} MISS "
                         f"(no button found / click failed)"
