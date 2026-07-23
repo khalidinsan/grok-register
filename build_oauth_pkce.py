@@ -429,7 +429,7 @@ def _page_goto(page: Any, url: str, timeout_ms: int = 25000) -> None:
 
 
 def _capture_code_from_pages(page: Any) -> Optional[str]:
-    """ONLY localhost callback URLs — never scrape consent page DOM (false codes)."""
+    """Localhost callback URLs first; then xAI 'copy this code' display UI."""
     raw, loop, is_async = _unwrap_page(page)
     urls = []
     for obj in (raw, page):
@@ -461,6 +461,88 @@ def _capture_code_from_pages(page: Any) -> Optional[str]:
         c = extract_code_from_url(u)
         if c:
             return c
+    # Chromium often never navigates to localhost — xAI shows copy-code UI instead
+    return _capture_code_from_display_ui(page)
+
+
+def _looks_like_oauth_auth_code(code: str) -> bool:
+    """
+    Real authorize codes are long (typically 30–120 chars), mixed alnum + - _
+    Reject short email OTPs like CW9-AM9 / BQ4L3J.
+    """
+    c = (code or "").strip()
+    if len(c) < 24 or len(c) > 200:
+        return False
+    if not re.match(r"^[A-Za-z0-9_-]+$", c):
+        return False
+    # must have some letters (not pure digits)
+    if not re.search(r"[A-Za-z]", c):
+        return False
+    return True
+
+
+_SCRAPE_CODE_JS = r"""
+() => {
+  // xAI "Enter this code to finish signing in" / "Copy the code below into Grok Build"
+  const body = (document.body && document.body.innerText) || '';
+  const low = body.toLowerCase();
+  const isCopyUi = (
+    low.includes('finish signing in')
+    || low.includes('copy the code')
+    || low.includes('into grok build')
+    || low.includes('enter this code')
+    || low.includes('successfully authorized')
+    || low.includes('do not refresh')
+  );
+
+  const candidates = [];
+  // input / readonly fields
+  for (const el of document.querySelectorAll('input, textarea, code, pre, [data-testid], span, p, div')) {
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      let v = '';
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') v = String(el.value || '');
+      else v = String(el.innerText || el.textContent || '');
+      v = v.replace(/\s+/g, '').trim();
+      if (v.length >= 24 && v.length <= 200 && /^[A-Za-z0-9_-]+$/.test(v)) {
+        candidates.push(v);
+      }
+    } catch (e) {}
+  }
+  // regex over full body (codes often have hyphens)
+  const re = /[A-Za-z0-9_-]{28,120}/g;
+  let m;
+  while ((m = re.exec(body.replace(/\s+/g, ' '))) !== null) {
+    const v = m[0].trim();
+    if (/[A-Za-z]/.test(v) && v.length >= 24) candidates.push(v);
+  }
+  // prefer longest unique
+  const uniq = [...new Set(candidates)].sort((a, b) => b.length - a.length);
+  if (uniq.length) return { code: uniq[0], copyUi: isCopyUi, n: uniq.length };
+  return { code: '', copyUi: isCopyUi, n: 0 };
+}
+"""
+
+
+def _capture_code_from_display_ui(page: Any) -> Optional[str]:
+    """
+    When redirect to 127.0.0.1 fails (esp. Chromium headless / multi-worker),
+    xAI shows a page: "Enter this code to finish signing in" with a long code.
+    That code IS the OAuth authorization code — exchange it the same way.
+    """
+    try:
+        data = _run_page_js(page, _SCRAPE_CODE_JS)
+    except Exception:
+        return None
+    if not data:
+        return None
+    if isinstance(data, dict):
+        code = str(data.get("code") or "").strip()
+    else:
+        code = str(data or "").strip()
+    if _looks_like_oauth_auth_code(code):
+        return code
     return None
 
 
@@ -510,19 +592,20 @@ def _run_page_js(page: Any, script: str) -> Any:
             pass
     # DrissionPage Chromium MixTab / PwPageAdapter
     for target in (page, raw):
-        if hasattr(target, "run_js"):
+        if not hasattr(target, "run_js"):
+            continue
+        body = script.strip()
+        # Prefer IIFE so nested braces stay valid (don't strip outer { } naively)
+        variants = []
+        if body.startswith("() =>") or body.startswith("()=>"):
+            variants.append(f"return ({body})();")
+            variants.append(f"({body})()")
+        variants.append(body)
+        for v in variants:
             try:
-                # Drission: run_js body without outer function sometimes preferred
-                body = script.strip()
-                if body.startswith("() =>") or body.startswith("()=>"):
-                    body = body.split("{", 1)[-1].rsplit("}", 1)[0]
-                    return target.run_js(body)
-                return target.run_js(script)
+                return target.run_js(v)
             except Exception:
-                try:
-                    return target.run_js(script)
-                except Exception:
-                    pass
+                continue
     return None
 
 
@@ -740,7 +823,12 @@ def obtain_tokens_via_browser_pkce(
             code = _capture_code_from_pages(page) or captured.get("code")
             if code:
                 captured["code"] = code
-                _log("OAuth code from page URL / callback server")
+                src = (
+                    "callback/url"
+                    if "56121" in (_page_url(page) or "")
+                    else "display-ui-or-callback"
+                )
+                _log(f"OAuth code captured ({src}) len={len(code)}")
                 break
 
             cur = _page_url(page)
@@ -753,14 +841,57 @@ def obtain_tokens_via_browser_pkce(
                 _log(f"OAuth page (+{time.time() - t0:.0f}s): {cur[:140]}")
                 last = cur
 
+            # Always try scrape copy-code UI (even if URL still says /consent)
+            ui_code = _capture_code_from_display_ui(page)
+            if ui_code:
+                captured["code"] = ui_code
+                _log(
+                    f"OAuth code from copy-code UI len={len(ui_code)} "
+                    f"prefix={ui_code[:12]}…"
+                )
+                break
+
             on_consent = (
                 "/oauth2/consent" in cur
                 or "auth.x.ai" in cur
                 or ("accounts.x.ai" in cur and "consent" in cur)
             )
-            if try_consent_click and on_consent:
-                # Retry Allow every ~1.2s until redirect
-                if time.time() - last_allow_try >= 1.2:
+            # If copy-code UI is up, don't keep clicking Allow
+            try:
+                body_hint = str(
+                    _run_page_js(
+                        page,
+                        """() => (document.body && document.body.innerText || '')
+                          .toLowerCase().slice(0, 200)""",
+                    )
+                    or ""
+                )
+            except Exception:
+                body_hint = ""
+            on_copy_ui = any(
+                k in body_hint
+                for k in (
+                    "finish signing in",
+                    "copy the code",
+                    "into grok build",
+                    "enter this code",
+                    "do not refresh",
+                )
+            )
+            if on_copy_ui:
+                # wait a beat for code to paint, then scrape again
+                time.sleep(0.5)
+                ui_code = _capture_code_from_display_ui(page)
+                if ui_code:
+                    captured["code"] = ui_code
+                    _log(f"OAuth code from copy-code UI len={len(ui_code)}")
+                    break
+                time.sleep(0.5)
+                continue
+
+            if try_consent_click and on_consent and not on_copy_ui:
+                # Retry Allow every ~1.5s until redirect or copy-code UI
+                if time.time() - last_allow_try >= 1.5:
                     last_allow_try = time.time()
                     allow_attempts += 1
                     if allow_attempts == 1:
@@ -785,46 +916,51 @@ def obtain_tokens_via_browser_pkce(
                         except Exception:
                             pass
 
-                    # Abort if session already lost (redirect to sign-in)
                     cur_now = _page_url(page) or cur
                     if "sign-in" in cur_now or "sign-up" in cur_now:
-                        _log(
-                            f"OAuth session lost (url has sign-in/up) — stop Allow spam"
-                        )
+                        _log("OAuth session lost (url has sign-in/up) — stop Allow spam")
                         break
 
                     ok = _click_allow_hard(page, log=_log)
                     if ok:
                         _log(
-                            f"OAuth Allow attempt #{allow_attempts} OK — wait callback…"
+                            f"OAuth Allow attempt #{allow_attempts} OK — "
+                            f"wait callback / copy-code UI…"
                         )
                         try:
                             raw2, loop2, asy2 = _unwrap_page(page)
                             if hasattr(raw2, "wait_for_url"):
-                                _run(
-                                    loop2,
-                                    asy2,
-                                    raw2.wait_for_url(
-                                        re.compile(
-                                            r"https?://(127\.0\.0\.1|localhost):56121/"
+                                try:
+                                    _run(
+                                        loop2,
+                                        asy2,
+                                        raw2.wait_for_url(
+                                            re.compile(
+                                                r"https?://(127\.0\.0\.1|localhost):56121/"
+                                            ),
+                                            timeout=5000,
                                         ),
-                                        timeout=10000,
-                                    ),
-                                )
+                                    )
+                                except Exception:
+                                    pass
                                 c2 = (
                                     _capture_code_from_pages(page)
                                     or captured.get("code")
+                                    or _capture_code_from_display_ui(page)
                                 )
                                 if c2:
                                     captured["code"] = c2
                                     break
                             else:
-                                # Drission: wait for real HTTP callback server or URL
-                                for _ in range(40):
+                                # Drission: poll callback server + copy-code UI
+                                for _ in range(35):
                                     time.sleep(0.35)
                                     if captured.get("code"):
                                         break
-                                    c2 = _capture_code_from_pages(page)
+                                    c2 = (
+                                        _capture_code_from_pages(page)
+                                        or _capture_code_from_display_ui(page)
+                                    )
                                     if c2:
                                         captured["code"] = c2
                                         break
@@ -860,7 +996,6 @@ def obtain_tokens_via_browser_pkce(
                             f"OAuth Allow attempt #{allow_attempts} MISS "
                             f"(no button found / click failed)"
                         )
-                        # After a few misses on consent, don't thrash forever
                         if allow_attempts >= 8:
                             _log("OAuth Allow giving up after 8 misses on consent")
                             break
