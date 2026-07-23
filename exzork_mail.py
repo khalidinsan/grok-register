@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import quopri
 import random
 import re
 import string
@@ -205,6 +206,11 @@ def _extract_address(payload: Any) -> str:
 
 
 def _message_list(payload: Any) -> List[dict]:
+    """
+    List endpoint shape (exzork):
+      {"mailbox": {...}, "messages": [{id, subject, snippet, from_address, ...}]}
+    subject is often empty; snippet is raw header prefix — OTP lives in full message.
+    """
     if payload is None:
         return []
     if isinstance(payload, list):
@@ -214,10 +220,33 @@ def _message_list(payload: Any) -> List[dict]:
             v = payload.get(k)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # single message object
-        if any(k in payload for k in ("subject", "body", "text", "from", "id")):
+        # single message object or {"message": {...}}
+        if "message" in payload and isinstance(payload["message"], dict):
+            return [payload["message"]]
+        if any(k in payload for k in ("subject", "body", "text", "text_body", "from", "id", "snippet")):
             return [payload]
     return []
+
+
+def _decode_qpish(raw: str) -> str:
+    """Decode quoted-printable MIME bodies (x.ai mails are often QP + HTML)."""
+    if not raw:
+        return ""
+    s = raw
+    # Soft line breaks in QP
+    if "=3D" in s or "=\r\n" in s or "=\n" in s or "quoted-printable" in s.lower():
+        try:
+            s = quopri.decodestring(s.encode("utf-8", errors="replace")).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            try:
+                s = quopri.decodestring(s.encode("latin-1", errors="replace")).decode(
+                    "latin-1", errors="replace"
+                )
+            except Exception:
+                pass
+    return s
 
 
 def _message_text(msg: dict) -> str:
@@ -229,24 +258,55 @@ def _message_text(msg: dict) -> str:
         "text",
         "text_body",
         "html",
+        "html_body",
         "content",
         "raw",
         "snippet",
         "preview",
+        "from_address",
+        "to_address",
     ):
         v = msg.get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v)
         elif isinstance(v, dict):
-            # nested body
-            for kk in ("text", "html", "plain"):
+            for kk in ("text", "html", "plain", "text_body"):
                 vv = v.get(kk)
                 if isinstance(vv, str) and vv.strip():
                     parts.append(vv)
-    # strip crude HTML
     blob = "\n".join(parts)
+    blob = _decode_qpish(blob)
+    # Pull Subject: from raw header dump if top-level subject empty
+    if "Subject:" in blob or "subject:" in blob:
+        m = re.search(r"(?im)^Subject:\s*(.+)$", blob)
+        if m:
+            parts.insert(0, m.group(1).strip())
+            blob = m.group(1).strip() + "\n" + blob
     blob = re.sub(r"<[^>]+>", " ", blob)
+    blob = re.sub(r"&nbsp;", " ", blob, flags=re.I)
+    blob = re.sub(r"\s+", " ", blob)
     return blob
+
+
+def get_message(message_id: Any) -> Optional[dict]:
+    """
+    Full message: GET /api/v1/messages/{id}
+    Response: {"message": { id, text_body, subject, ... }}
+    text_body often contains full raw MIME (headers + HTML) with confirmation code.
+    """
+    mid = str(message_id or "").strip()
+    if not mid:
+        return None
+    code, data = _request("GET", f"/api/v1/messages/{quote(mid, safe='')}")
+    if code >= 400 or data is None:
+        print(f"[exzork] get message {mid} HTTP {code}: {str(data)[:160]}")
+        return None
+    if isinstance(data, dict):
+        if isinstance(data.get("message"), dict):
+            return data["message"]
+        if "text_body" in data or "id" in data:
+            return data
+    return None
 
 
 # ── public API used by email_register ───────────────────────────────
@@ -379,7 +439,12 @@ def wait_for_code(
     timeout: float = 120.0,
     poll_interval: float = 1.5,
 ) -> Optional[str]:
-    """Poll mailbox messages until xAI OTP found or timeout."""
+    """
+    Poll until xAI OTP found.
+
+    exzork list endpoint only returns meta + header snippet (subject often empty).
+    OTP is in GET /api/v1/messages/{id} → text_body (raw MIME / QP HTML).
+    """
     from email_register import extract_verification_code
 
     address = (address or "").strip()
@@ -388,49 +453,50 @@ def wait_for_code(
     print(f"[exzork] Waiting for OTP to {address} (timeout={int(timeout)}s)...")
     t0 = time.time()
     poll = 0
-    seen: set[str] = set()
+    fetched_ids: set[str] = set()
 
     while time.time() - t0 < timeout:
         poll += 1
         elapsed = int(time.time() - t0)
         try:
             msgs = list_messages(address)
+            if poll == 1 or (msgs and poll % 5 == 0):
+                print(f"[exzork] list n={len(msgs)} elapsed={elapsed}s")
             for msg in msgs:
-                mid = str(msg.get("id") or msg.get("_id") or "")
+                mid = str(msg.get("id") or msg.get("_id") or "").strip()
+                # 1) cheap path: list fields (usually empty subject / useless snippet)
                 blob = _message_text(msg)
-                # de-dupe by id+subject head
-                sig = mid or blob[:80]
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                # prefer x.ai / confirmation subjects
-                low = blob.lower()
-                if any(
-                    k in low
-                    for k in (
-                        "x.ai",
-                        "xai",
-                        "confirmation",
-                        "verification",
-                        "verify",
-                        "grok",
-                        "one-time",
-                        "otp",
-                    )
-                ) or not mid:
-                    code = extract_verification_code(blob)
-                    if code:
-                        print(
-                            f"[exzork] Found OTP: {code} for {address} in {elapsed}s"
+                code = extract_verification_code(blob) if blob else None
+                if code:
+                    print(f"[exzork] Found OTP: {code} for {address} in {elapsed}s (list)")
+                    return code
+
+                # 2) full message by id (required for x.ai on exzork)
+                if mid and mid not in fetched_ids:
+                    full = get_message(mid)
+                    fetched_ids.add(mid)
+                    if full:
+                        blob2 = _message_text(full)
+                        # also search raw text_body before HTML strip for Subject line
+                        raw_tb = str(full.get("text_body") or full.get("body") or "")
+                        raw_tb = _decode_qpish(raw_tb)
+                        code = extract_verification_code(blob2) or extract_verification_code(
+                            raw_tb
                         )
-                        return code
-                else:
-                    code = extract_verification_code(blob)
-                    if code:
-                        print(
-                            f"[exzork] Found OTP: {code} for {address} in {elapsed}s"
-                        )
-                        return code
+                        if code:
+                            print(
+                                f"[exzork] Found OTP: {code} for {address} "
+                                f"in {elapsed}s (message id={mid})"
+                            )
+                            return code
+                        else:
+                            # debug once per message
+                            snip = (raw_tb or blob2 or "")[:120].replace("\n", " ")
+                            print(
+                                f"[exzork] message id={mid} no OTP yet "
+                                f"from={full.get('from_address','')[:40]!r} "
+                                f"snip={snip!r}"
+                            )
         except Exception as e:
             print(f"[exzork] poll error: {e}")
 
