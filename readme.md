@@ -5,13 +5,18 @@ Automated **xAI / Grok** account registration farm: signup → SSO → **Grok Bu
 Default browser engine: **Camoufox** (anti-detect Firefox). Optional **Chromium** (Playwright) fallback.
 
 ```text
-email (IMAP catch-all **or** mailer.exzork.me API)
+email (IMAP catch-all  |  mailer.exzork.me API)
   → register (browser full UI  |  hybrid: short browser + protocol HTTP)
   → SSO cookies (wrapper → session materialize if needed)
+  → SAVE accounts/ (email + password + status=created)  +  sso/*.txt (cookie only)
   → SETTLE (bot hygiene, default 12s)
-  → OAuth PKCE referrer=grok-build  (fallback: device OAuth, fail-fast)
+  → OAuth PKCE referrer=grok-build  (Camoufox)
+      · token exchange prefers Playwright browser context (less invalid_grant)
+      · Chromium default: device SSO (skip :56121 lock)
+      · device fallback fail-fast if PKCE dies
   → PROBE cli-chat-proxy (inject only if USABLE)
-  → PUSH 9router grok-cli
+  → PUSH 9router grok-cli  →  accounts status=injected
+  → on fail: accounts status=failed_oauth | failed_probe | failed_push
 ```
 
 > x.ai rejects common disposable mail domains. Use your **own catch-all domain**.
@@ -27,7 +32,10 @@ email (IMAP catch-all **or** mailer.exzork.me API)
 | **Engines** | Camoufox (default) · Playwright Chromium fallback |
 | **Register modes** | `browser` full UI · `hybrid` (castle harvest + protocol HTTP) |
 | **Mail** | IMAP Gmail catch-all **or** [exzork](https://mailer.exzork.me/) API (wildcard subdomains) · humanized local-parts |
-| **OAuth** | Browser **PKCE** `referrer=grok-build` · device SSO fallback (fail-fast) |
+| **Password** | **Fixed** for all accounts via `account.password` (not random) · env `GROK_ACCOUNT_PASSWORD` |
+| **Account ledger** | `accounts/accounts.jsonl` (email/pass + pipeline **status**) · `accounts/email_pass.txt` |
+| **OAuth** | Browser **PKCE** `referrer=grok-build` · exchange via **browser context** first · device SSO fallback |
+| **Device OAuth** | HTTP device flow: approve `user_code` + `action=allow` · no empty `principal_id` · fail-fast RL |
 | **Inject policy** | `usable` — chat probe **200** only; **402/403 DENIED never inject** |
 | **Proxy** | Pool file, `per_account` / `per_worker`, health check, retry → direct |
 | **Asset block** | Optional third-party font/media block (bandwidth) |
@@ -42,7 +50,7 @@ email (IMAP catch-all **or** mailer.exzork.me API)
 |--|--|
 | **OS** | macOS · Linux (VPS OK) · Windows |
 | **Python** | **3.10–3.13** recommended (3.14 may hit TLS edge cases) |
-| **Mail** | Domain with **catch-all** → Gmail + [App Password](https://myaccount.google.com/apppasswords) |
+| **Mail** | Domain with **catch-all** → Gmail + [App Password](https://myaccount.google.com/apppasswords) **or** exzork API |
 | **Optional** | Local [9router](https://github.com/) (`http://127.0.0.1:20127` or remote URL) |
 | **Optional** | Residential proxies (`proxy.txt`) |
 
@@ -126,7 +134,7 @@ playwright install chromium
 python -m playwright install-deps chromium || true
 
 cp config.example.json config.json
-# fill email.*, grok_cli.*, register_mode, pool.proxy_file, etc.
+# fill email.*, account.password, grok_cli.*, register_mode, pool.proxy_file, etc.
 # add proxy.txt if using residential proxies
 ```
 
@@ -213,12 +221,15 @@ cp config.example.json config.json
     "local_style": "human"
   },
   "browser": { "engine": "camoufox" },
+  "account": {
+    "password": "Nfarm!a7#GrokBuild26"
+  },
   "grok_cli": {
     "enabled": true,
     "base_url": "http://127.0.0.1:20127",
     "password": "your-9router-dashboard-password",
     "data_dir": "~/.9router",
-    "oauth_mode": "pkce",
+    "oauth_mode": "auto",
     "oauth_referrer": "grok-build",
     "post_signup_settle_sec": 12,
     "oauth_gap_sec": 8,
@@ -238,6 +249,7 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | Field | Description |
 |-------|-------------|
 | `register_mode` | `browser` (full UI) · `hybrid` (protocol after short harvest). Default if unset: **browser**. Env: `GROK_REGISTER_MODE`. |
+| `account.password` | **Fixed password for every farmed account** (not random). Env: `GROK_ACCOUNT_PASSWORD`. |
 | `pool.concurrent` / `-c` | Parallel workers (browsers). |
 | `pool.count` / `-n` | Total accounts (`0` = unlimited). |
 | `pool.display` | `headless` · `offscreen` · `virtual` · `headed`. |
@@ -252,7 +264,7 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `grok_cli.oauth_gap_sec` | Min seconds between OAuth mints (default 8). |
 | `grok_cli.chat_probe_off_critical` | Soft-reset browser before HTTP probe (default true). |
 | `grok_cli.inject_policy` | `usable` · `jwt_clean` · `all`. |
-| `grok_cli.oauth_mode` | `pkce` (preferred) · device fallback automatic. |
+| `grok_cli.oauth_mode` | `auto` (PKCE on Camoufox, device on Chromium) · `pkce` · `device`. Force Chromium PKCE: `GROK_FORCE_CHROMIUM_PKCE=1`. |
 
 ---
 
@@ -263,6 +275,7 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `GROK_BROWSER_ENGINE` | `camoufox` | `camoufox` \| `chromium` |
 | `GROK_DISPLAY` / `GROK_HEADLESS` | platform | Display mode |
 | `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` |
+| `GROK_ACCOUNT_PASSWORD` | config `account.password` | Fixed signup password for all accounts |
 | `GROK_BLOCK_ASSETS` | `1` | Font/media asset block |
 | `GROK_PROXY_RETRIES` | `3` | Proxy tries per account |
 | `GROK_PROXY_FALLBACK_DIRECT` | `1` | Fall back to direct |
@@ -270,6 +283,7 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `GROK_CHAT_PROBE_OFF_CRITICAL` | `1` | Defer probe after OAuth |
 | `GROK_DEVICE_RL_MAX_TRIES` | `2` | Device OAuth rate-limit tries |
 | `GROK_DEVICE_POLL_TIMEOUT_SEC` | `45` | Device token poll cap |
+| `GROK_FORCE_CHROMIUM_PKCE` | off | Force browser PKCE on Chromium (needs :56121) |
 | `GROK_HYBRID_USE_DRISSION_TS` | off | Opt-in slow Drission Turnstile path |
 | `GROK_BROWSER_PROXY` / `GROK_PROXIES` | — | Worker proxy (set by pool/TUI) |
 
@@ -357,6 +371,9 @@ python farm_tui.py -u -c 2 --stagger 15 --offscreen \
 ./run_linux.sh farm_tui.py -u -c 2 --stagger 15 \
   --display headless --proxy-file proxy.txt --proxy-mode per_account
 
+# Unlimited · 5 workers · headless
+.venv/bin/python farm_tui.py -u -c 5 --display headless
+
 # Skip proxy health check (if check is wrong but proxies work)
 python farm_tui.py -c 1 --no-proxy-check --proxy-file proxy.txt
 ```
@@ -395,7 +412,7 @@ python farm_tui.py -c 1 --no-proxy-check --proxy-file proxy.txt
 | `headless` | VPS farm (default Linux) |
 | `virtual` | Linux no GUI, better CF than pure headless — needs `xvfb` |
 | `offscreen` | Mac while working |
-| `headed` | Debug Turnstile / CF |
+| `headed` | Debug Turnstile / CF / OAuth consent |
 
 ---
 
@@ -415,40 +432,92 @@ Turnstile on Camoufox hybrid: native poll + inject widget (not Drission shadow c
 ## Pipeline (per account)
 
 1. **Register** — `browser` or `hybrid` → SSO  
-2. **SETTLE** — `post_signup_settle_sec` (default **12s** bot hygiene)  
-3. **CONVERT** — PKCE `grok-build` on live session; prep tab after hybrid; device fallback fail-fast  
-4. **PROBE** — `cli-chat-proxy` model `grok-4.5` (default off critical path)  
-5. **PUSH** — only if **USABLE** (`inject_policy=usable`)
+2. **SAVE** — `sso/*.txt` (cookie) + `accounts/` (`status=created`, email + password)  
+3. **SETTLE** — `post_signup_settle_sec` (default **12s** bot hygiene)  
+4. **CONVERT** — PKCE `grok-build` on live session (Camoufox); Chromium prefers device SSO; device fallback fail-fast  
+5. **PROBE** — `cli-chat-proxy` model `grok-4.5` (default off critical path)  
+6. **PUSH** — only if **USABLE** (`inject_policy=usable`) → `status=injected`
 
-| Probe | Meaning |
-|-------|---------|
-| **200** + reply | USABLE → inject 9router |
-| **402** spending-limit | Token OK, no free credits — **not** injected |
-| **403** | Chat denied — not injected |
+| Probe | Meaning | `accounts.status` |
+|-------|---------|-------------------|
+| **200** + reply | USABLE → inject 9router | `injected` |
+| **402** spending-limit | Token may be OK later; free credits / soft limit — **not** injected | `failed_probe` |
+| **403** | Chat denied — not injected (sometimes recovers later) | `failed_probe` |
+| OAuth / `invalid_grant` / Access denied | No Build token or xAI denied grant | `failed_oauth` |
 
 Proxy failures during convert may retry **direct** (`proxy_fallback_direct`).
+
+> **402/403 are not always permanent.** Free-tier quota and soft denials can clear after hours. Prefer **reprobe** tokens that already have OAuth over mass-reconvert of dead SSO files.
 
 ---
 
 ## Outputs
 
 ```text
-sso/
-  sso_<timestamp>_w<N>.txt
+sso/                          # OUTPUT ONLY — farm never reads these back
+  sso_<timestamp>_w<N>.txt    # one cookie-header line per created account
+
+accounts/                     # gitignored (secrets)
+  accounts.jsonl              # structured ledger: email, password, status, sso_cookie, …
+  email_pass.txt              # email:password (all created accounts)
+
 logs/
   run_<timestamp>_w<N>.log
 ```
 
+### `sso/` vs `accounts/`
+
+| Path | Written when | Read by farm? | Contents |
+|------|----------------|---------------|----------|
+| `sso/*.txt` | After SSO cookies exist | **No** (output only; offline reconvert tools may read) | Cookie header only |
+| `accounts/accounts.jsonl` | After SSO + **updated** after OAuth/probe/push | No | email, password, **status**, SSO snapshot, errors |
+| `accounts/email_pass.txt` | After create | No | `email:password` for every created account |
+
+### Account status values (`accounts.jsonl`)
+
+| `status` | Meaning |
+|----------|---------|
+| `created` | Register + SSO OK (has email/password/cookie) |
+| `oauth_ok` | Build OAuth tokens minted (intermediate) |
+| `injected` | Chat usable + pushed to 9router (**full success**) |
+| `failed_oauth` | SSO OK but PKCE/device OAuth failed |
+| `failed_probe` | OAuth OK but chat 402/403/denied (candidate for later reprobe) |
+| `failed_push` | Usable but 9router import failed |
+
 ```bash
+# full success
+grep '"status": "injected"' accounts/accounts.jsonl
+
+# OAuth OK but chat denied (maybe reprobe later)
+grep '"status": "failed_probe"' accounts/accounts.jsonl
+
+# register only / OAuth fail
+grep '"status": "failed_oauth"' accounts/accounts.jsonl
+
 tail -f logs/run_*_w1.log
 ```
+
+### Offline reconvert (SSO → Build, no register)
+
+`sso/*.txt` is **not** used by the live farm loop. You can convert stored cookies offline with:
+
+```bash
+# single cookie header / file
+.venv/bin/python sso_to_build.py path/to/sso_line_or_file.txt
+```
+
+Device flow notes (current code):
+
+- Approve payload: `user_code` + `action=allow` only (empty `principal_id` → `Invalid action`)
+- Rate-limit detector ignores large accounts.x.ai HTML (i18n `"try again later"` false positives)
+- Old SSO often returns `token failed HTTP 400: Access denied` (session dead) — not worth bulk reconvert
 
 ---
 
 ## Project layout
 
 ```text
-├── DrissionPage_example.py   # Main worker (register + OAuth + probe + push)
+├── DrissionPage_example.py   # Main worker (register + OAuth + probe + push + accounts ledger)
 ├── farm_tui.py               # Textual multi-worker dashboard
 ├── run_pool.py               # CLI multi-process launcher
 ├── run_linux.sh              # Linux/VPS launcher (headless / xvfb)
@@ -456,14 +525,16 @@ tail -f logs/run_*_w1.log
 ├── hybrid/                   # Hybrid register (castle + protocol)
 ├── sso_util.py               # SSO wrapper ↔ session materialize
 ├── sso_to_build.py           # Device OAuth (HTTP) fail-fast
-├── build_oauth_pkce.py       # Browser PKCE referrer=grok-build
+├── build_oauth_pkce.py       # Browser PKCE referrer=grok-build + browser-context token exchange
 ├── push_9router_grok_cli.py  # 9router grok-cli import
 ├── chat_usable.py            # Chat probe
 ├── proxy_util.py / proxy_health.py
 ├── config.example.json
 ├── requirements.txt
 ├── turnstilePatch/           # Chromium extension (optional path)
-├── sso/  logs/               # outputs (auto)
+├── sso/                      # cookie outputs (auto, gitignored)
+├── accounts/                 # email/pass + status ledger (auto, gitignored)
+├── logs/                     # worker logs (auto, gitignored)
 ```
 
 ---
@@ -477,10 +548,15 @@ tail -f logs/run_*_w1.log
 | All proxies DROP | Format / plan / `curl -x … https://accounts.x.ai/` |
 | `get_turnstile_fn failed` (old) | Update to latest; hybrid uses inject path now |
 | PKCE `NS_BINDING_ABORTED` | Fixed via PKCE prep after hybrid; update main |
+| PKCE `invalid_grant` / Access denied after code OK | Token exchange prefers **browser context**; update main. xAI may still deny grant for flagged sessions |
+| UI: *Failed to generate authentication code* | xAI hard-deny on consent — fail-fast; try device fallback / new account |
 | Device approve hang 7min | Fixed fail-fast (~45s); update main |
-| **402 spending-limit** | xAI free quota / policy — not a local crash |
+| Device `Invalid action` on approve | Empty `principal_id` bug — fixed (approve = `user_code` + `action=allow`) |
+| **402 spending-limit** | xAI free quota / policy — not a local crash; may recover later → `failed_probe` |
+| **403** chat denied | Soft deny / new account; sometimes recovers → `failed_probe` |
 | Hybrid always fallback | Check logs for castle/OTP; `curl_cffi` installed? |
-| 9router empty after PASS | `grok_cli.base_url` + password; import only on USABLE |
+| 9router empty after PASS | `grok_cli.base_url` + password; import only on USABLE; check `accounts.status=injected` |
+| Forgot password on old accounts | Pre-ledger runs used random passwords (only in logs). New runs use fixed `account.password` |
 
 ---
 
@@ -499,6 +575,12 @@ python farm_tui.py -u -c 2 --offscreen --proxy-file proxy.txt --proxy-mode per_a
 source .venv/bin/activate
 ./run_linux.sh farm_tui.py -u -c 2 --stagger 15 \
   --display headless --proxy-file proxy.txt --proxy-mode per_account
+```
+
+**Unlimited · 5 concurrent · headless**
+
+```bash
+.venv/bin/python farm_tui.py -u -c 5 --display headless
 ```
 
 **One account debug (headed)**
