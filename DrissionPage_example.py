@@ -3909,7 +3909,7 @@ def convert_grok_cli_tokens(result: dict):
     px = current_proxy_url()
     from_hybrid = bool(isinstance(result, dict) and result.get("hybrid"))
 
-    oauth_mode = str(gcli.get("oauth_mode") or "pkce").strip().lower()
+    oauth_mode = str(gcli.get("oauth_mode") or "auto").strip().lower()
     referrer = str(gcli.get("oauth_referrer") or "grok-build").strip() or "grok-build"
     try:
         settle_s = float(gcli.get("post_signup_settle_sec") or 12)
@@ -3922,6 +3922,36 @@ def convert_grok_cli_tokens(result: dict):
     if enforce_ref is None:
         enforce_ref = True
 
+    # ── Engine-aware OAuth ─────────────────────────────────────────
+    # Camoufox: PKCE via Playwright page.route() (no real :56121) — good concurrent.
+    # Chromium/Drission MixTab: needs exclusive :56121 OR flaky copy-code UI —
+    # multi-worker burns minutes on port lock. Default: skip PKCE → device SSO.
+    eng = _resolve_browser_engine()
+    force_chromium_pkce = (os.environ.get("GROK_FORCE_CHROMIUM_PKCE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    pkce_modes = ("pkce", "browser", "oidc", "grok-build")
+    device_modes = ("device", "sso", "device_sso", "http")
+    if oauth_mode in ("auto", "", "default"):
+        use_pkce = eng == "camoufox"
+    elif oauth_mode in device_modes:
+        use_pkce = False
+    elif oauth_mode in pkce_modes:
+        use_pkce = True
+        if eng == "chromium" and not force_chromium_pkce:
+            slog(
+                "CONVERT",
+                "Chromium detected — skip PKCE (use device SSO). "
+                "Set GROK_FORCE_CHROMIUM_PKCE=1 to force browser PKCE.",
+                level="warn",
+            )
+            use_pkce = False
+    else:
+        use_pkce = eng == "camoufox"
+
     gap_sec = _oauth_gap_sec(gcli)
     _wait_oauth_gap(gap_sec)
 
@@ -3931,22 +3961,22 @@ def convert_grok_cli_tokens(result: dict):
         time.sleep(settle_s)
         slog("SETTLE", "done")
 
-    # Stabilize page after hybrid (prevents NS_BINDING_ABORTED on PKCE goto)
-    if from_hybrid or oauth_mode in ("pkce", "browser", "oidc", "grok-build"):
+    # Stabilize page only when we will run browser PKCE
+    if use_pkce and (from_hybrid or True):
         try:
             prepare_page_for_pkce(result)
         except Exception as e:
             slog("CONVERT", f"PKCE prep failed (continue): {e}", level="warn")
 
-    # ── PHASE: CONVERT (PKCE browser preferred) ─────────────────────
+    # ── PHASE: CONVERT ─────────────────────────────────────────────
     tokens = None
     pkce_err: Exception | None = None
-    if oauth_mode in ("pkce", "browser", "oidc", "grok-build"):
+    if use_pkce:
         slog(
             "CONVERT",
             f"browser PKCE referrer={referrer} email={email or '-'} "
-            f"(flash path — same session as signup"
-            f"{'; hybrid prep' if from_hybrid else ''})",
+            f"engine={eng}"
+            f"{'; hybrid prep' if from_hybrid else ''}",
         )
         for pkce_try in range(1, 3 if from_hybrid else 2):
             try:
@@ -3977,7 +4007,6 @@ def convert_grok_cli_tokens(result: dict):
                     level="warn",
                 )
                 tokens = None
-                # Only re-prep once for hybrid
                 if pkce_try >= (2 if from_hybrid else 1):
                     break
 
@@ -3987,6 +4016,11 @@ def convert_grok_cli_tokens(result: dict):
                 f"PKCE failed — device SSO fallback (fail-fast)  err={pkce_err}",
                 level="warn",
             )
+    else:
+        slog(
+            "CONVERT",
+            f"device SSO (no browser PKCE) engine={eng} email={email or '-'}",
+        )
 
     if tokens is None:
         slog("CONVERT", f"Web SSO → Device OAuth (fail-fast) email={email or '-'}")
