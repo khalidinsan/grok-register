@@ -38,7 +38,8 @@ SIGNIN_URL = "https://accounts.x.ai/sign-in"
 ACCOUNT_URL = "https://accounts.x.ai/account"
 EXCHANGE_HINT = "exchange-token"
 
-# Terminal ledger statuses — skip on next claim (same idea as login_to_build).
+# Final ledger statuses in accounts.jsonl — skip on next claim.
+# (jsonl is written AFTER probe for google mode; in-flight claims use CLAIM_LIVE.)
 SKIP_STATUSES = frozenset(
     {
         "failed_login",
@@ -48,11 +49,20 @@ SKIP_STATUSES = frozenset(
         "usable",
         "injected",
         "oauth_ok",
-        "created",  # mid-pipeline or already registered this google email
-        "pending",  # claimed by another worker
+        "created",
+        "pending",
         "in_progress",
     }
 )
+
+# Multi-worker in-flight claims (NOT accounts.jsonl — that is post-probe only)
+CLAIM_LIVE = ROOT / "accounts" / ".google_claim_live.jsonl"
+
+
+class GoogleInventoryEmpty(Exception):
+    """No free emails left in google_pass inventory — worker should stop cleanly."""
+
+    pass
 
 LogFn = Callable[[str], None]
 
@@ -188,20 +198,80 @@ def _with_claim_lock(fn):
                 pass
 
 
-def _mark_pending(email: str, password: str) -> None:
-    """Append a pending ledger row so other workers skip this email."""
-    DEFAULT_JSONL.parent.mkdir(parents=True, exist_ok=True)
+def _live_claimed_emails() -> set[str]:
+    """Emails currently claimed by any worker (in-flight, not yet in jsonl final)."""
+    out: set[str] = set()
+    if not CLAIM_LIVE.is_file():
+        return out
+    try:
+        for line in CLAIM_LIVE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                # plain email line
+                if "@" in line:
+                    out.add(line.lower())
+                continue
+            em = str(rec.get("email") or "").strip().lower()
+            st = str(rec.get("status") or "in_progress").strip()
+            if em and st in ("in_progress", "pending", "claimed"):
+                out.add(em)
+    except Exception:
+        pass
+    return out
+
+
+def _mark_claim_live(email: str, password: str) -> None:
+    """Mark email in-flight for multi-worker (separate from accounts.jsonl)."""
+    CLAIM_LIVE.parent.mkdir(parents=True, exist_ok=True)
     rec = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "email": email,
         "password": password,
-        "mode": "google",
-        "status": "pending",
+        "status": "in_progress",
         "provider": "google",
+        "pid": os.getpid(),
     }
-    with open(DEFAULT_JSONL, "a", encoding="utf-8") as f:
+    with open(CLAIM_LIVE, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def release_google_claim(email: str) -> None:
+    """Drop in-flight claim so email can be retried (or after final jsonl write)."""
+    email = (email or "").strip().lower()
+    if not email or not CLAIM_LIVE.is_file():
+        return
+
+    def _rel():
+        try:
+            lines = CLAIM_LIVE.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return
+        kept = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                em = str(rec.get("email") or "").strip().lower()
+                if em == email:
+                    continue  # drop
+                kept.append(json.dumps(rec, ensure_ascii=False))
+            except Exception:
+                if line.lower() != email:
+                    kept.append(line)
+        CLAIM_LIVE.write_text(
+            ("\n".join(kept) + ("\n" if kept else "")), encoding="utf-8"
+        )
+
+    try:
+        _with_claim_lock(_rel)
+    except Exception:
+        pass
 
 
 def claim_next_google_account(
@@ -212,8 +282,11 @@ def claim_next_google_account(
 ) -> Optional[tuple[str, str]]:
     """Claim next unused Google email:password (multi-worker safe).
 
-    Skips emails whose latest accounts.jsonl status is terminal / in progress
-    unless ``force=True`` (env GROK_GOOGLE_FORCE=1).
+    Skips:
+      - emails already in accounts.jsonl with terminal status (post-probe ledger)
+      - emails currently in-flight (.google_claim_live.jsonl)
+
+    Does NOT write accounts.jsonl (that happens after probe).
     """
     path = accounts_file or resolve_google_accounts_file()
     if (os.environ.get("GROK_GOOGLE_FORCE") or "").strip() in ("1", "true", "yes"):
@@ -225,11 +298,15 @@ def claim_next_google_account(
             _log(log, f"google inventory empty: {path}")
             return None
         statuses = _jsonl_status_by_email()
+        live = _live_claimed_emails()
         for em, pw in pairs:
-            st = statuses.get(em.lower(), "")
+            key = em.lower()
+            st = statuses.get(key, "")
             if not force and st in SKIP_STATUSES:
                 continue
-            _mark_pending(em, pw)
+            if not force and key in live:
+                continue
+            _mark_claim_live(em, pw)
             _log(log, f"claimed google account {em}  (was status={st or 'new'})")
             return em, pw
         _log(log, f"no free google accounts left in {path.name}  (n={len(pairs)})")

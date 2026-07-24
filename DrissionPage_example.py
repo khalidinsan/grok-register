@@ -3777,8 +3777,16 @@ def _try_google_registration() -> dict | None:
     """
     Google OIDC path: claim email:pass from google_pass.txt → Continue with Google
     → consent → /account SSO. Returns result dict on success, None on soft failure.
+
+    Raises GoogleInventoryEmpty when no free inventory (worker should stop).
+    Does NOT write accounts.jsonl — that happens after probe.
     """
-    from google_signup import claim_next_google_account, register_one_google
+    from google_signup import (
+        claim_next_google_account,
+        register_one_google,
+        release_google_claim,
+        GoogleInventoryEmpty,
+    )
 
     global page, browser
     if page is None or browser is None:
@@ -3790,8 +3798,10 @@ def _try_google_registration() -> dict | None:
 
     claimed = claim_next_google_account(log=lambda m: slog("GOOGLE", m))
     if not claimed:
-        slog("GOOGLE", "no free accounts in google inventory", level="error")
-        return None
+        slog("GOOGLE", "no free accounts in google inventory — worker will stop")
+        raise GoogleInventoryEmpty(
+            "no free google accounts left in inventory (google_pass.txt)"
+        )
     email, password = claimed
     try:
         meta = register_one_google(
@@ -3803,7 +3813,7 @@ def _try_google_registration() -> dict | None:
     except Exception as e:
         slog("GOOGLE", f"register failed email={email}: {e}", level="error")
         try:
-            update_account_status(email, "failed_login", error=str(e)[:400])
+            release_google_claim(email)
         except Exception:
             pass
         return None
@@ -3815,7 +3825,7 @@ def _try_google_registration() -> dict | None:
     except Exception as e:
         slog("GOOGLE", f"SSO wait failed email={email}: {e}", level="error")
         try:
-            update_account_status(email, "failed_login", error=f"sso: {e}"[:400])
+            release_google_claim(email)
         except Exception:
             pass
         return None
@@ -3825,7 +3835,7 @@ def _try_google_registration() -> dict | None:
     ):
         slog("GOOGLE", f"no SSO after google login email={email}", level="error")
         try:
-            update_account_status(email, "failed_login", error="no_sso")
+            release_google_claim(email)
         except Exception:
             pass
         return None
@@ -3886,7 +3896,11 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     if reg_mode == "google":
         slog("FLOW", "① google OIDC register (inventory → Continue with Google)")
         try:
+            from google_signup import GoogleInventoryEmpty
+
             google_result = _try_google_registration()
+        except GoogleInventoryEmpty:
+            raise  # main loop stops worker cleanly
         except Exception as e:
             slog("GOOGLE", f"exception: {e}", level="error")
             google_result = None
@@ -3963,16 +3977,10 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             "provider": "google",
             **profile,
         }
-        append_account_record(
-            email=email,
-            password=str(profile.get("password") or ""),
-            given_name=str(profile.get("given_name") or ""),
-            family_name=str(profile.get("family_name") or ""),
-            sso_cookie=sso_line or str(result.get("cookie_header") or ""),
-            mode="google",
-            sso_file=output_path,
-            extra={"provider": "google"},
-        )
+        # accounts.jsonl written AFTER probe (not at signup) — see finalize below
+        result["_defer_account_ledger"] = True
+        result["_sso_file"] = output_path
+        result["_sso_line"] = sso_line or ""
     elif hybrid_result:
         email = str(hybrid_result.get("email") or "")
         profile = {
@@ -4087,14 +4095,69 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     slog(
         "CREATED",
         f"email={email}  name={profile.get('given_name','')} {profile.get('family_name','')}  "
-        f"pass={profile.get('password','')}  mode={mode_tag}",
+        f"pass={profile.get('password','')}  mode={mode_tag}"
+        + ("  (ledger after probe)" if result.get("_defer_account_ledger") else ""),
     )
+
+    def _write_google_ledger(status: str, error: str = "") -> None:
+        """First (and only) accounts.jsonl write for google mode — after probe/push."""
+        try:
+            from google_signup import release_google_claim
+        except Exception:
+            release_google_claim = None  # type: ignore
+        probe = (
+            result.get("chat_probe")
+            if isinstance(result.get("chat_probe"), dict)
+            else {}
+        )
+        has_oauth = bool(
+            result.get("build_refresh_token")
+            or result.get("build_access_token")
+            or result.get("_build_tokens")
+        )
+        extra = {
+            "provider": "google",
+            "injected": status == ACCOUNT_STATUS_INJECTED,
+            "has_oauth": has_oauth
+            or status
+            in (
+                ACCOUNT_STATUS_OAUTH_OK,
+                ACCOUNT_STATUS_USABLE,
+                ACCOUNT_STATUS_INJECTED,
+                ACCOUNT_STATUS_FAILED_PROBE,
+                ACCOUNT_STATUS_FAILED_PUSH,
+            ),
+            "probe_status": probe.get("status"),
+            "probe_err": (str(probe.get("err") or "")[:200] if probe else ""),
+            "build_email": result.get("build_email") or "",
+            "build_user_id": result.get("build_user_id") or "",
+            "inject_active": result.get("inject_active"),
+            "error": (error or "")[:400],
+            "9router_id": result.get("9router_id") or "",
+        }
+        append_account_record(
+            email=email,
+            password=str(profile.get("password") or ""),
+            given_name=str(profile.get("given_name") or ""),
+            family_name=str(profile.get("family_name") or ""),
+            sso_cookie=str(result.get("_sso_line") or result.get("cookie_header") or ""),
+            mode="google",
+            sso_file=str(result.get("_sso_file") or ""),
+            status=status,
+            extra=extra,
+        )
+        if release_google_claim:
+            try:
+                release_google_claim(email)
+            except Exception:
+                pass
 
     # Primary: settle → PKCE/device → chat usable → push 9router
     # ANY failure here must raise so main() counts FAIL (not OK).
     # When GROK_CHAT_PROBE_OFF_CRITICAL (default on): OAuth on browser path,
     # soft-reset, then HTTP probe+push so browser is not held during probe.
-    # Account row already written as status=created; updated on oauth/probe/push.
+    # Google mode: accounts.jsonl ONLY after probe (not at signup).
+    defer_ledger = bool(result.get("_defer_account_ledger"))
     try:
         conf = _load_config()
         gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
@@ -4103,9 +4166,10 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             slog("FLOW", "⑥ ACTIVATE grok.com → ⑦ OAuth PKCE  (PROBE deferred off critical)")
             tokens = convert_grok_cli_tokens(result)
             if tokens is not None:
-                _sync_account_status_from_result(
-                    email, status=ACCOUNT_STATUS_OAUTH_OK, result=result
-                )
+                if not defer_ledger:
+                    _sync_account_status_from_result(
+                        email, status=ACCOUNT_STATUS_OAUTH_OK, result=result
+                    )
                 slog("PROBE", "deferred (off critical path)")
                 result["inject_pending_probe"] = True
                 try:
@@ -4126,9 +4190,21 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         else:
             slog("FLOW", "⑥ ACTIVATE grok.com → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
             convert_and_push_grok_cli(result)
-        _sync_account_status_from_result(
-            email, status=ACCOUNT_STATUS_INJECTED, result=result
-        )
+        if defer_ledger:
+            has_tok = bool(
+                result.get("build_refresh_token")
+                or result.get("build_access_token")
+                or result.get("_build_tokens")
+            )
+            if has_tok or result.get("9router_id"):
+                _write_google_ledger(ACCOUNT_STATUS_INJECTED)
+            else:
+                # OAuth disabled / convert returned None without raise
+                _write_google_ledger(ACCOUNT_STATUS_FAILED_OAUTH, error="no_tokens")
+        else:
+            _sync_account_status_from_result(
+                email, status=ACCOUNT_STATUS_INJECTED, result=result
+            )
         slog("PUSH", "9router import OK")
     except Exception as e:
         err = str(e)
@@ -4162,9 +4238,12 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             result.get("build_refresh_token") or result.get("_build_tokens")
         ):
             acct_status = ACCOUNT_STATUS_FAILED_PROBE
-        _sync_account_status_from_result(
-            email, status=acct_status, error=err, result=result
-        )
+        if defer_ledger:
+            _write_google_ledger(acct_status, error=err)
+        else:
+            _sync_account_status_from_result(
+                email, status=acct_status, error=err, result=result
+            )
         slog(phase, f"FAILED: {e}", level="error")
         slog(
             "FAIL",
@@ -5417,6 +5496,28 @@ def main():
                     slog("STOP", "interrupted by user", level="warn")
                     raise
                 except Exception as error:
+                    # Google inventory empty → stop worker cleanly (not a fail spam)
+                    try:
+                        from google_signup import GoogleInventoryEmpty
+
+                        is_inv_empty = isinstance(error, GoogleInventoryEmpty)
+                    except Exception:
+                        is_inv_empty = False
+                    if not is_inv_empty:
+                        is_inv_empty = "no free google accounts" in str(error).lower()
+                    if is_inv_empty:
+                        slog(
+                            "DONE",
+                            "google inventory exhausted — stopping worker "
+                            f"(✓{_progress_ok} ✗{_progress_fail})",
+                        )
+                        # do not count as account fail
+                        last_error = None
+                        account_ok = True  # skip fail path; break outer
+                        fail_recorded = True
+                        # sentinel so outer loop breaks without hard-reset thrash
+                        os.environ["GROK_GOOGLE_INVENTORY_EMPTY"] = "1"
+                        break
                     last_error = error
                     more = try_i < total_attempts - 1
                     if is_proxy_failure(error) and more:
@@ -5453,6 +5554,11 @@ def main():
             if not account_ok and last_error is not None and not fail_recorded:
                 progress_end_account(False, str(last_error))
                 hard_fail = True
+
+            # Google inventory empty: stop this worker (all workers empty ⇒ farm done)
+            if (os.environ.get("GROK_GOOGLE_INVENTORY_EMPTY") or "").strip() == "1":
+                slog("DONE", "worker exit — no more google accounts to claim")
+                break
 
             try:
                 if args.count == 0 or current_round < args.count:
