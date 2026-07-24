@@ -5,21 +5,23 @@ Automated **xAI / Grok** account registration farm: signup → SSO → **Grok Bu
 Default browser engine: **Camoufox** (anti-detect Firefox). Optional **Chromium** (Playwright) fallback.
 
 ```text
-email (IMAP catch-all  |  mailer.exzork.me API)
-  → register (browser full UI  |  hybrid: short browser + protocol HTTP)
-  → SSO cookies (wrapper → session materialize if needed)
-  → SAVE accounts/ (email + password + status=created)  +  sso/*.txt (cookie only)
-  → ACTIVATE grok.com (SSO session — replaces idle bot-hygiene sleep)
-  → OAuth PKCE referrer=grok-build  (Camoufox)
-      · token exchange prefers Playwright browser context (less invalid_grant)
-      · Chromium default: device SSO (skip :56121 lock)
-      · device fallback fail-fast if PKCE dies
-  → PROBE cli-chat-proxy (inject only if USABLE)
-  → PUSH 9router grok-cli  →  accounts status=injected
-  → on fail: accounts status=failed_oauth | failed_probe | failed_push
+identity:
+  browser/hybrid → email (IMAP catch-all | exzork API)
+  google         → accounts/google_pass.txt (email:password inventory)
+
+  → register (browser | hybrid | google OIDC)
+  → SSO cookies (+ sso/*.txt)
+  → ACTIVATE grok.com + bot-hygiene settle (post_signup_settle_sec, default 12s)
+  → OAuth PKCE referrer=grok-build  (Camoufox; Chromium often device SSO)
+  → PROBE cli-chat-proxy grok-4.5
+  → PUSH 9router grok-cli
+      · USABLE (200)     → isActive=ON
+      · 402 / 403 / other → isActive=OFF + testStatus re-probe-ready
+      · 400 only          → no inject
+  → accounts.jsonl AFTER probe (google) / after create then update (browser|hybrid)
 ```
 
-> x.ai rejects common disposable mail domains. Use your **own catch-all domain**.
+> x.ai rejects common disposable mail domains. For **browser/hybrid** use your **own catch-all**. For **google** mode you only need a Google inventory file.
 
 **Research / personal use only.** Respect site ToS and local law.
 
@@ -30,17 +32,16 @@ email (IMAP catch-all  |  mailer.exzork.me API)
 | Area | Notes |
 |------|--------|
 | **Engines** | Camoufox (default) · Playwright Chromium fallback |
-| **Register modes** | `browser` full UI · `hybrid` (castle harvest + protocol HTTP) |
-| **Mail** | IMAP Gmail catch-all **or** [exzork](https://mailer.exzork.me/) API (wildcard subdomains) · humanized local-parts |
-| **Password** | **Fixed** for all accounts via `account.password` (not random) · env `GROK_ACCOUNT_PASSWORD` |
-| **Account ledger** | `accounts/accounts.jsonl` (email/pass + pipeline **status**) · `accounts/email_pass.txt` |
-| **OAuth** | Browser **PKCE** `referrer=grok-build` · exchange via **browser context** first · device SSO fallback |
-| **Device OAuth** | HTTP device flow: approve `user_code` + `action=allow` · no empty `principal_id` · fail-fast RL |
-| **Inject policy** | `usable` — chat probe **200** only; **402/403 DENIED never inject** |
+| **Register modes** | `browser` · `hybrid` · **`google`** (OIDC from inventory file) |
+| **Mail** | IMAP catch-all **or** [exzork](https://mailer.exzork.me/) · humanized locals (**browser/hybrid only**) |
+| **Google inventory** | `accounts/google_pass.txt` · multi-worker claim · inventory empty → **workers stop cleanly** |
+| **Password** | Fixed signup password via `account.password` (browser/hybrid) · Google mode uses inventory password |
+| **Account ledger** | `accounts/accounts.jsonl` + `email_pass.txt` · **google: write after probe** (not at signup) |
+| **OAuth** | Browser **PKCE** `referrer=grok-build` · device SSO fallback · activate + **12s bot hygiene** |
+| **Browser reset** | `browser.reset=hard\|soft` · google defaults **hard** (fresh profile per account) |
+| **Inject policy** | `usable`: **200 → ON**; **402/403 → OFF** (`quota_exhausted` / `permission_denied` for 9router re-probe); **400 → skip** |
 | **Proxy** | Pool file, `per_account` / `per_worker`, health check, retry → direct |
-| **Asset block** | Optional third-party font/media block (bandwidth) |
 | **Farm** | Multi-worker pool · unlimited mode · Textual TUI |
-| **Display** | `headless` (Linux) · `offscreen` (Mac) · `virtual` (Xvfb) · `headed` |
 
 ---
 
@@ -220,7 +221,8 @@ cp config.example.json config.json
     "imap_port": 993,
     "local_style": "human"
   },
-  "browser": { "engine": "camoufox" },
+  "browser": { "engine": "camoufox", "reset": "hard" },
+  "google": { "accounts_file": "accounts/google_pass.txt" },
   "account": {
     "password": "Nfarm!a7#GrokBuild26"
   },
@@ -233,7 +235,7 @@ cp config.example.json config.json
     "oauth_referrer": "grok-build",
     "activate_grok_com": true,
     "activate_timeout_sec": 45,
-    "post_signup_settle_sec": 0,
+    "post_signup_settle_sec": 12,
     "oauth_gap_sec": 8,
     "chat_probe_off_critical": true,
     "inject_policy": "usable",
@@ -250,11 +252,11 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 
 | Field | Description |
 |-------|-------------|
-| `register_mode` | `browser` (full UI) · `hybrid` (protocol after short harvest) · `google` (Google OIDC from `accounts/google_pass.txt`). Default if unset: **browser**. Env: `GROK_REGISTER_MODE`. |
-| `google.accounts_file` | Inventory for `register_mode=google` (`email:password` per line). Env: `GROK_GOOGLE_ACCOUNTS`. |
-| `account.password` | **Fixed password for every farmed account** (not random). Env: `GROK_ACCOUNT_PASSWORD`. |
+| `register_mode` | `browser` · `hybrid` · `google`. Env: `GROK_REGISTER_MODE`. |
+| `google.accounts_file` | Inventory for google mode (`email:password` per line). Env: `GROK_GOOGLE_ACCOUNTS`. |
+| `account.password` | Fixed password for **browser/hybrid** signup. Env: `GROK_ACCOUNT_PASSWORD`. |
 | `pool.concurrent` / `-c` | Parallel workers (browsers). |
-| `pool.count` / `-n` | Total accounts (`0` = unlimited). |
+| `pool.count` / `-n` | Total accounts (`0` = unlimited until inventory empty in google mode). |
 | `pool.display` | `headless` · `offscreen` · `virtual` · `headed`. |
 | `pool.proxy_file` | Path to proxy list. |
 | `pool.proxy_mode` | `per_account` (rotate) · `per_worker` (sticky). |
@@ -263,14 +265,15 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `pool.proxy_fallback_direct` | After proxy fails → try **direct** (default true). |
 | `pool.block_assets` | Abort third-party font/media (`GROK_BLOCK_ASSETS`). |
 | `browser.engine` | `camoufox` (default) · `chromium`. |
-| `grok_cli.activate_grok_com` | Visit **grok.com** with SSO before OAuth (default **true**). Replaces idle bot-hygiene sleep; helps free-tier / chat activation. |
+| `browser.reset` | `hard` (kill + fresh profile per account) · `soft` (reuse process). **Google defaults hard.** Env: `GROK_BROWSER_RESET`. |
+| `grok_cli.activate_grok_com` | Visit **grok.com** with SSO before OAuth (default **true**). |
 | `grok_cli.activate_timeout_sec` | Max wait for grok.com ready (default 45). |
-| `grok_cli.post_signup_settle_sec` | Extra idle **after** activate (default **0**). Legacy 12s sleep only if activate is off. |
+| `grok_cli.post_signup_settle_sec` | **Bot hygiene idle after activate** (default **12**). Set `0` to skip. |
 | `grok_cli.oauth_gap_sec` | Min seconds between OAuth mints (default 8). |
 | `grok_cli.chat_probe_off_critical` | Soft-reset browser before HTTP probe (default true). |
-| `grok_cli.inject_policy` | `usable` · `jwt_clean` · `all`. |
-| `grok_cli.oauth_mode` | `auto` (PKCE on Camoufox, device on Chromium) · `pkce` · `device`. Force Chromium PKCE: `GROK_FORCE_CHROMIUM_PKCE=1`. |
-| `grok_cli.oauth_referrer` | `grok-build` (default, 9router Build) · `cli-proxy-api` (free CLI style). See OAuth referrer section. |
+| `grok_cli.inject_policy` | `usable` (default) · `jwt_clean` · `all`. See inject table below. |
+| `grok_cli.oauth_mode` | `auto` · `pkce` · `device`. Force Chromium PKCE: `GROK_FORCE_CHROMIUM_PKCE=1`. |
+| `grok_cli.oauth_referrer` | `grok-build` (default) · `cli-proxy-api`. |
 
 ---
 
@@ -281,9 +284,10 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `GROK_BROWSER_ENGINE` | `camoufox` | `camoufox` \| `chromium` |
 | `GROK_DISPLAY` / `GROK_HEADLESS` | platform | Display mode |
 | `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` \| `google` |
-| `GROK_GOOGLE_ACCOUNTS` | `accounts/google_pass.txt` | Google inventory path when mode=google |
+| `GROK_GOOGLE_ACCOUNTS` | `accounts/google_pass.txt` | Google inventory path |
 | `GROK_GOOGLE_FORCE` | off | Re-claim google emails even if ledger status terminal |
-| `GROK_ACCOUNT_PASSWORD` | config `account.password` | Fixed signup password for all accounts |
+| `GROK_BROWSER_RESET` | soft / hard for google | `hard` = full relaunch per account · `soft` = reuse process |
+| `GROK_ACCOUNT_PASSWORD` | config `account.password` | Fixed signup password (browser/hybrid) |
 | `GROK_BLOCK_ASSETS` | `1` | Font/media asset block |
 | `GROK_PROXY_RETRIES` | `3` | Proxy tries per account |
 | `GROK_PROXY_FALLBACK_DIRECT` | `1` | Fall back to direct |
@@ -440,7 +444,7 @@ Turnstile on Camoufox hybrid: native poll + inject widget (not Drission shadow c
 
 ### Google provider (`register_mode=google`)
 
-Pre-seeded **Google** accounts (not catch-all mail). Inventory file:
+Pre-seeded **Google** accounts (not catch-all mail). Inventory:
 
 ```text
 # accounts/google_pass.txt
@@ -451,34 +455,69 @@ user2@clumo.my.id:secret2
 ```json
 {
   "register_mode": "google",
+  "browser": { "engine": "camoufox", "reset": "hard" },
   "google": { "accounts_file": "accounts/google_pass.txt" }
 }
 ```
 
 ```bash
-# one-shot (TUI / pool)
-GROK_REGISTER_MODE=google .venv/bin/python farm_tui.py -n 5 -c 1 --headed
+# farm (headed recommended for Google UI)
+.venv/bin/python farm_tui.py -n 0 -c 2 --headed   # n=0 unlimited until inventory empty
 # inventory stats
 .venv/bin/python google_signup.py --stats
 ```
 
-Flow: **sign-up** → **Continue with Google** → email/password → consent (**Lanjutkan** / Continue) → `/exchange-token` → `/account` → SSO → activate → OAuth → probe → 9router.
+**Flow**
 
-- Multi-worker safe claim (file lock + `accounts.jsonl` status).
-- Skips emails already `created` / `injected` / `failed_*` unless `GROK_GOOGLE_FORCE=1`.
-- Hard Google challenges (2FA, captcha, “browser not secure”) fail that account (`failed_login`) — no silent email/OTP fallback.
-- Live path verified: chat probe `grok-4.5` usable + 9router inject.
+1. Claim next free line from inventory (multi-worker lock)
+2. `accounts.x.ai/sign-up` → **Continue with Google**
+3. Email → password → multi-step consent (Workspace **I understand** / **Lanjutkan** / Allow)
+4. Wait OIDC **`exchange-token`** finish (do not interrupt redirect)
+5. SSO → activate grok.com → bot hygiene settle → OAuth → probe → 9router
+
+**Claim / ledger**
+
+| File | Role |
+|------|------|
+| `accounts/google_pass.txt` | Inventory (`email:password`) |
+| `accounts/.google_claim_live.jsonl` | In-flight claims only (not final ledger) |
+| `accounts/accounts.jsonl` | Written **after probe/push** with final status |
+| `accounts/email_pass.txt` | Appended with password when ledger row is written |
+
+- Skips emails already in jsonl with terminal status (`injected`, `failed_*`, …) unless `GROK_GOOGLE_FORCE=1`.
+- Login fail **before** probe → release live claim (retryable); **no** jsonl row yet.
+- **Inventory empty** → worker exits cleanly (`DONE google inventory exhausted`) — **not** counted as ✗ fail. All workers empty ⇒ farm finished.
+
+**Consent / challenges**
+
+- Multi-step: scroll → `#gaplustosNext` / “I understand” → Allow / Lanjutkan.
+- 2FA, captcha, “browser not secure” → that account fails (no email/OTP fallback).
 
 ---
 
 ## Pipeline (per account)
 
-1. **Register** — `browser` / `hybrid` / `google` → SSO  
-2. **SAVE** — `sso/*.txt` (cookie) + `accounts/` (`status=created`, email + password)  
-3. **ACTIVATE** — open **grok.com** with SSO (ToS / first session). Replaces idle 12s “bot hygiene”.  
-4. **CONVERT** — PKCE `oauth_referrer` (default `grok-build`) on live session; Chromium prefers device SSO; device fallback fail-fast  
-5. **PROBE** — `cli-chat-proxy` model `grok-4.5` (default off critical path)  
-6. **PUSH** — only if **USABLE** (`inject_policy=usable`) → `status=injected`
+1. **Register** — `browser` / `hybrid` / `google` → SSO (+ `sso/*.txt`)  
+2. **Ledger (browser/hybrid)** — `accounts.jsonl` `status=created` early; status updated after OAuth/probe  
+   **Ledger (google)** — **no** jsonl until after probe  
+3. **ACTIVATE** — open **grok.com** with SSO  
+4. **SETTLE** — bot hygiene idle `post_signup_settle_sec` (default **12s**)  
+5. **CONVERT** — PKCE `oauth_referrer` (default `grok-build`); device fallback  
+6. **PROBE** — `cli-chat-proxy` `grok-4.5`  
+7. **PUSH** — 9router (see inject table) · google jsonl written here  
+
+### Inject policy (`inject_policy=usable`)
+
+| Probe HTTP | 9router | `testStatus` (for re-probe) | `accounts.status` |
+|------------|---------|-------------------------------|-------------------|
+| **200** USABLE | inject **ON** (`isActive=true`) | `active` | `injected` |
+| **402** | inject **OFF** | **`quota_exhausted`** + PSD `quotaExhausted` | `injected` (off) |
+| **403** | inject **OFF** | **`permission_denied`** + PSD `permissionDenied` | `injected` (off) |
+| other soft fail | inject **OFF** | **`unavailable`** | `injected` (off) |
+| **400** only | **no inject** | — | `failed_probe` |
+| OAuth / Access denied / no token | **no inject** | — | `failed_oauth` |
+
+402/403 rows stay in 9router for **re-probe** (must not use plain `inactive`, which looks like manual off).
 
 ### OAuth `referrer` — `grok-build` vs `cli-proxy-api`
 
@@ -500,16 +539,9 @@ authorize?…&client_id=b1a00492-…&referrer=cli-proxy-api →  JWT often has r
 - Only switch to **`cli-proxy-api`** if you intentionally want sgb-style free CLI tokens (and turn off hard referrer enforce if needed).  
 - Do **not** mix referrers in one 9router pool if you enforce JWT referrer.
 
-| Probe | Meaning | `accounts.status` |
-|-------|---------|-------------------|
-| **200** + reply | USABLE → inject 9router | `injected` |
-| **402** spending-limit | Token may be OK later; free credits / soft limit — **not** injected | `failed_probe` |
-| **403** | Chat denied — not injected (sometimes recovers later) | `failed_probe` |
-| OAuth / `invalid_grant` / Access denied | No Build token or xAI denied grant | `failed_oauth` |
-
 Proxy failures during convert may retry **direct** (`proxy_fallback_direct`).
 
-> **402/403 are not always permanent.** Free-tier quota and soft denials can clear after hours. Prefer **reprobe** tokens that already have OAuth over mass-reconvert of dead SSO files.
+> **402/403 are not always permanent.** Free-tier quota and soft denials can clear after hours. Prefer **9router re-probe** of OFF accounts over mass-reconvert.
 
 ---
 
@@ -517,11 +549,13 @@ Proxy failures during convert may retry **direct** (`proxy_fallback_direct`).
 
 ```text
 sso/                          # OUTPUT ONLY — farm never reads these back
-  sso_<timestamp>_w<N>.txt    # one cookie-header line per created account
+  sso_<timestamp>_w<N>.txt    # cookie-header lines
 
 accounts/                     # gitignored (secrets)
-  accounts.jsonl              # structured ledger: email, password, status, sso_cookie, …
-  email_pass.txt              # email:password (all created accounts)
+  google_pass.txt             # google inventory (input)
+  .google_claim_live.jsonl    # in-flight claims only (google mode)
+  accounts.jsonl              # ledger: email, password, status, probe, …
+  email_pass.txt              # email:password dump
 
 logs/
   run_<timestamp>_w<N>.log
@@ -531,20 +565,23 @@ logs/
 
 | Path | Written when | Read by farm? | Contents |
 |------|----------------|---------------|----------|
-| `sso/*.txt` | After SSO cookies exist | **No** (output only; offline reconvert tools may read) | Cookie header only |
-| `accounts/accounts.jsonl` | After SSO + **updated** after OAuth/probe/push | No | email, password, **status**, SSO snapshot, errors |
-| `accounts/email_pass.txt` | After create | No | `email:password` for every created account |
+| `sso/*.txt` | After SSO cookies | **No** (output / offline tools) | Cookie header |
+| `accounts/google_pass.txt` | You edit | **Yes** (google mode inventory) | `email:password` |
+| `accounts/.google_claim_live.jsonl` | On claim → cleared after ledger write | Yes (multi-worker) | In-flight only |
+| `accounts/accounts.jsonl` | **browser/hybrid:** after create, then update · **google:** **after probe** | Skip terminal emails for google claim | Full ledger |
+| `accounts/email_pass.txt` | With ledger write | No | `email:password` |
 
 ### Account status values (`accounts.jsonl`)
 
 | `status` | Meaning |
 |----------|---------|
-| `created` | Register + SSO OK (has email/password/cookie) |
-| `oauth_ok` | Build OAuth tokens minted (intermediate) |
-| `injected` | Chat usable + pushed to 9router (**full success**) |
+| `created` | browser/hybrid: register + SSO OK |
+| `oauth_ok` | Build OAuth minted (intermediate, browser/hybrid) |
+| `injected` | Pushed to 9router (ON if usable; **OFF** still `injected` for 402/403 with `inject_active=false`) |
 | `failed_oauth` | SSO OK but PKCE/device OAuth failed |
-| `failed_probe` | OAuth OK but chat 402/403/denied (candidate for later reprobe) |
+| `failed_probe` | OAuth OK but probe **400** (or hard probe fail without inject) |
 | `failed_push` | Usable but 9router import failed |
+| `failed_login` | google: signup/SSO failed before OAuth (only if ledger written; live claim released) |
 
 ```bash
 # full success
