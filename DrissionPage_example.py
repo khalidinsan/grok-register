@@ -3885,7 +3885,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
         off_crit = _chat_probe_off_critical(gcli)
         if off_crit:
-            slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE  (PROBE deferred off critical)")
+            slog("FLOW", "⑥ ACTIVATE grok.com → ⑦ OAuth PKCE  (PROBE deferred off critical)")
             tokens = convert_grok_cli_tokens(result)
             if tokens is not None:
                 _sync_account_status_from_result(
@@ -3909,7 +3909,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                 # convert returned None (disabled) — keep created
                 pass
         else:
-            slog("FLOW", "⑥ SETTLE → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
+            slog("FLOW", "⑥ ACTIVATE grok.com → ⑦ OAuth PKCE → ⑧ PROBE → ⑨ PUSH")
             convert_and_push_grok_cli(result)
         _sync_account_status_from_result(
             email, status=ACCOUNT_STATUS_INJECTED, result=result
@@ -4047,7 +4047,15 @@ def _inject_sso_cookies_to_page(sso: str, sso_rw: str = "", cf_header: str = "")
         ctx = getattr(raw, "context", None)
         if ctx is not None:
             cookies = []
-            for domain in (".x.ai", "accounts.x.ai", "auth.x.ai", ".accounts.x.ai"):
+            # Include .grok.com — activate_grok_com needs SSO visible on grok.com
+            for domain in (
+                ".x.ai",
+                "accounts.x.ai",
+                "auth.x.ai",
+                ".accounts.x.ai",
+                ".grok.com",
+                "grok.com",
+            ):
                 cookies.append(
                     {
                         "name": "sso",
@@ -4078,17 +4086,18 @@ def _inject_sso_cookies_to_page(sso: str, sso_rw: str = "", cf_header: str = "")
                 k, v = k.strip(), v.strip()
                 if not k or not v:
                     continue
-                cookies.append(
-                    {
-                        "name": k,
-                        "value": v,
-                        "domain": ".x.ai",
-                        "path": "/",
-                        "secure": True,
-                        "httpOnly": False,
-                        "sameSite": "Lax",
-                    }
-                )
+                for domain in (".x.ai", ".grok.com"):
+                    cookies.append(
+                        {
+                            "name": k,
+                            "value": v,
+                            "domain": domain,
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": False,
+                            "sameSite": "Lax",
+                        }
+                    )
             is_async = bool(getattr(page, "_async", False) or getattr(page, "_loop", None))
             loop = getattr(page, "_loop", None)
             if is_async and loop is not None:
@@ -4115,6 +4124,267 @@ def _inject_sso_cookies_to_page(sso: str, sso_rw: str = "", cf_header: str = "")
         )
     except Exception:
         pass
+
+
+def _page_current_url() -> str:
+    """Best-effort current URL (Camoufox PwPageAdapter + Drission)."""
+    global page
+    if page is None:
+        return ""
+    try:
+        u = getattr(page, "url", None)
+        if callable(u):
+            u = u()
+        if u:
+            return str(u)
+    except Exception:
+        pass
+    try:
+        # Drission-style body (NOT () => … — PwPageAdapter wraps that and never calls it)
+        u = page.run_js("return location.href;")
+        if u:
+            return str(u)
+    except Exception:
+        pass
+    return ""
+
+
+def activate_grok_com(result: dict | None = None, *, timeout_sec: float = 45.0) -> bool:
+    """
+    Visit grok.com with the signup SSO session so free-tier / chat access
+    actually activates (port of grok-sgb activate_grok_com).
+
+    Replaces idle post-signup sleep ("bot hygiene"): sleeping does little;
+    a real grok.com session + ToS often clears later 402/403 on cli-chat-proxy.
+
+    Best-effort: never raises. Returns True if grok.com looked ready.
+
+    NOTE: page.run_js on Camoufox expects a JS *body* (uses `return` / `arguments`),
+    not a `() => {}` IIFE — those never execute under PwPageAdapter wrapping.
+    """
+    global page, browser
+    result = result if isinstance(result, dict) else {}
+    email = str(result.get("email") or "").strip()
+    password = str(result.get("password") or "").strip() or _account_password_from_config()
+
+    slog("ACTIVATE", f"open https://grok.com/  email={email or '-'} (replace idle settle)")
+    try:
+        refresh_active_page()
+    except Exception:
+        pass
+
+    # Ensure SSO cookies are on the browser before hitting grok.com
+    try:
+        sso = str(result.get("sso_token") or result.get("sso") or "").strip()
+        if sso.lower().startswith("sso="):
+            sso = sso[4:].split(";")[0].strip()
+        sso_rw = str(result.get("sso_rw") or sso).strip()
+        cf = str(result.get("cloudflare_cookies") or "").strip()
+        if not sso:
+            try:
+                wanted, _ = _collect_grok_session_cookies()
+                sso = str(wanted.get("sso") or "").strip()
+                sso_rw = str(wanted.get("sso-rw") or sso).strip()
+            except Exception:
+                pass
+        if sso and page is not None:
+            _inject_sso_cookies_to_page(sso, sso_rw, cf)
+            slog("ACTIVATE", f"SSO cookies injected (len={len(sso)}) incl .grok.com")
+    except Exception as e:
+        slog("ACTIVATE", f"cookie inject warn: {e}", level="warn")
+
+    if page is None:
+        try:
+            start_browser()
+        except Exception as e:
+            slog("ACTIVATE", f"no browser: {e}", level="warn")
+            return False
+
+    try:
+        page.get("https://grok.com/")
+    except Exception as e:
+        slog("ACTIVATE", f"goto grok.com warn: {e}", level="warn")
+        try:
+            page.get("https://grok.com/")
+        except Exception as e2:
+            slog("ACTIVATE", f"goto grok.com failed: {e2}", level="warn")
+
+    time.sleep(1.0)
+    cur0 = _page_current_url()
+    slog("ACTIVATE", f"after goto  url={(cur0 or '-')[:120]}")
+
+    ready = False
+    last_snap = ""
+    deadline = time.time() + max(15.0, float(timeout_sec or 45.0))
+    while time.time() < deadline:
+        try:
+            # Body style (not arrow fn) so Camoufox PwPageAdapter executes it
+            info = page.run_js(
+                r"""
+const title = (document.title || '').toLowerCase();
+const body = ((document.body && document.body.innerText) || '').slice(0, 900).toLowerCase();
+const url = (location.href || '').toLowerCase();
+const just =
+  title.includes('just a moment')
+  || body.includes('just a moment')
+  || body.includes('checking your browser')
+  || body.includes('enable javascript and cookies');
+const hasUi = !!(
+  document.querySelector('textarea, [contenteditable="true"], nav, main, [data-testid]')
+);
+const hasChat = !!(document.querySelector('textarea, [contenteditable="true"]'));
+const hasSignIn = /sign in|log in|login|get started/.test(body);
+return {
+  url: url,
+  just: !!just,
+  hasUi: !!hasUi,
+  hasChat: !!hasChat,
+  hasSignIn: !!hasSignIn,
+  ready: url.includes('grok.com') && !just && (hasUi || body.includes('grok') || hasChat),
+};
+"""
+            )
+            if not isinstance(info, dict):
+                # Fallback: URL property only
+                u = _page_current_url().lower()
+                info = {
+                    "url": u,
+                    "just": False,
+                    "hasUi": "grok.com" in u,
+                    "ready": "grok.com" in u and "challenge" not in u,
+                }
+            snap = (
+                f"url={str(info.get('url') or '')[:80]} "
+                f"just={info.get('just')} hasUi={info.get('hasUi')} "
+                f"chat={info.get('hasChat')} signIn={info.get('hasSignIn')}"
+            )
+            if snap != last_snap:
+                slog("ACTIVATE", f"poll  {snap}")
+                last_snap = snap
+            if info.get("ready"):
+                ready = True
+                break
+            # CF challenge: keep waiting
+            if info.get("just"):
+                time.sleep(0.8)
+                continue
+        except Exception as e:
+            slog("ACTIVATE", f"poll warn: {e}", level="warn")
+        time.sleep(0.5)
+
+    if ready:
+        slog("ACTIVATE", "grok.com ready")
+    else:
+        slog(
+            "ACTIVATE",
+            f"grok.com not fully ready — continue best-effort  url={(_page_current_url() or '-')[:100]}",
+            level="warn",
+        )
+
+    try:
+        _dismiss_cookie_banner()
+    except Exception:
+        pass
+
+    # If still on marketing / sign-in wall, try Sign in once
+    try:
+        needs_login = page.run_js(
+            r"""
+const body = ((document.body && document.body.innerText) || '').toLowerCase();
+const hasChat = !!(document.querySelector('textarea, [contenteditable="true"]'));
+const hasSignIn = /sign in|log in|login|get started/.test(body);
+return !!(hasSignIn && !hasChat);
+"""
+        )
+    except Exception:
+        needs_login = False
+
+    if needs_login:
+        slog("ACTIVATE", "sign-in wall — try click Sign in")
+        try:
+            clicked = page.run_js(
+                r"""
+const want = /^(sign in|log in|login|get started)$/i;
+const ban = /google|apple|github|microsoft|continue with/i;
+for (const b of document.querySelectorAll('button, a, [role="button"]')) {
+  const t = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!t || ban.test(t)) continue;
+  if (!want.test(t)) continue;
+  const r = b.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) { b.click(); return t; }
+}
+return '';
+"""
+            )
+            if clicked:
+                slog("ACTIVATE", f"clicked {clicked!r}")
+            time.sleep(1.5)
+        except Exception as e:
+            slog("ACTIVATE", f"sign-in click warn: {e}", level="warn")
+
+        cur = _page_current_url()
+        if "accounts.x.ai" in cur or "auth.x.ai" in cur:
+            slog("ACTIVATE", f"on auth host — fill login if form present  url={cur[:80]}")
+            try:
+                page.run_js(
+                    r"""
+const email = arguments[0];
+const password = arguments[1];
+const em = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="username"]');
+const pw = document.querySelector('input[type="password"], input[name="password"]');
+const set = (el, v) => {
+  if (!el || !v) return;
+  el.focus();
+  el.value = v;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+};
+if (em && email) set(em, email);
+if (pw && password) set(pw, password);
+const btns = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')];
+for (const b of btns) {
+  const t = (b.innerText || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (t === 'next' || t === 'continue' || t === 'log in' || t === 'login' || t === 'sign in') {
+    b.click();
+    return t;
+  }
+}
+return '';
+""",
+                    email,
+                    password,
+                )
+                time.sleep(2.0)
+                try:
+                    page.get("https://grok.com/")
+                except Exception:
+                    pass
+                time.sleep(1.5)
+            except Exception as e:
+                slog("ACTIVATE", f"login branch warn: {e}", level="warn")
+
+    # ToS / Accept if shown
+    try:
+        page.run_js(
+            r"""
+const want = /^(accept|agree|i agree|continue|ok|got it|start|i understand)$/i;
+const ban = /deny|cancel|decline|no thanks|google|apple/i;
+for (const b of document.querySelectorAll('button, [role="button"], a')) {
+  const t = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!t || ban.test(t)) continue;
+  if (!want.test(t)) continue;
+  const r = b.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) { b.click(); return t; }
+}
+return '';
+"""
+        )
+    except Exception:
+        pass
+
+    final = _page_current_url()
+    slog("ACTIVATE", f"done  ready={ready}  url={(final or '-')[:120]}")
+    return ready
 
 
 def prepare_page_for_pkce(result: dict | None = None) -> Any:
@@ -4205,11 +4475,39 @@ def convert_grok_cli_tokens(result: dict):
 
     oauth_mode = str(gcli.get("oauth_mode") or "auto").strip().lower()
     referrer = str(gcli.get("oauth_referrer") or "grok-build").strip() or "grok-build"
+    # Legacy idle settle (seconds). Default 0 — replaced by activate_grok.com.
+    # Set post_signup_settle_sec > 0 only if you still want extra sleep AFTER activate.
     try:
-        settle_s = float(gcli.get("post_signup_settle_sec") or 12)
+        settle_s = float(gcli.get("post_signup_settle_sec") or 0)
     except (TypeError, ValueError):
-        settle_s = 12.0
-    # Bot hygiene: always honor post_signup_settle_sec (default 12s), including hybrid
+        settle_s = 0.0
+    # activate_grok.com (sgb-style) replaces idle bot-hygiene sleep
+    activate = gcli.get("activate_grok_com")
+    if activate is None:
+        activate = True
+    activate = bool(activate)
+    if (os.environ.get("GROK_ACTIVATE_GROK_COM") or "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        activate = False
+    elif (os.environ.get("GROK_ACTIVATE_GROK_COM") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        activate = True
+    try:
+        activate_timeout = float(
+            gcli.get("activate_timeout_sec")
+            or os.environ.get("GROK_ACTIVATE_TIMEOUT_SEC")
+            or 45
+        )
+    except (TypeError, ValueError):
+        activate_timeout = 45.0
     inject_policy = _gcli_inject_policy(gcli)
     reject_bot = bool(gcli.get("jwt_reject_bot_flag") or inject_policy == "jwt_clean")
     enforce_ref = gcli.get("jwt_enforce_referrer")
@@ -4249,11 +4547,21 @@ def convert_grok_cli_tokens(result: dict):
     gap_sec = _oauth_gap_sec(gcli)
     _wait_oauth_gap(gap_sec)
 
-    # ── SETTLE (hygiene before OAuth — flash anti-bot) ──────────────
-    if settle_s > 0:
-        slog("SETTLE", f"post-signup idle {settle_s:.0f}s before OAuth (bot hygiene)")
+    # ── ACTIVATE (replaces idle post-signup settle / bot hygiene) ──
+    # Visit grok.com with SSO so free chat/API is provisioned before OAuth.
+    if activate:
+        try:
+            activate_grok_com(result, timeout_sec=activate_timeout)
+        except Exception as e:
+            slog("ACTIVATE", f"failed (non-fatal): {e}", level="warn")
+    elif settle_s > 0:
+        # Legacy path only when activate disabled
+        slog("SETTLE", f"post-signup idle {settle_s:.0f}s before OAuth (legacy bot hygiene)")
         time.sleep(settle_s)
         slog("SETTLE", "done")
+    if activate and settle_s > 0:
+        slog("SETTLE", f"extra idle {settle_s:.0f}s after activate (post_signup_settle_sec)")
+        time.sleep(settle_s)
 
     # Stabilize page only when we will run browser PKCE
     if use_pkce and (from_hybrid or True):

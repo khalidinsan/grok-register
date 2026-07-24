@@ -9,7 +9,7 @@ email (IMAP catch-all  |  mailer.exzork.me API)
   → register (browser full UI  |  hybrid: short browser + protocol HTTP)
   → SSO cookies (wrapper → session materialize if needed)
   → SAVE accounts/ (email + password + status=created)  +  sso/*.txt (cookie only)
-  → SETTLE (bot hygiene, default 12s)
+  → ACTIVATE grok.com (SSO session — replaces idle bot-hygiene sleep)
   → OAuth PKCE referrer=grok-build  (Camoufox)
       · token exchange prefers Playwright browser context (less invalid_grant)
       · Chromium default: device SSO (skip :56121 lock)
@@ -231,7 +231,9 @@ cp config.example.json config.json
     "data_dir": "~/.9router",
     "oauth_mode": "auto",
     "oauth_referrer": "grok-build",
-    "post_signup_settle_sec": 12,
+    "activate_grok_com": true,
+    "activate_timeout_sec": 45,
+    "post_signup_settle_sec": 0,
     "oauth_gap_sec": 8,
     "chat_probe_off_critical": true,
     "inject_policy": "usable",
@@ -260,11 +262,14 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `pool.proxy_fallback_direct` | After proxy fails → try **direct** (default true). |
 | `pool.block_assets` | Abort third-party font/media (`GROK_BLOCK_ASSETS`). |
 | `browser.engine` | `camoufox` (default) · `chromium`. |
-| `grok_cli.post_signup_settle_sec` | **Bot hygiene** idle before OAuth (default **12**). |
+| `grok_cli.activate_grok_com` | Visit **grok.com** with SSO before OAuth (default **true**). Replaces idle bot-hygiene sleep; helps free-tier / chat activation. |
+| `grok_cli.activate_timeout_sec` | Max wait for grok.com ready (default 45). |
+| `grok_cli.post_signup_settle_sec` | Extra idle **after** activate (default **0**). Legacy 12s sleep only if activate is off. |
 | `grok_cli.oauth_gap_sec` | Min seconds between OAuth mints (default 8). |
 | `grok_cli.chat_probe_off_critical` | Soft-reset browser before HTTP probe (default true). |
 | `grok_cli.inject_policy` | `usable` · `jwt_clean` · `all`. |
 | `grok_cli.oauth_mode` | `auto` (PKCE on Camoufox, device on Chromium) · `pkce` · `device`. Force Chromium PKCE: `GROK_FORCE_CHROMIUM_PKCE=1`. |
+| `grok_cli.oauth_referrer` | `grok-build` (default, 9router Build) · `cli-proxy-api` (free CLI style). See OAuth referrer section. |
 
 ---
 
@@ -280,6 +285,8 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `GROK_PROXY_RETRIES` | `3` | Proxy tries per account |
 | `GROK_PROXY_FALLBACK_DIRECT` | `1` | Fall back to direct |
 | `GROK_OAUTH_GAP_SEC` | `8` | Gap between converts |
+| `GROK_ACTIVATE_GROK_COM` | `1` | Visit grok.com before OAuth (`0` = disable) |
+| `GROK_ACTIVATE_TIMEOUT_SEC` | `45` | Activate wait cap |
 | `GROK_CHAT_PROBE_OFF_CRITICAL` | `1` | Defer probe after OAuth |
 | `GROK_DEVICE_RL_MAX_TRIES` | `2` | Device OAuth rate-limit tries |
 | `GROK_DEVICE_POLL_TIMEOUT_SEC` | `45` | Device token poll cap |
@@ -433,10 +440,30 @@ Turnstile on Camoufox hybrid: native poll + inject widget (not Drission shadow c
 
 1. **Register** — `browser` or `hybrid` → SSO  
 2. **SAVE** — `sso/*.txt` (cookie) + `accounts/` (`status=created`, email + password)  
-3. **SETTLE** — `post_signup_settle_sec` (default **12s** bot hygiene)  
-4. **CONVERT** — PKCE `grok-build` on live session (Camoufox); Chromium prefers device SSO; device fallback fail-fast  
+3. **ACTIVATE** — open **grok.com** with SSO (ToS / first session). Replaces idle 12s “bot hygiene”.  
+4. **CONVERT** — PKCE `oauth_referrer` (default `grok-build`) on live session; Chromium prefers device SSO; device fallback fail-fast  
 5. **PROBE** — `cli-chat-proxy` model `grok-4.5` (default off critical path)  
 6. **PUSH** — only if **USABLE** (`inject_policy=usable`) → `status=injected`
+
+### OAuth `referrer` — `grok-build` vs `cli-proxy-api`
+
+Both use the **same** xAI OAuth client id (`b1a00492-…` Grok CLI). The `referrer=` query on `/oauth2/authorize` tells xAI **which product surface** minted the token. That value is often embedded in the JWT (`referrer` claim) and can affect which APIs / free tiers accept the token.
+
+| `oauth_referrer` | Used by | Intended surface | Notes |
+|------------------|---------|------------------|--------|
+| **`grok-build`** (default here) | This farm → 9router **grok-cli** / Grok Build | Build / shell CLI path | Matches 9router import + `jwt_enforce_referrer` when enabled |
+| **`cli-proxy-api`** | grok-sgb / some free CLI proxies | cli-chat-proxy / free CLI style | Different claim; may work on chat proxy but fail referrer gate for Build |
+
+```text
+authorize?…&client_id=b1a00492-…&referrer=grok-build     →  JWT often has referrer=grok-build
+authorize?…&client_id=b1a00492-…&referrer=cli-proxy-api →  JWT often has referrer=cli-proxy-api
+```
+
+**Practical advice**
+
+- Keep **`grok-build`** if the goal is **9router grok-cli / Grok Build**.  
+- Only switch to **`cli-proxy-api`** if you intentionally want sgb-style free CLI tokens (and turn off hard referrer enforce if needed).  
+- Do **not** mix referrers in one 9router pool if you enforce JWT referrer.
 
 | Probe | Meaning | `accounts.status` |
 |-------|---------|-------------------|
