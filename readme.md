@@ -533,6 +533,26 @@ tail -f logs/run_*_w1.log
 .venv/bin/python sso_to_build.py path/to/sso_line_or_file.txt
 ```
 
+### Login → OAuth (from email:password stock)
+
+For accounts that already exist (no register). Reads `accounts/email_pass.txt` or filters `accounts.jsonl` by status:
+
+```bash
+# batch from email_pass.txt (login → activate → PKCE → probe → inject usable)
+.venv/bin/python login_to_build.py -n 5 -c 1 --headed
+
+# only failed_probe / failed_oauth rows from accounts.jsonl
+.venv/bin/python login_to_build.py --status failed_probe,failed_oauth -n 10 --headless
+
+# single account
+.venv/bin/python login_to_build.py --email you@domain.com --password 'YourPass' --headed
+
+# mint + probe only (no 9router)
+.venv/bin/python login_to_build.py -n 3 --no-inject
+```
+
+Flow: **login accounts.x.ai** → **activate grok.com** → **PKCE `grok-build`** (device fallback) → **chat probe** → **inject if usable** → update `accounts.jsonl` status.
+
 Device flow notes (current code):
 
 - Approve payload: `user_code` + `action=allow` only (empty `principal_id` → `Invalid action`)
