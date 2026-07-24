@@ -111,12 +111,64 @@ def _login_dashboard(base_url: str, password: str, timeout: int = 30) -> str:
     return cookie_header
 
 
+def probe_status_to_9router_flags(probe_status: int, probe_err: str = "") -> Dict[str, Any]:
+    """Map chat probe HTTP status → 9router fields that re-probe candidates expect.
+
+    isGrokCliReprobeCandidate needs testStatus in:
+      quota_exhausted | permission_denied | unavailable
+    and/or PSD quotaExhausted / permissionDenied — NOT plain "inactive".
+    """
+    st = int(probe_status or 0)
+    err = (probe_err or "").strip()
+    err_l = err.lower()
+    if st == 402 or "402" in err_l or "quota" in err_l or "payment" in err_l:
+        return {
+            "test_status": "quota_exhausted",
+            "error_code": 402,
+            "last_error_type": "quota_exhausted",
+            "psd": {
+                "quotaExhausted": True,
+                "permissionDenied": False,
+                "farmInjectOff": True,
+                "farmProbeStatus": st or 402,
+            },
+        }
+    if st == 403 or "403" in err_l or "permission" in err_l or "denied" in err_l:
+        return {
+            "test_status": "permission_denied",
+            "error_code": 403,
+            "last_error_type": "permission_denied",
+            "psd": {
+                "quotaExhausted": False,
+                "permissionDenied": True,
+                "farmInjectOff": True,
+                "farmProbeStatus": st or 403,
+            },
+        }
+    # other soft-fail (network 0, 429, 5xx, …) still OFF but re-probe-able
+    return {
+        "test_status": "unavailable",
+        "error_code": st or None,
+        "last_error_type": "unavailable",
+        "psd": {
+            "farmInjectOff": True,
+            "farmProbeStatus": st,
+        },
+    }
+
+
 def _build_payload(
     tokens: BuildTokens,
     *,
     name: str = "",
     email: str = "",
     display_name: str = "",
+    is_active: bool = True,
+    test_status: str = "",
+    last_error: str = "",
+    error_code: Any = None,
+    last_error_type: str = "",
+    provider_specific_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     email = (email or tokens.email or "").strip()
     name = (name or tokens.name or email or tokens.user_id or "Grok CLI").strip()
@@ -136,7 +188,7 @@ def _build_payload(
     if not display_name:
         display_name = name
 
-    return {
+    payload: Dict[str, Any] = {
         "provider": "grok-cli",
         "accessToken": tokens.access_token,
         "refreshToken": tokens.refresh_token or None,
@@ -148,7 +200,25 @@ def _build_payload(
         "name": name,
         "displayName": display_name,
         "userId": tokens.user_id or None,
+        "isActive": bool(is_active),
     }
+    if test_status:
+        payload["testStatus"] = str(test_status)
+    elif not is_active:
+        # Prefer re-probe-friendly status over plain "inactive" (manual-off lookalike)
+        payload["testStatus"] = "unavailable"
+    if last_error:
+        payload["lastError"] = str(last_error)[:500]
+    if error_code is not None:
+        try:
+            payload["errorCode"] = int(error_code)
+        except (TypeError, ValueError):
+            pass
+    if last_error_type:
+        payload["lastErrorType"] = str(last_error_type)
+    if provider_specific_data:
+        payload["providerSpecificData"] = dict(provider_specific_data)
+    return payload
 
 
 def _jwt_payload(token: str) -> Dict[str, Any]:
@@ -389,6 +459,12 @@ def push_build_tokens_to_9router(
     smoke_bot_flag: bool = True,
     smoke_model: str = DEFAULT_SMOKE_MODEL,
     smoke_timeout_sec: float = DEFAULT_SMOKE_TIMEOUT,
+    is_active: bool = True,
+    test_status: str = "",
+    last_error: str = "",
+    error_code: Any = None,
+    last_error_type: str = "",
+    provider_specific_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create grok-cli connection via 9router HTTP API.
@@ -396,6 +472,9 @@ def push_build_tokens_to_9router(
     Auth priority:
       1. password (dashboard login → Cookie)  — works for external URLs
       2. cli_token / local ~/.9router CLI token — mainly localhost
+
+    is_active=False → import with connection OFF (dashboard inactive). Used when
+    chat probe is 402/403 but OAuth tokens are still valid.
 
     Bot-flag policy (default):
       - no bot_flag_source → import directly
@@ -407,7 +486,16 @@ def push_build_tokens_to_9router(
     """
     base = (base_url or DEFAULT_BASE).rstrip("/")
     payload = _build_payload(
-        tokens, name=name, email=email, display_name=display_name
+        tokens,
+        name=name,
+        email=email,
+        display_name=display_name,
+        is_active=is_active,
+        test_status=test_status,
+        last_error=last_error,
+        error_code=error_code,
+        last_error_type=last_error_type,
+        provider_specific_data=provider_specific_data,
     )
     email_s = payload.get("email") or ""
     name_s = payload.get("name") or ""
@@ -489,7 +577,7 @@ def push_build_tokens_to_9router(
     url = f"{base}/api/providers"
     print(
         f"[*] 9router POST {url} auth={auth_mode} "
-        f"name={name_s} email={email_s}"
+        f"name={name_s} email={email_s} isActive={bool(is_active)}"
     )
     resp = requests.post(url, headers=headers, json=payload, timeout=45)
 
@@ -509,14 +597,62 @@ def push_build_tokens_to_9router(
     data = resp.json() if resp.content else {}
     conn = data.get("connection") or {}
     conn_id = conn.get("id") or ""
+
+    # Fallback: older 9router may ignore isActive/testStatus on create — PATCH
+    need_patch = bool(conn_id) and (
+        (not is_active and conn.get("isActive") is not False)
+        or (
+            not is_active
+            and test_status
+            and str(conn.get("testStatus") or "") != str(test_status)
+        )
+    )
+    if need_patch:
+        try:
+            patch_url = f"{base}/api/providers/{conn_id}"
+            patch_body: Dict[str, Any] = {
+                "isActive": False,
+                # re-probe candidates need quota_exhausted | permission_denied | unavailable
+                "testStatus": test_status or "unavailable",
+            }
+            if last_error:
+                patch_body["lastError"] = str(last_error)[:500]
+            if error_code is not None:
+                try:
+                    patch_body["errorCode"] = int(error_code)
+                except (TypeError, ValueError):
+                    pass
+            if provider_specific_data:
+                patch_body["providerSpecificData"] = dict(provider_specific_data)
+            pr = requests.patch(patch_url, headers=headers, json=patch_body, timeout=30)
+            if pr.status_code in (200, 201):
+                print(f"[*] 9router PATCH isActive=false id={conn_id}", flush=True)
+                try:
+                    pdata = pr.json() if pr.content else {}
+                    if isinstance(pdata, dict) and pdata.get("connection"):
+                        conn = pdata["connection"]
+                except Exception:
+                    conn["isActive"] = False
+            else:
+                print(
+                    f"[*] 9router PATCH isActive warn HTTP {pr.status_code}: "
+                    f"{(pr.text or '')[:200]}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"[*] 9router PATCH isActive warn: {e}", flush=True)
+
+    active_s = "on" if (conn.get("isActive") is not False and is_active) else "off"
     print(
         f"[*] 9router grok-cli imported "
-        f"id={conn_id} name={conn.get('name') or name_s} email={conn.get('email') or email_s}"
+        f"id={conn_id} name={conn.get('name') or name_s} "
+        f"email={conn.get('email') or email_s} active={active_s}"
     )
     out: Dict[str, Any] = {
         "id": conn_id,
         "name": conn.get("name") or name_s,
         "email": conn.get("email") or email_s,
+        "isActive": bool(is_active) if conn.get("isActive") is None else bool(conn.get("isActive")),
         "raw": data,
         "auth_mode": auth_mode,
     }

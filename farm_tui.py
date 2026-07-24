@@ -79,6 +79,8 @@ PHASE_STYLE = {
     "BROWSER": "dim cyan",
     "FLOW": "cyan",
     "EMAIL": "blue",
+    "GOOGLE": "bright_blue",
+    "HYBRID": "blue",
     "OTP": "magenta",
     "PROFILE": "yellow",
     "TURNSTILE": "yellow",
@@ -496,7 +498,7 @@ class PoolRunner:
             or (_full.get("run") or {}).get("register_mode")
             or "browser"
         ).strip().lower()
-        if _rmode not in ("hybrid", "browser"):
+        if _rmode not in ("hybrid", "browser", "google"):
             _rmode = "browser"
         env.setdefault("GROK_REGISTER_MODE", _rmode)
         env.setdefault(

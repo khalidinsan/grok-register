@@ -1173,6 +1173,40 @@ def _is_pw_adapter_browser() -> bool:
     )
 
 
+def _browser_reset_mode() -> str:
+    """soft | hard — env GROK_BROWSER_RESET / config browser.reset.
+
+    hard = full process relaunch (new profile dir, no leftover Google/xAI cookies).
+    soft = clear cookies + about:blank (reuse process).
+
+    Default: hard when register_mode=google (avoids 400 Access denied from stale
+    Google SSO sessions), else soft.
+    """
+    env = (os.environ.get("GROK_BROWSER_RESET") or "").strip().lower()
+    if env in ("hard", "full", "1", "true", "yes", "on"):
+        return "hard"
+    if env in ("soft", "0", "false", "no", "off"):
+        return "soft"
+    try:
+        conf = _load_config()
+    except Exception:
+        conf = {}
+    br = conf.get("browser") if isinstance(conf.get("browser"), dict) else {}
+    raw = str(
+        br.get("reset") or br.get("reset_mode") or conf.get("browser_reset") or ""
+    ).strip().lower()
+    if raw in ("hard", "full"):
+        return "hard"
+    if raw in ("soft",):
+        return "soft"
+    try:
+        if _resolve_register_mode() == "google":
+            return "hard"
+    except Exception:
+        pass
+    return "soft"
+
+
 def soft_reset_browser():
     """
     Reset session for the next account WITHOUT relaunching the process.
@@ -1184,21 +1218,43 @@ def soft_reset_browser():
         return
     try:
         if _is_pw_adapter_browser():
-            # Playwright/Camoufox: clear cookies + blank tab (no Drission get_tabs)
+            # Playwright/Camoufox: wipe context cookies thoroughly
             try:
                 page.clear_cache(session_storage=True, cookies=True)
             except Exception:
                 pass
+            # Extra: raw context.clear_cookies (some adapters miss storage)
+            try:
+                raw = getattr(page, "raw", None) or page
+                ctx = getattr(raw, "context", None)
+                if ctx is not None:
+                    loop = getattr(page, "_loop", None)
+                    is_async = bool(getattr(page, "_async", False) or loop)
+                    if is_async and loop is not None:
+                        loop.run_until_complete(ctx.clear_cookies())
+                    else:
+                        try:
+                            ctx.clear_cookies()
+                        except TypeError:
+                            pass
+            except Exception:
+                pass
             try:
                 page.run_js(
-                    "try{localStorage.clear();sessionStorage.clear();}catch(e){}"
+                    "try{localStorage.clear();sessionStorage.clear();"
+                    "indexedDB&&indexedDB.databases&&indexedDB.databases()"
+                    ".then(ds=>ds.forEach(d=>indexedDB.deleteDatabase(d.name)));"
+                    "}catch(e){}"
                 )
             except Exception:
                 pass
             try:
                 page.get("about:blank")
             except Exception:
-                page = browser.new_tab("about:blank")
+                try:
+                    page = browser.new_tab("about:blank")
+                except Exception:
+                    pass
             print("[*] Soft reset camoufox/playwright (same process)")
             return
 
@@ -1246,15 +1302,24 @@ def soft_reset_browser():
         start_browser()
 
 
+def hard_reset_browser():
+    """Kill browser process + new profile (clean cookies / no Google session leak)."""
+    slog("BROWSER", "HARD reset (full relaunch + fresh profile)")
+    stop_browser()
+    start_browser()
+
+
 def restart_browser(force_full: bool = False):
     """
-    Default: soft reset (reuse process). Full relaunch only when force_full=True
-    or soft path cannot recover.
-    Camoufox: soft reset preferred; full only when forced / dead.
+    Default: soft reset (reuse process). Full relaunch when force_full=True,
+    browser.reset=hard, register_mode=google (default hard), or soft cannot recover.
     """
-    if force_full or browser is None:
-        stop_browser()
-        start_browser()
+    want_hard = force_full or _browser_reset_mode() == "hard"
+    if want_hard or browser is None:
+        if browser is None:
+            start_browser()
+        else:
+            hard_reset_browser()
     else:
         soft_reset_browser()
 
@@ -2979,6 +3044,13 @@ def wait_for_sso_cookie(timeout=90, no_sso_deadline=22):
                                 "No sso cookie after signup (stuck on /account); "
                                 f"cookies seen: {sorted(last_seen_names)}"
                             )
+                    elif "exchange-token" in cur:
+                        # Google OIDC still setting cookies — NEVER navigate away
+                        if now - last_poll_log >= 3:
+                            slog("SSO", f"OIDC exchange mid-flight — wait  url={cur[:100]}")
+                            last_poll_log = now
+                        time.sleep(0.5)
+                        continue
                     elif "sign-up" in cur:
                         # Still on signup after Complete — nudge to /account once
                         poll_ticks += 1
@@ -3684,21 +3756,95 @@ def push_sso_to_api(new_tokens: list) -> None:
 
 
 def _resolve_register_mode() -> str:
-    """browser (default) | hybrid — env GROK_REGISTER_MODE or config register_mode."""
+    """browser (default) | hybrid | google — env GROK_REGISTER_MODE or config register_mode."""
     try:
         from hybrid.register import resolve_register_mode
 
         return resolve_register_mode(_load_config())
     except Exception:
         env = (os.environ.get("GROK_REGISTER_MODE") or "").strip().lower()
-        if env in ("hybrid", "browser"):
+        if env in ("hybrid", "browser", "google"):
             return env
         conf = _load_config()
         mode = str(conf.get("register_mode") or "").strip().lower()
         if not mode:
             run = conf.get("run") if isinstance(conf.get("run"), dict) else {}
             mode = str(run.get("register_mode") or "").strip().lower()
-        return mode if mode in ("hybrid", "browser") else "browser"
+        return mode if mode in ("hybrid", "browser", "google") else "browser"
+
+
+def _try_google_registration() -> dict | None:
+    """
+    Google OIDC path: claim email:pass from google_pass.txt → Continue with Google
+    → consent → /account SSO. Returns result dict on success, None on soft failure.
+    """
+    from google_signup import claim_next_google_account, register_one_google
+
+    global page, browser
+    if page is None or browser is None:
+        try:
+            start_browser()
+        except Exception as e:
+            slog("GOOGLE", f"browser start failed: {e}", level="warn")
+            return None
+
+    claimed = claim_next_google_account(log=lambda m: slog("GOOGLE", m))
+    if not claimed:
+        slog("GOOGLE", "no free accounts in google inventory", level="error")
+        return None
+    email, password = claimed
+    try:
+        meta = register_one_google(
+            page,
+            email,
+            password,
+            log=lambda m: slog("GOOGLE", m),
+        )
+    except Exception as e:
+        slog("GOOGLE", f"register failed email={email}: {e}", level="error")
+        try:
+            update_account_status(email, "failed_login", error=str(e)[:400])
+        except Exception:
+            pass
+        return None
+
+    # Collect SSO from live session — do NOT rush grok.com; wait_for_sso
+    # only opens grok.com AFTER sso cookie is already present.
+    try:
+        sso_cred = wait_for_sso_cookie(timeout=90, no_sso_deadline=30)
+    except Exception as e:
+        slog("GOOGLE", f"SSO wait failed email={email}: {e}", level="error")
+        try:
+            update_account_status(email, "failed_login", error=f"sso: {e}"[:400])
+        except Exception:
+            pass
+        return None
+
+    if not isinstance(sso_cred, dict) or not (
+        sso_cred.get("sso_token") or sso_cred.get("apiKey")
+    ):
+        slog("GOOGLE", f"no SSO after google login email={email}", level="error")
+        try:
+            update_account_status(email, "failed_login", error="no_sso")
+        except Exception:
+            pass
+        return None
+
+    return {
+        "email": email,
+        "password": password,
+        "given_name": (meta or {}).get("given_name") or "",
+        "family_name": (meta or {}).get("family_name") or "",
+        "apiKey": sso_cred.get("apiKey") or "",
+        "sso_token": sso_cred.get("sso_token") or "",
+        "sso_rw": sso_cred.get("sso_rw") or "",
+        "cookie_header": sso_cred.get("cookie_header") or sso_cred.get("apiKey") or "",
+        "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
+        "providerSpecificData": sso_cred.get("providerSpecificData") or {},
+        "google": True,
+        "mode": "google",
+        "provider": "google",
+    }
 
 
 def _try_hybrid_registration() -> dict | None:
@@ -3732,10 +3878,31 @@ def _try_hybrid_registration() -> dict | None:
 
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # One round: open signup -> register -> capture SSO -> write file -> push 9router.
-    # Optional hybrid: protocol HTTP after short browser harvest; fall back to full browser.
+    # Modes: browser | hybrid | google (see register_mode / GROK_REGISTER_MODE).
     reg_mode = _resolve_register_mode()
     hybrid_result = None
-    if reg_mode == "hybrid":
+    google_result = None
+
+    if reg_mode == "google":
+        slog("FLOW", "① google OIDC register (inventory → Continue with Google)")
+        try:
+            google_result = _try_google_registration()
+        except Exception as e:
+            slog("GOOGLE", f"exception: {e}", level="error")
+            google_result = None
+        if not google_result or not (
+            google_result.get("sso_token")
+            or google_result.get("sso")
+            or google_result.get("apiKey")
+        ):
+            # No email/OTP fallback for google mode — inventory is the identity plane
+            raise RuntimeError(
+                "GOOGLE: register failed or no SSO "
+                "(check accounts/google_pass.txt + Google challenges)"
+            )
+        slog("GOOGLE", f"OK email={google_result.get('email', '')}")
+
+    elif reg_mode == "hybrid":
         slog("FLOW", "① hybrid register (browser harvest + protocol HTTP)")
         try:
             hybrid_result = _try_hybrid_registration()
@@ -3762,7 +3929,51 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         else:
             slog("HYBRID", f"OK email={hybrid_result.get('email','')}")
 
-    if hybrid_result:
+    if google_result:
+        email = str(google_result.get("email") or "")
+        profile = {
+            "given_name": google_result.get("given_name") or "",
+            "family_name": google_result.get("family_name") or "",
+            "password": google_result.get("password") or "",
+        }
+        sso_cred = {
+            "apiKey": google_result.get("apiKey") or "",
+            "sso_token": google_result.get("sso_token") or google_result.get("sso") or "",
+            "sso_rw": google_result.get("sso_rw") or "",
+            "cookie_header": google_result.get("cookie_header")
+            or google_result.get("apiKey")
+            or "",
+            "cloudflare_cookies": google_result.get("cloudflare_cookies") or "",
+            "providerSpecificData": google_result.get("providerSpecificData") or {},
+        }
+        sso_line = append_sso_to_txt(sso_cred, output_path)
+        result = {
+            "email": email,
+            "sso": sso_cred.get("sso_token") or sso_cred.get("apiKey") or "",
+            "apiKey": sso_cred.get("apiKey") or "",
+            "sso_token": sso_cred.get("sso_token") or "",
+            "sso_rw": sso_cred.get("sso_rw") or "",
+            "cookie_header": sso_cred.get("cookie_header")
+            or sso_cred.get("apiKey")
+            or sso_line
+            or "",
+            "cloudflare_cookies": sso_cred.get("cloudflare_cookies") or "",
+            "providerSpecificData": sso_cred.get("providerSpecificData") or {},
+            "google": True,
+            "provider": "google",
+            **profile,
+        }
+        append_account_record(
+            email=email,
+            password=str(profile.get("password") or ""),
+            given_name=str(profile.get("given_name") or ""),
+            family_name=str(profile.get("family_name") or ""),
+            sso_cookie=sso_line or str(result.get("cookie_header") or ""),
+            mode="google",
+            sso_file=output_path,
+            extra={"provider": "google"},
+        )
+    elif hybrid_result:
         email = str(hybrid_result.get("email") or "")
         profile = {
             "given_name": hybrid_result.get("given_name") or "",
@@ -3868,11 +4079,15 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             sso_file=output_path,
         )
 
+    mode_tag = (
+        "google"
+        if result.get("google")
+        else ("hybrid" if result.get("hybrid") else "browser")
+    )
     slog(
         "CREATED",
         f"email={email}  name={profile.get('given_name','')} {profile.get('family_name','')}  "
-        f"pass={profile.get('password','')}"
-        + ("  mode=hybrid" if result.get("hybrid") else ""),
+        f"pass={profile.get('password','')}  mode={mode_tag}",
     )
 
     # Primary: settle → PKCE/device → chat usable → push 9router
@@ -4547,21 +4762,19 @@ def convert_grok_cli_tokens(result: dict):
     gap_sec = _oauth_gap_sec(gcli)
     _wait_oauth_gap(gap_sec)
 
-    # ── ACTIVATE (replaces idle post-signup settle / bot hygiene) ──
-    # Visit grok.com with SSO so free chat/API is provisioned before OAuth.
+    # ── ACTIVATE + bot-hygiene settle ──────────────────────────────
+    # 1) Visit grok.com with SSO (provision free tier)
+    # 2) Idle post_signup_settle_sec (default/config 12s bot hygiene) before OAuth
     if activate:
         try:
             activate_grok_com(result, timeout_sec=activate_timeout)
         except Exception as e:
             slog("ACTIVATE", f"failed (non-fatal): {e}", level="warn")
-    elif settle_s > 0:
-        # Legacy path only when activate disabled
-        slog("SETTLE", f"post-signup idle {settle_s:.0f}s before OAuth (legacy bot hygiene)")
+    if settle_s > 0:
+        when = "after activate" if activate else "before OAuth (activate off)"
+        slog("SETTLE", f"bot hygiene idle {settle_s:.0f}s {when}")
         time.sleep(settle_s)
         slog("SETTLE", "done")
-    if activate and settle_s > 0:
-        slog("SETTLE", f"extra idle {settle_s:.0f}s after activate (post_signup_settle_sec)")
-        time.sleep(settle_s)
 
     # Stabilize page only when we will run browser PKCE
     if use_pkce and (from_hybrid or True):
@@ -4751,8 +4964,11 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
     """
     Chat usable probe + 9router push. HTTP-only — no browser required.
 
-    inject_policy=usable (default): NEVER inject until probe USABLE.
-    DENIED raises RuntimeError so main counts FAIL.
+    Policy (token already minted):
+      - probe USABLE (2xx)     → inject isActive=ON
+      - probe 402 / 403 / other → inject isActive=OFF (keep for re-probe)
+      - probe 400 only         → do NOT inject, raise FAIL
+      - inject_policy=all      → inject ON without probe gate
     """
     if tokens is None:
         return
@@ -4761,8 +4977,6 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
     gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
     if gcli.get("enabled") is False:
         return
-
-    from push_9router_grok_cli import push_build_tokens_to_9router
 
     email = str(result.get("email") or "").strip()
     given = str(result.get("given_name") or "").strip()
@@ -4779,8 +4993,12 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
     tok_email = getattr(tokens, "email", "") or result.get("build_email") or email
     tok_uid = getattr(tokens, "user_id", "") or result.get("build_user_id") or ""
 
-    # ── PHASE: CHAT USABLE (truth for 403 — flash inject_policy=usable) ──
+    # ── PHASE: CHAT PROBE ──────────────────────────────────────────
     usable_info = None
+    inject_active = True
+    probe_err = ""
+    probe_status = 0
+
     if inject_policy == "usable":
         from chat_usable import probe_chat_usable
 
@@ -4802,32 +5020,61 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
                 timeout=float(gcli.get("smoke_timeout_sec") or 45),
             )
         result["chat_probe"] = usable_info
+        probe_status = int(usable_info.get("status") or 0)
+        probe_err = str(usable_info.get("err") or "")
+
         if usable_info.get("usable"):
+            inject_active = True
             slog(
                 "PROBE",
-                f"USABLE  status={usable_info.get('status')}  "
+                f"USABLE  status={probe_status}  "
                 f"latency_ms={usable_info.get('latency_ms')}  "
                 f"reply={str(usable_info.get('reply') or '')[:40]}",
             )
-        else:
+        elif probe_status == 400:
+            # Only hard-block: invalid token / bad request
             slog(
                 "PROBE",
-                f"DENIED  status={usable_info.get('status')}  "
-                f"err={usable_info.get('err')}  "
-                f"(will NOT inject — policy=usable)",
+                f"DENIED 400  err={probe_err}  (will NOT inject)",
                 level="error",
             )
             raise RuntimeError(
-                f"chat DENIED status={usable_info.get('status')} "
-                f"email={tok_email} err={usable_info.get('err')}"
+                f"chat DENIED status=400 email={tok_email} err={probe_err}"
+            )
+        else:
+            # 402/403/other: still inject but OFF + re-probe-friendly testStatus
+            inject_active = False
+            slog(
+                "PROBE",
+                f"DENIED status={probe_status}  err={probe_err}  "
+                f"→ inject 9router OFF (token kept, re-probe eligible)",
+                level="warn",
             )
     else:
-        # legacy: skip hard usable gate (may still smoke inside push)
         slog("PROBE", f"inject_policy={inject_policy} — skip hard usable gate")
+        inject_active = True
 
-    # ── PHASE: PUSH (only after USABLE when policy=usable) ──────────
-    slog("PUSH", f"import grok-cli → 9router  email={tok_email or '-'}")
-    push_build_tokens_to_9router(
+    # Map probe → 9router flags (must match isGrokCliReprobeCandidate)
+    from push_9router_grok_cli import (
+        push_build_tokens_to_9router,
+        probe_status_to_9router_flags,
+    )
+
+    off_flags: dict = {}
+    if not inject_active:
+        off_flags = probe_status_to_9router_flags(probe_status, probe_err)
+    inject_test_status = (
+        "active" if inject_active else str(off_flags.get("test_status") or "unavailable")
+    )
+    inject_psd = dict(off_flags.get("psd") or {}) if not inject_active else {}
+
+    # ── PHASE: PUSH (always if tokens, except 400 above) ───────────
+    mode_s = "ON" if inject_active else f"OFF/{inject_test_status}"
+    slog(
+        "PUSH",
+        f"import grok-cli → 9router  email={tok_email or '-'}  isActive={mode_s}",
+    )
+    push_out = push_build_tokens_to_9router(
         tokens,
         base_url=str(gcli.get("base_url") or "http://127.0.0.1:20127"),
         data_dir=str(gcli.get("data_dir") or "~/.9router"),
@@ -4836,10 +5083,22 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
         name=email or getattr(tokens, "name", "") or tok_email,
         email=tok_email,
         display_name=display or getattr(tokens, "name", "") or tok_email,
-        # already probed usable — never skip import on JWT bot alone
+        # already probed — never skip import on JWT bot alone
         smoke_bot_flag=False,
         smoke_model=probe_model,
         smoke_timeout_sec=float(gcli.get("smoke_timeout_sec") or 45),
+        is_active=inject_active,
+        test_status=inject_test_status,
+        last_error=(
+            ""
+            if inject_active
+            else f"probe status={probe_status} {probe_err}".strip()[:500]
+        ),
+        error_code=off_flags.get("error_code") if not inject_active else None,
+        last_error_type=(
+            str(off_flags.get("last_error_type") or "") if not inject_active else ""
+        ),
+        provider_specific_data=inject_psd or None,
     )
     result["build_access_token"] = access
     result["build_refresh_token"] = (
@@ -4849,9 +5108,15 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
     result["build_user_id"] = tok_uid
     result["bot_flag_source"] = getattr(tokens, "bot_flag_source", None)
     result["oauth_referrer"] = getattr(tokens, "referrer", "") or ""
+    result["inject_active"] = inject_active
+    result["9router_id"] = (push_out or {}).get("id") or ""
+    if usable_info is not None:
+        result["probe_usable"] = bool(usable_info.get("usable"))
+        result["probe_status"] = probe_status
     slog(
         "PUSH",
-        f"grok-cli ready  email={tok_email}  user_id={tok_uid or '-'}",
+        f"grok-cli ready  email={tok_email}  user_id={tok_uid or '-'}  "
+        f"isActive={mode_s}  id={result.get('9router_id') or '-'}",
     )
 
 
@@ -4872,8 +5137,8 @@ def convert_and_push_grok_cli(result: dict) -> None:
                                       browser before probe (see run_single_registration)
 
     inject_policy:
-      usable  — only push if chat probe USABLE (default; fights 403)
-      all     — push if tokens ok (legacy)
+      usable  — probe chat; USABLE→inject ON, 402/403→inject OFF, 400→no inject
+      all     — push if tokens ok (always ON)
       jwt_clean — hard reject bot_flag (optional)
     """
     tokens = convert_grok_cli_tokens(result)
@@ -5194,8 +5459,14 @@ def main():
                     next_idx = current_round + 1
                     next_proxy = select_proxy_for_account(next_idx)
                     same_proxy = next_proxy == current_proxy_url()
-                    if hard_fail:
-                        slog("BROWSER", "FULL restart (browser unhealthy)")
+                    reset_mode = _browser_reset_mode()
+                    if hard_fail or reset_mode == "hard":
+                        why = (
+                            "browser unhealthy"
+                            if hard_fail
+                            else f"reset={reset_mode} mode={_resolve_register_mode()}"
+                        )
+                        slog("BROWSER", f"HARD reset → next account ({why})")
                         restart_browser(force_full=True)
                     elif same_proxy and _proxy_mode == "per_worker":
                         slog("BROWSER", "soft-reset → next account (same proxy)")

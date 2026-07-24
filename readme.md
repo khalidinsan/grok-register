@@ -250,7 +250,8 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 
 | Field | Description |
 |-------|-------------|
-| `register_mode` | `browser` (full UI) · `hybrid` (protocol after short harvest). Default if unset: **browser**. Env: `GROK_REGISTER_MODE`. |
+| `register_mode` | `browser` (full UI) · `hybrid` (protocol after short harvest) · `google` (Google OIDC from `accounts/google_pass.txt`). Default if unset: **browser**. Env: `GROK_REGISTER_MODE`. |
+| `google.accounts_file` | Inventory for `register_mode=google` (`email:password` per line). Env: `GROK_GOOGLE_ACCOUNTS`. |
 | `account.password` | **Fixed password for every farmed account** (not random). Env: `GROK_ACCOUNT_PASSWORD`. |
 | `pool.concurrent` / `-c` | Parallel workers (browsers). |
 | `pool.count` / `-n` | Total accounts (`0` = unlimited). |
@@ -279,7 +280,9 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 |-----|---------|---------|
 | `GROK_BROWSER_ENGINE` | `camoufox` | `camoufox` \| `chromium` |
 | `GROK_DISPLAY` / `GROK_HEADLESS` | platform | Display mode |
-| `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` |
+| `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` \| `google` |
+| `GROK_GOOGLE_ACCOUNTS` | `accounts/google_pass.txt` | Google inventory path when mode=google |
+| `GROK_GOOGLE_FORCE` | off | Re-claim google emails even if ledger status terminal |
 | `GROK_ACCOUNT_PASSWORD` | config `account.password` | Fixed signup password for all accounts |
 | `GROK_BLOCK_ASSETS` | `1` | Font/media asset block |
 | `GROK_PROXY_RETRIES` | `3` | Proxy tries per account |
@@ -429,16 +432,48 @@ python farm_tui.py -c 1 --no-proxy-check --proxy-file proxy.txt
 |------|-----|----------------|
 | **`browser`** | Full Camoufox UI signup | default if unset |
 | **`hybrid`** | Short browser (castle + cookies) → protocol HTTP signup → materialize SSO → same OAuth/probe | `"register_mode": "hybrid"` or `GROK_REGISTER_MODE=hybrid` |
+| **`google`** | Claim `email:password` from inventory → Continue with Google → OIDC consent → SSO → same OAuth/probe | `"register_mode": "google"` + `google.accounts_file` |
 
 Hybrid needs **`curl_cffi`** (in requirements). On failure, farm **falls back** to full browser UI automatically.
 
 Turnstile on Camoufox hybrid: native poll + inject widget (not Drission shadow click). Legacy path: `GROK_HYBRID_USE_DRISSION_TS=1`.
 
+### Google provider (`register_mode=google`)
+
+Pre-seeded **Google** accounts (not catch-all mail). Inventory file:
+
+```text
+# accounts/google_pass.txt
+user1@gmail.com:secret1
+user2@clumo.my.id:secret2
+```
+
+```json
+{
+  "register_mode": "google",
+  "google": { "accounts_file": "accounts/google_pass.txt" }
+}
+```
+
+```bash
+# one-shot (TUI / pool)
+GROK_REGISTER_MODE=google .venv/bin/python farm_tui.py -n 5 -c 1 --headed
+# inventory stats
+.venv/bin/python google_signup.py --stats
+```
+
+Flow: **sign-up** → **Continue with Google** → email/password → consent (**Lanjutkan** / Continue) → `/exchange-token` → `/account` → SSO → activate → OAuth → probe → 9router.
+
+- Multi-worker safe claim (file lock + `accounts.jsonl` status).
+- Skips emails already `created` / `injected` / `failed_*` unless `GROK_GOOGLE_FORCE=1`.
+- Hard Google challenges (2FA, captcha, “browser not secure”) fail that account (`failed_login`) — no silent email/OTP fallback.
+- Live path verified: chat probe `grok-4.5` usable + 9router inject.
+
 ---
 
 ## Pipeline (per account)
 
-1. **Register** — `browser` or `hybrid` → SSO  
+1. **Register** — `browser` / `hybrid` / `google` → SSO  
 2. **SAVE** — `sso/*.txt` (cookie) + `accounts/` (`status=created`, email + password)  
 3. **ACTIVATE** — open **grok.com** with SSO (ToS / first session). Replaces idle 12s “bot hygiene”.  
 4. **CONVERT** — PKCE `oauth_referrer` (default `grok-build`) on live session; Chromium prefers device SSO; device fallback fail-fast  

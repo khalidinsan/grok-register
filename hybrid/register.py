@@ -34,13 +34,16 @@ def _default_log(msg: str) -> None:
         print(f"[HYBRID] {msg}", flush=True)
 
 
+_VALID_REGISTER_MODES = frozenset({"browser", "hybrid", "google"})
+
+
 def resolve_register_mode(config: Optional[dict] = None) -> str:
-    """Return 'browser' | 'hybrid'. Default browser.
+    """Return 'browser' | 'hybrid' | 'google'. Default browser.
 
     Priority: env GROK_REGISTER_MODE → config register_mode → browser
     """
     env = (os.environ.get("GROK_REGISTER_MODE") or "").strip().lower()
-    if env in ("hybrid", "browser"):
+    if env in _VALID_REGISTER_MODES:
         return env
     conf = config
     if conf is None:
@@ -55,7 +58,7 @@ def resolve_register_mode(config: Optional[dict] = None) -> str:
     if not mode:
         run = conf.get("run") if isinstance(conf.get("run"), dict) else {}
         mode = str(run.get("register_mode") or "").strip().lower()
-    if mode in ("hybrid", "browser"):
+    if mode in _VALID_REGISTER_MODES:
         return mode
     return "browser"
 

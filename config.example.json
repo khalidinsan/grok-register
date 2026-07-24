@@ -3,6 +3,9 @@
         "count": 10
     },
     "register_mode": "browser",
+    "google": {
+        "accounts_file": "accounts/google_pass.txt"
+    },
     "pool": {
         "count": 10,
         "concurrent": 2,
@@ -36,7 +39,9 @@
     "proxy": "",
     "browser_proxy": "",
     "browser": {
-        "engine": "camoufox"
+        "engine": "camoufox",
+        "reset": "hard",
+        "_comment_reset": "hard = kill+relaunch browser per account (clean cookies). soft = reuse process. google mode defaults hard. Env: GROK_BROWSER_RESET=hard|soft"
     },
     "account": {
         "password": "Nfarm!a7#GrokBuild26",
@@ -55,11 +60,12 @@
         "activate_grok_com": true,
         "activate_timeout_sec": 45,
         "_comment_activate": "Visit grok.com with SSO before OAuth (replaces idle bot-hygiene sleep). Reduces later 402/403. Env: GROK_ACTIVATE_GROK_COM=0 to disable.",
-        "post_signup_settle_sec": 0,
-        "_comment_settle": "Extra idle seconds AFTER activate (default 0). Old bot-hygiene sleep was 12s; prefer activate_grok_com instead.",
+        "post_signup_settle_sec": 12,
+        "_comment_settle": "Bot-hygiene idle AFTER activate_grok_com (default 12s). Set 0 to skip. Env path: convert_grok_cli_tokens.",
         "oauth_gap_sec": 8,
         "chat_probe_off_critical": true,
         "inject_policy": "usable",
+        "_comment_inject_policy": "usable: probe chat — 2xx inject ON, 402/403 inject OFF, 400 skip. all: always inject ON if tokens.",
         "jwt_reject_bot_flag": false,
         "jwt_enforce_referrer": true,
         "chat_probe_model": "grok-4.5",
