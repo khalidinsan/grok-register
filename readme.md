@@ -6,7 +6,7 @@ Default browser engine: **Camoufox** (anti-detect Firefox). Optional **Chromium*
 
 ```text
 identity:
-  browser/hybrid → email (IMAP catch-all | exzork API)
+  browser/hybrid → email (IMAP catch-all | khalidmailer API)
   google         → accounts/google_pass.txt (email:password inventory)
 
   → register (browser | hybrid | google OIDC)
@@ -33,7 +33,7 @@ identity:
 |------|--------|
 | **Engines** | Camoufox (default) · Playwright Chromium fallback |
 | **Register modes** | `browser` · `hybrid` · **`google`** (OIDC from inventory file) |
-| **Mail** | IMAP catch-all **or** [exzork](https://mailer.exzork.me/) · humanized locals (**browser/hybrid only**) |
+| **Mail** | IMAP catch-all **or** [khalidmailer](https://mailer.khalid.id/) · humanized locals (**browser/hybrid only**) |
 | **Google inventory** | `accounts/google_pass.txt` · multi-worker claim · inventory empty → **workers stop cleanly** |
 | **Password** | Fixed signup password via `account.password` (browser/hybrid) · Google mode uses inventory password |
 | **Account ledger** | `accounts/accounts.jsonl` + `email_pass.txt` · **google: write after probe** (not at signup) |
@@ -51,7 +51,7 @@ identity:
 |--|--|
 | **OS** | macOS · Linux (VPS OK) · Windows |
 | **Python** | **3.10–3.13** recommended (3.14 may hit TLS edge cases) |
-| **Mail** | Domain with **catch-all** → Gmail + [App Password](https://myaccount.google.com/apppasswords) **or** exzork API |
+| **Mail** | Domain with **catch-all** → Gmail + [App Password](https://myaccount.google.com/apppasswords) **or** [khalidmailer](https://mailer.khalid.id/docs) API |
 | **Optional** | Local [9router](https://github.com/) (`http://127.0.0.1:20127` or remote URL) |
 | **Optional** | Residential proxies (`proxy.txt`) |
 
@@ -246,13 +246,31 @@ cp config.example.json config.json
 }
 ```
 
-Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API_KEY`, `EXZORK_USE_SUBDOMAIN`.
+Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_DOMAINS`, `EMAIL_PROVIDER`, `IMAP_*`, `KHALIDMAILER_API_KEY`, `KHALIDMAILER_USE_SUBDOMAIN`.
+
+### Email domain (single **or** multi) — one key only: `email.domain`
+
+```json
+// single
+"domain": "syzerf.my.id"
+
+// multi round-robin (array)
+"domain": ["syzerf.my.id", "khalid.id", "yani43.site", "yani43.com", "sikilat.web.id"]
+
+// multi round-robin (comma string — also OK)
+"domain": "syzerf.my.id,khalid.id,yani43.site"
+```
+
+- Multi → each new alias advances `accounts/.domain_rr.index` (multi-worker safe); log `rr=2/5`.
+- All domains must catch-all to the **same** IMAP inbox.
+- Env: `EMAIL_DOMAIN` (same formats).
 
 ### Important fields
 
 | Field | Description |
 |-------|-------------|
 | `register_mode` | `browser` · `hybrid` · `google`. Env: `GROK_REGISTER_MODE`. |
+| `email.domain` | Catch-all domain(s) — **one key**: string or array. Multi = round-robin. Env: `EMAIL_DOMAIN`. |
 | `google.accounts_file` | Inventory for google mode (`email:password` per line). Env: `GROK_GOOGLE_ACCOUNTS`. |
 | `account.password` | Fixed password for **browser/hybrid** signup. Env: `GROK_ACCOUNT_PASSWORD`. |
 | `pool.concurrent` / `-c` | Parallel workers (browsers). |
@@ -284,6 +302,7 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 | `GROK_BROWSER_ENGINE` | `camoufox` | `camoufox` \| `chromium` |
 | `GROK_DISPLAY` / `GROK_HEADLESS` | platform | Display mode |
 | `GROK_REGISTER_MODE` | config / `browser` | `hybrid` \| `browser` \| `google` |
+| `EMAIL_DOMAIN` | config `email.domain` | Single domain, comma list, or set array in config only |
 | `GROK_GOOGLE_ACCOUNTS` | `accounts/google_pass.txt` | Google inventory path |
 | `GROK_GOOGLE_FORCE` | off | Re-claim google emails even if ledger status terminal |
 | `GROK_BROWSER_RESET` | soft / hard for google | `hard` = full relaunch per account · `soft` = reuse process |
@@ -323,40 +342,41 @@ Env overrides for email: `EMAIL_DOMAIN`, `EMAIL_PROVIDER`, `IMAP_*`, `EXZORK_API
 }
 ```
 
-### B) mailer.exzork.me (`provider: exzork`)
+### B) mailer.khalid.id (`provider: khalidmailer`)
 
-Receive-only API with **wildcard subdomains** (`user@rand.yourdomain.com`).
+Receive-only API with **wildcard subdomains** (`user@rand.gumial.web.id`). Docs: https://mailer.khalid.id/docs
 
-1. DNS (Cloudflare DNS only, not Email Routing MX):
+1. DNS (Cloudflare: **DNS only** / gray cloud for MX — proxy does not support MX):
 
 ```text
-@  MX  10  mailer.exzork.me
-*  MX  10  mailer.exzork.me
+@  MX  10  mailer.khalid.id
+*  MX  10  mailer.khalid.id
 ```
 
-2. Claim apex + wildcard at https://mailer.exzork.me/ — **save API key once**.
+2. Claim apex + wildcard (`*.gumial.web.id`) at https://mailer.khalid.id/ — **save API key once**.
 3. Config / env (prefer env for the key):
 
 ```bash
-export EXZORK_API_KEY='tm_...'
+export KHALIDMAILER_API_KEY='tm_...'
 ```
 
 ```json
 "email": {
-  "provider": "exzork",
-  "domain": "koew.tech",
+  "provider": "khalidmailer",
+  "domain": "gumial.web.id",
   "local_style": "human",
-  "exzork_base_url": "https://mailer.exzork.me",
-  "exzork_use_subdomain": true,
-  "exzork_api_key": ""
+  "khalidmailer_base_url": "https://mailer.khalid.id",
+  "khalidmailer_use_subdomain": true,
+  "khalidmailer_api_key": ""
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `provider` | `imap` \| `exzork` |
-| `exzork_use_subdomain` | `true` → `local@<random>.domain.com` (needs wildcard MX) |
-| `EXZORK_API_KEY` | Preferred over putting key in config |
+| `provider` | `imap` \| `khalidmailer` |
+| `khalidmailer_use_subdomain` | `true` → `local@<random>.domain.com` (needs wildcard MX) |
+| `KHALIDMAILER_API_KEY` | Preferred over putting key in config |
+| Module | `khalidmailer.py` (replaces old `exzork_mail.py`) |
 
 Never commit API keys.
 

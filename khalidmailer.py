@@ -1,20 +1,20 @@
 """
-mailer.exzork.me — receive-only temp mail API provider.
+mailer.khalid.id — receive-only temp mail API (khalidmailer).
 
-Docs: https://mailer.exzork.me/docs
-Base:  https://mailer.exzork.me
+Docs: https://mailer.khalid.id/docs
+Base:  https://mailer.khalid.id
 
 Auth:  X-API-Key: tm_...   or   Authorization: Bearer tm_...
 
 Config (config.json → email.* or env):
-  email.provider = "exzork"
-  email.domain   = "koew.tech"          # apex (claim + wildcard MX)
-  email.exzork_api_key / EXZORK_API_KEY / MAILER_EXZORK_API_KEY
-  email.exzork_base_url (default https://mailer.exzork.me)
-  email.exzork_use_subdomain (bool) — random@<rand>.domain.com when wildcard claimed
-  email.local_style — human | random (local-part style)
+  email.provider = "khalidmailer"   # aliases: khalid, mailer.khalid
+  email.domain   = "gumial.web.id"  # apex; wildcard MX * → mailer.khalid.id
+  email.khalidmailer_api_key / KHALIDMAILER_API_KEY / MAILER_API_KEY
+  email.khalidmailer_base_url (default https://mailer.khalid.id)
+  email.khalidmailer_use_subdomain (bool, default true) — local@<rand>.apex
+  email.local_style — human | random
 
-Never commit API keys. Prefer env EXZORK_API_KEY.
+Never commit API keys. Prefer env KHALIDMAILER_API_KEY.
 """
 
 from __future__ import annotations
@@ -72,12 +72,18 @@ def _ebool(key: str, env_key: str = "", default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-DEFAULT_BASE = "https://mailer.exzork.me"
+DEFAULT_BASE = "https://mailer.khalid.id"
 
 
 def base_url() -> str:
     return (
-        _ecfg("exzork_base_url", "EXZORK_BASE_URL", "MAILER_EXZORK_BASE_URL", default=DEFAULT_BASE)
+        _ecfg(
+            "khalidmailer_base_url",
+            "KHALIDMAILER_BASE_URL",
+            "MAILER_KHALID_BASE_URL",
+            "MAILER_BASE_URL",
+            default=DEFAULT_BASE,
+        )
         .rstrip("/")
         or DEFAULT_BASE
     )
@@ -85,25 +91,49 @@ def base_url() -> str:
 
 def api_key() -> str:
     return _ecfg(
-        "exzork_api_key",
-        "EXZORK_API_KEY",
-        "MAILER_EXZORK_API_KEY",
+        "khalidmailer_api_key",
+        "KHALIDMAILER_API_KEY",
+        "MAILER_KHALID_API_KEY",
         "MAILER_API_KEY",
+        # legacy env names still accepted during migration
+        "EXZORK_API_KEY",
         default="",
     )
 
 
 def apex_domain() -> str:
-    d = _ecfg("domain", "EMAIL_DOMAIN", "EXZORK_DOMAIN", default="")
+    """Primary/first domain (compat). Prefer next_email_domain() for RR create."""
+    try:
+        from email_register import list_email_domains
+
+        pool = list_email_domains()
+        if pool:
+            return pool[0]
+    except Exception:
+        pass
+    d = _ecfg("domain", "EMAIL_DOMAIN", "KHALIDMAILER_DOMAIN", default="")
     return d.lstrip("@").strip().lower()
 
 
 def use_subdomain() -> bool:
-    # default True when provider is exzork (wildcard is the point); override with false
-    return _ebool("exzork_use_subdomain", "EXZORK_USE_SUBDOMAIN", default=True)
+    # default True (wildcard is the point for farm)
+    return _ebool(
+        "khalidmailer_use_subdomain",
+        "KHALIDMAILER_USE_SUBDOMAIN",
+        default=True,
+    ) or _ebool("exzork_use_subdomain", "EXZORK_USE_SUBDOMAIN", default=False)
 
 
 # ── HTTP ────────────────────────────────────────────────────────────
+
+
+def _unwrap(payload: Any) -> Any:
+    """Unwrap { success, data } envelopes from mailer.khalid.id."""
+    if not isinstance(payload, dict):
+        return payload
+    if "data" in payload and payload.get("success") is not False:
+        return payload["data"]
+    return payload
 
 
 def _request(
@@ -116,15 +146,20 @@ def _request(
     key = api_key()
     if not key:
         raise RuntimeError(
-            "exzork API key missing — set email.exzork_api_key or env EXZORK_API_KEY"
+            "khalidmailer API key missing — set email.khalidmailer_api_key "
+            "or env KHALIDMAILER_API_KEY"
         )
-    url = f"{base_url()}{path if path.startswith('/') else '/' + path}"
+    # API lives under /api/v1
+    p = path if path.startswith("/") else "/" + path
+    if not p.startswith("/api/"):
+        p = "/api/v1" + p if p.startswith("/") else "/api/v1/" + p
+    url = f"{base_url()}{p}"
     data = None
     headers = {
         "Accept": "application/json",
         "X-API-Key": key,
         "Authorization": f"Bearer {key}",
-        "User-Agent": "grok-register-exzork/1.0",
+        "User-Agent": "grok-register-khalidmailer/1.0",
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -148,7 +183,7 @@ def _request(
             parsed = err_body
         return int(e.code), parsed
     except URLError as e:
-        raise RuntimeError(f"exzork network error: {e}") from e
+        raise RuntimeError(f"khalidmailer network error: {e}") from e
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -156,7 +191,6 @@ def _request(
 
 def _rand_sub(n: int = 8) -> str:
     chars = string.ascii_lowercase + string.digits
-    # start with letter (safer for hostnames)
     first = random.choice(string.ascii_lowercase)
     rest = "".join(random.choice(chars) for _ in range(max(0, n - 1)))
     return first + rest
@@ -182,6 +216,7 @@ def _human_or_random_local(given: str = "", family: str = "") -> str:
 
 def _extract_address(payload: Any) -> str:
     """Normalize create-mailbox response → email address string."""
+    payload = _unwrap(payload)
     if payload is None:
         return ""
     if isinstance(payload, str):
@@ -193,7 +228,10 @@ def _extract_address(payload: Any) -> str:
         v = payload.get(k)
         if isinstance(v, str) and "@" in v:
             return v.strip()
-    # nested
+    local = payload.get("local_part") or payload.get("local")
+    domain = payload.get("domain")
+    if isinstance(local, str) and isinstance(domain, str) and local and domain:
+        return f"{local}@{domain}"
     for nest in ("data", "mailbox", "result"):
         inner = payload.get(nest)
         if isinstance(inner, dict):
@@ -207,10 +245,10 @@ def _extract_address(payload: Any) -> str:
 
 def _message_list(payload: Any) -> List[dict]:
     """
-    List endpoint shape (exzork):
-      {"mailbox": {...}, "messages": [{id, subject, snippet, from_address, ...}]}
-    subject is often empty; snippet is raw header prefix — OTP lives in full message.
+    List endpoint (docs):
+      { "success": true, "data": [ { id, from_addr, subject, ... } ] }
     """
+    payload = _unwrap(payload)
     if payload is None:
         return []
     if isinstance(payload, list):
@@ -220,20 +258,20 @@ def _message_list(payload: Any) -> List[dict]:
             v = payload.get(k)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # single message object or {"message": {...}}
-        if "message" in payload and isinstance(payload["message"], dict):
+        if isinstance(payload.get("message"), dict):
             return [payload["message"]]
-        if any(k in payload for k in ("subject", "body", "text", "text_body", "from", "id", "snippet")):
+        if any(
+            k in payload
+            for k in ("subject", "body", "body_text", "from_addr", "id", "snippet")
+        ):
             return [payload]
     return []
 
 
 def _decode_qpish(raw: str) -> str:
-    """Decode quoted-printable MIME bodies (x.ai mails are often QP + HTML)."""
     if not raw:
         return ""
     s = raw
-    # Soft line breaks in QP
     if "=3D" in s or "=\r\n" in s or "=\n" in s or "quoted-printable" in s.lower():
         try:
             s = quopri.decodestring(s.encode("utf-8", errors="replace")).decode(
@@ -255,6 +293,8 @@ def _message_text(msg: dict) -> str:
         "subject",
         "Subject",
         "body",
+        "body_text",
+        "body_html",
         "text",
         "text_body",
         "html",
@@ -263,20 +303,21 @@ def _message_text(msg: dict) -> str:
         "raw",
         "snippet",
         "preview",
+        "from_addr",
         "from_address",
+        "to_addr",
         "to_address",
     ):
         v = msg.get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v)
         elif isinstance(v, dict):
-            for kk in ("text", "html", "plain", "text_body"):
+            for kk in ("text", "html", "plain", "text_body", "body_text"):
                 vv = v.get(kk)
                 if isinstance(vv, str) and vv.strip():
                     parts.append(vv)
     blob = "\n".join(parts)
     blob = _decode_qpish(blob)
-    # Pull Subject: from raw header dump if top-level subject empty
     if "Subject:" in blob or "subject:" in blob:
         m = re.search(r"(?im)^Subject:\s*(.+)$", blob)
         if m:
@@ -289,23 +330,21 @@ def _message_text(msg: dict) -> str:
 
 
 def get_message(message_id: Any) -> Optional[dict]:
-    """
-    Full message: GET /api/v1/messages/{id}
-    Response: {"message": { id, text_body, subject, ... }}
-    text_body often contains full raw MIME (headers + HTML) with confirmation code.
-    """
+    """GET /api/v1/messages/{id} → full body (body_text / body_html)."""
     mid = str(message_id or "").strip()
     if not mid:
         return None
     code, data = _request("GET", f"/api/v1/messages/{quote(mid, safe='')}")
     if code >= 400 or data is None:
-        print(f"[exzork] get message {mid} HTTP {code}: {str(data)[:160]}")
+        print(f"[khalidmailer] get message {mid} HTTP {code}: {str(data)[:160]}")
         return None
-    if isinstance(data, dict):
-        if isinstance(data.get("message"), dict):
-            return data["message"]
-        if "text_body" in data or "id" in data:
-            return data
+    un = _unwrap(data)
+    if isinstance(un, dict):
+        if isinstance(un.get("message"), dict):
+            return un["message"]
+        return un
+    if isinstance(data, dict) and isinstance(data.get("message"), dict):
+        return data["message"]
     return None
 
 
@@ -320,7 +359,6 @@ def _host_of(addr: str) -> str:
 
 
 def _is_subdomain_of(host: str, apex: str) -> bool:
-    """True if host is strictly under apex (foo.apex), not apex itself."""
     host = (host or "").lower().strip(".")
     apex = (apex or "").lower().strip(".")
     if not host or not apex or host == apex:
@@ -336,51 +374,52 @@ def create_mailbox(
     prefer_subdomain: Optional[bool] = None,
 ) -> str:
     """
-    Create a mailbox on exzork. Returns full address (local@host).
+    Create mailbox. Returns full address.
 
-    With wildcard claimed + use_subdomain:
-      local@<random>.koew.tech
+    Wildcard + use_subdomain:
+      local@<random>.gumial.web.id
     Else:
-      local@koew.tech  (or API random on apex)
+      local@gumial.web.id
     """
-    apex = (domain or apex_domain()).lstrip("@").strip().lower()
+    apex = (domain or "").lstrip("@").strip().lower()
     if not apex:
-        raise RuntimeError("exzork: email.domain / EMAIL_DOMAIN empty")
+        try:
+            from email_register import next_email_domain
+
+            apex = next_email_domain().lstrip("@").strip().lower()
+        except Exception:
+            apex = apex_domain()
+    if not apex:
+        raise RuntimeError("khalidmailer: email.domain / EMAIL_DOMAIN empty")
 
     local = _human_or_random_local(given=given, family=family)
     want_sub = use_subdomain() if prefer_subdomain is None else prefer_subdomain
 
-    # Target host for the address
     if want_sub:
         host = f"{_rand_sub(8)}.{apex}"
     else:
         host = apex
     address = f"{local}@{host}"
     print(
-        f"[exzork] create want_sub={want_sub} requested={address} "
-        f"apex={apex}"
+        f"[khalidmailer] create want_sub={want_sub} requested={address} apex={apex}"
     )
 
-    # Body shapes — NEVER fall back to apex-only when want_sub (that was the bug:
-    # attempt 4 random+apex returned oswaz…@koew.tech and we accepted it).
+    # Docs: { "local_part", "domain" } — domain may be apex or full host for wildcard
     if want_sub:
         attempts: list[dict] = [
+            {"local_part": local, "domain": host},
+            {"local_part": local, "domain": f"*.{apex}"},
+            {"domain": host},  # random local on that host
+            {"domain": f"*.{apex}"},
             {"address": address},
             {"email": address},
-            {"mailbox": address},
-            {"random": True, "domain": host},
-            {"domain": host, "local": local},
-            {"domain": host, "local_part": local},
-            # some APIs want wildcard domain label
-            {"address": address, "domain": f"*.{apex}"},
-            {"random": True, "domain": f"*.{apex}"},
         ]
     else:
         attempts = [
+            {"local_part": local, "domain": apex},
+            {"domain": apex},
             {"address": address},
             {"email": address},
-            {"random": True, "domain": apex},
-            {"domain": apex, "local": local},
         ]
 
     last_err = ""
@@ -388,35 +427,31 @@ def create_mailbox(
         code, data = _request("POST", "/api/v1/mailboxes", body=body)
         if 200 <= code < 300:
             got = _extract_address(data) or ""
-            # Prefer our requested address if API returns empty / incomplete
             if not got or "@" not in got:
                 got = address
             got_host = _host_of(got)
-            if want_sub:
-                # Reject apex-only success — force real subdomain
-                if not _is_subdomain_of(got_host, apex):
-                    # If API ignored subdomain but accepted create, try keep requested
-                    if _is_subdomain_of(_host_of(address), apex):
-                        # Verify requested might still work as inbox key
-                        print(
-                            f"[exzork] API returned apex {got!r} but we requested "
-                            f"subdomain {address!r} — using requested address"
-                        )
-                        got = address
-                    else:
-                        print(
-                            f"[exzork] create try={attempt} got apex {got!r}, "
-                            f"need subdomain — retry"
-                        )
-                        last_err = f"apex_not_sub:{got}"
-                        continue
-            print(f"[exzork] mailbox OK ({attempt}) {got}")
+            if want_sub and not _is_subdomain_of(got_host, apex):
+                if _is_subdomain_of(_host_of(address), apex):
+                    print(
+                        f"[khalidmailer] API returned apex {got!r} — "
+                        f"using requested subdomain {address!r}"
+                    )
+                    got = address
+                else:
+                    print(
+                        f"[khalidmailer] create try={attempt} got apex {got!r}, "
+                        f"need subdomain — retry"
+                    )
+                    last_err = f"apex_not_sub:{got}"
+                    continue
+            print(f"[khalidmailer] mailbox OK ({attempt}) {got}")
             return got
         last_err = f"HTTP {code} {str(data)[:160]}"
-        print(f"[exzork] create try={attempt} {last_err}")
+        print(f"[khalidmailer] create try={attempt} {last_err}")
 
     raise RuntimeError(
-        f"exzork create mailbox failed want_sub={want_sub} apex={apex} last={last_err}"
+        f"khalidmailer create mailbox failed want_sub={want_sub} "
+        f"apex={apex} last={last_err}"
     )
 
 
@@ -428,7 +463,7 @@ def list_messages(address: str) -> List[dict]:
     if code == 404:
         return []
     if code >= 400:
-        print(f"[exzork] list messages HTTP {code}: {str(data)[:200]}")
+        print(f"[khalidmailer] list messages HTTP {code}: {str(data)[:200]}")
         return []
     return _message_list(data)
 
@@ -439,18 +474,13 @@ def wait_for_code(
     timeout: float = 120.0,
     poll_interval: float = 1.5,
 ) -> Optional[str]:
-    """
-    Poll until xAI OTP found.
-
-    exzork list endpoint only returns meta + header snippet (subject often empty).
-    OTP is in GET /api/v1/messages/{id} → text_body (raw MIME / QP HTML).
-    """
+    """Poll until xAI OTP found (list meta + full message body)."""
     from email_register import extract_verification_code
 
     address = (address or "").strip()
     if not address:
         return None
-    print(f"[exzork] Waiting for OTP to {address} (timeout={int(timeout)}s)...")
+    print(f"[khalidmailer] Waiting for OTP to {address} (timeout={int(timeout)}s)...")
     t0 = time.time()
     poll = 0
     fetched_ids: set[str] = set()
@@ -461,50 +491,54 @@ def wait_for_code(
         try:
             msgs = list_messages(address)
             if poll == 1 or (msgs and poll % 5 == 0):
-                print(f"[exzork] list n={len(msgs)} elapsed={elapsed}s")
+                print(f"[khalidmailer] list n={len(msgs)} elapsed={elapsed}s")
             for msg in msgs:
                 mid = str(msg.get("id") or msg.get("_id") or "").strip()
-                # 1) cheap path: list fields (usually empty subject / useless snippet)
                 blob = _message_text(msg)
                 code = extract_verification_code(blob) if blob else None
                 if code:
-                    print(f"[exzork] Found OTP: {code} for {address} in {elapsed}s (list)")
+                    print(
+                        f"[khalidmailer] Found OTP: {code} for {address} "
+                        f"in {elapsed}s (list)"
+                    )
                     return code
 
-                # 2) full message by id (required for x.ai on exzork)
                 if mid and mid not in fetched_ids:
                     full = get_message(mid)
                     fetched_ids.add(mid)
                     if full:
                         blob2 = _message_text(full)
-                        # also search raw text_body before HTML strip for Subject line
-                        raw_tb = str(full.get("text_body") or full.get("body") or "")
+                        raw_tb = str(
+                            full.get("body_text")
+                            or full.get("text_body")
+                            or full.get("body")
+                            or full.get("body_html")
+                            or ""
+                        )
                         raw_tb = _decode_qpish(raw_tb)
                         code = extract_verification_code(blob2) or extract_verification_code(
                             raw_tb
                         )
                         if code:
                             print(
-                                f"[exzork] Found OTP: {code} for {address} "
+                                f"[khalidmailer] Found OTP: {code} for {address} "
                                 f"in {elapsed}s (message id={mid})"
                             )
                             return code
-                        else:
-                            # debug once per message
-                            snip = (raw_tb or blob2 or "")[:120].replace("\n", " ")
-                            print(
-                                f"[exzork] message id={mid} no OTP yet "
-                                f"from={full.get('from_address','')[:40]!r} "
-                                f"snip={snip!r}"
-                            )
+                        snip = (raw_tb or blob2 or "")[:120].replace("\n", " ")
+                        print(
+                            f"[khalidmailer] message id={mid} no OTP yet "
+                            f"from={(full.get('from_addr') or full.get('from_address') or '')[:40]!r} "
+                            f"snip={snip!r}"
+                        )
         except Exception as e:
-            print(f"[exzork] poll error: {e}")
+            print(f"[khalidmailer] poll error: {e}")
 
         if poll == 1 or poll % 8 == 0:
-            print(f"[exzork] waiting... {elapsed}s/{int(timeout)}s")
+            print(f"[khalidmailer] waiting... {elapsed}s/{int(timeout)}s")
         time.sleep(poll_interval)
 
-    print(f"[exzork] Timeout waiting for OTP to {address}")
+    print(f"[khalidmailer] Timeout waiting for OTP to {address}")
     return None
 
 
@@ -517,12 +551,12 @@ def get_email_and_token(
         addr = create_mailbox(given=given, family=family)
         return addr, addr
     except Exception as e:
-        print(f"[exzork] get_email_and_token failed: {e}")
+        print(f"[khalidmailer] get_email_and_token failed: {e}")
         return None, None
 
 
 def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str]:
-    """Adapter: poll OTP; strip hyphens for form fill (caller may also strip)."""
+    """Adapter: poll OTP; strip hyphens for form fill."""
     target = (email or dev_token or "").strip()
     code = wait_for_code(target, timeout=float(timeout))
     if code:
@@ -531,7 +565,6 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str
 
 
 if __name__ == "__main__":
-    # smoke: needs EXZORK_API_KEY + EMAIL_DOMAIN in env
     print("base=", base_url())
     print("domain=", apex_domain())
     print("key_set=", bool(api_key()))
@@ -539,4 +572,4 @@ if __name__ == "__main__":
         em, tok = get_email_and_token()
         print("mailbox=", em)
     else:
-        print("skip live create — set EXZORK_API_KEY and EMAIL_DOMAIN")
+        print("skip live create — set KHALIDMAILER_API_KEY and EMAIL_DOMAIN")

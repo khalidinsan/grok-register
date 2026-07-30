@@ -35,24 +35,179 @@ def _cfg(key: str, env_key: str, default: str = "") -> str:
     return str(val or default)
 
 
-EMAIL_DOMAIN = _cfg("domain", "EMAIL_DOMAIN") or _cfg("email_domain", "EMAIL_DOMAIN")
 IMAP_USER = _cfg("imap_user", "IMAP_USER")
 IMAP_PASS = _cfg("imap_pass", "IMAP_PASS")
 IMAP_HOST = _cfg("imap_host", "IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(_cfg("imap_port", "IMAP_PORT", "993") or "993")
 
-# Provider: imap (default, Gmail catch-all) | exzork (mailer.exzork.me API)
+# Round-robin domain index (multi-worker / multi-process safe)
+_DOMAIN_RR_PATH = Path(__file__).parent / "accounts" / ".domain_rr.index"
+_domain_rr_thread_lock = None  # lazy threading.Lock
+
+
+# Provider: imap (default) | khalidmailer (mailer.khalid.id API)
 def _email_provider() -> str:
     raw = (
         _cfg("provider", "EMAIL_PROVIDER")
         or _cfg("email_provider", "EMAIL_PROVIDER")
         or "imap"
     ).strip().lower()
-    if raw in ("exzork", "mailer", "mailer.exzork", "exzork_mail", "tm"):
-        return "exzork"
+    if raw in (
+        "khalidmailer",
+        "khalid",
+        "mailer.khalid",
+        "mailer.khalid.id",
+        "khalid_mail",
+        # legacy aliases → khalidmailer
+        "exzork",
+        "mailer",
+        "mailer.exzork",
+        "exzork_mail",
+        "tm",
+    ):
+        return "khalidmailer"
     if raw in ("imap", "gmail", "catchall", "catch-all", ""):
         return "imap"
     return raw
+
+
+def list_email_domains() -> List[str]:
+    """Ordered domain pool — **one config key only: ``email.domain``**.
+
+    Forms (all via ``email.domain`` / env ``EMAIL_DOMAIN``):
+
+      "syzerf.my.id"                          → single
+      "a.com,b.com,c.com"                     → multi RR
+      ["a.com", "b.com"]                      → multi RR (JSON array)
+
+    Env ``EMAIL_DOMAINS`` is an optional override (same formats) if you prefer
+    not to put the list in config; otherwise leave unset.
+
+    Dedupes (case-insensitive), preserves first-seen order.
+    """
+    raw_list: List[str] = []
+
+    # Preferred single key
+    conf_dom = _email_conf.get("domain")
+    if conf_dom is None or conf_dom == "":
+        conf_dom = _email_conf.get("email_domain")
+    if isinstance(conf_dom, list):
+        raw_list.extend(str(x).strip() for x in conf_dom if str(x).strip())
+    elif conf_dom is not None and str(conf_dom).strip():
+        raw_list.append(str(conf_dom).strip())
+
+    # Env: EMAIL_DOMAIN (same as domain) or EMAIL_DOMAINS alias
+    env_one = (os.environ.get("EMAIL_DOMAIN") or "").strip()
+    env_multi = (os.environ.get("EMAIL_DOMAINS") or "").strip()
+    if env_multi:
+        raw_list.append(env_multi)
+    elif env_one:
+        raw_list.append(env_one)
+
+    # Legacy: email.domains (deprecated — still accepted so old config doesn't break)
+    legacy = _email_conf.get("domains")
+    if isinstance(legacy, list) and not raw_list:
+        raw_list.extend(str(x).strip() for x in legacy if str(x).strip())
+    elif isinstance(legacy, str) and legacy.strip() and not raw_list:
+        raw_list.append(legacy.strip())
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for chunk in raw_list:
+        if isinstance(chunk, list):
+            parts = [str(x) for x in chunk]
+        else:
+            parts = re.split(r"[,;\s]+", str(chunk).strip())
+        for p in parts:
+            d = p.lstrip("@").strip().lower()
+            if not d or "." not in d:
+                continue
+            if d in seen:
+                continue
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+# First domain in pool (compat for code that still reads EMAIL_DOMAIN)
+_pool0 = list_email_domains()
+EMAIL_DOMAIN = _pool0[0] if _pool0 else ""
+
+
+def _with_domain_rr_lock(fn):
+    """Process + thread lock around domain RR counter."""
+    global _domain_rr_thread_lock
+    import threading
+
+    if _domain_rr_thread_lock is None:
+        _domain_rr_thread_lock = threading.Lock()
+
+    _DOMAIN_RR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _domain_rr_thread_lock:
+        fh = None
+        try:
+            fh = open(_DOMAIN_RR_PATH, "a+", encoding="utf-8")
+            try:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                try:
+                    import msvcrt
+
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                except Exception:
+                    pass
+            return fn(fh)
+        finally:
+            if fh is not None:
+                try:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+
+def next_email_domain() -> str:
+    """Next domain in round-robin (multi-worker safe).
+
+    Single domain → always that domain (no index churn needed for correctness,
+    but index still advances so adding domains later continues cleanly).
+    """
+    domains = list_email_domains()
+    if not domains:
+        raise Exception(
+            "email domain kosong — set email.domain "
+            '(string atau array) atau env EMAIL_DOMAIN'
+        )
+    if len(domains) == 1:
+        return domains[0]
+
+    def _pick(fh) -> str:
+        idx = 0
+        try:
+            fh.seek(0)
+            raw = (fh.read() or "").strip()
+            if raw:
+                idx = int(raw)
+        except Exception:
+            idx = 0
+        domain = domains[idx % len(domains)]
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(idx + 1))
+            fh.flush()
+        except Exception:
+            pass
+        return domain
+
+    return _with_domain_rr_lock(_pick)
 
 
 # ============================================================
@@ -70,21 +225,21 @@ def get_email_and_token(
     Create/register address for OTP.
 
     Returns (email, token):
-      - imap:   token == email (poll by alias)
-      - exzork: token == email (poll API by address)
+      - imap:          token == email (poll by alias)
+      - khalidmailer:  token == email (poll API by address)
     """
     provider = _email_provider()
-    if provider == "exzork":
+    if provider == "khalidmailer":
         try:
-            from exzork_mail import get_email_and_token as _exzork_get
+            from khalidmailer import get_email_and_token as _km_get
 
-            email_addr, tok = _exzork_get(given=given, family=family)
+            email_addr, tok = _km_get(given=given, family=family)
             if email_addr:
                 _temp_email_cache[email_addr] = tok or email_addr
                 return email_addr, tok or email_addr
             return None, None
         except Exception as e:
-            print(f"[email] exzork create failed: {e}")
+            print(f"[email] khalidmailer create failed: {e}")
             return None, None
 
     email_addr = create_temp_email(given=given, family=family)
@@ -95,22 +250,22 @@ def get_email_and_token(
 
 
 def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str]:
-    """Poll for Grok/x.ai OTP (IMAP or exzork). Strips hyphens for form fill."""
+    """Poll for Grok/x.ai OTP (IMAP or khalidmailer). Strips hyphens for form fill."""
     target = (email or dev_token or "").strip()
     if not target:
         return None
 
     provider = _email_provider()
-    if provider == "exzork":
+    if provider == "khalidmailer":
         try:
-            from exzork_mail import get_oai_code as _exzork_code
+            from khalidmailer import get_oai_code as _km_code
 
-            code = _exzork_code(dev_token, email, timeout=timeout)
+            code = _km_code(dev_token, email, timeout=timeout)
             if code:
                 return code.replace("-", "")
             return None
         except Exception as e:
-            print(f"[email] exzork OTP poll failed: {e}")
+            print(f"[email] khalidmailer OTP poll failed: {e}")
             return None
 
     code = wait_for_verification_code(target_email=target, timeout=timeout)
@@ -125,7 +280,7 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 120) -> Optional[str
 
 def _require_imap_config() -> None:
     missing = []
-    if not EMAIL_DOMAIN:
+    if not list_email_domains():
         missing.append("email.domain / EMAIL_DOMAIN")
     if not IMAP_USER:
         missing.append("email.imap_user / IMAP_USER")
@@ -139,14 +294,18 @@ def _require_imap_config() -> None:
 
 
 def create_temp_email(given: str = "", family: str = "") -> str:
-    """Catch-all alias with human-looking local-part (not pure random)."""
+    """Catch-all alias with human-looking local-part (not pure random).
+
+    Domain is picked via round-robin across email.domains / email.domain pool.
+    """
     _require_imap_config()
-    domain = EMAIL_DOMAIN.lstrip("@")
+    domain = next_email_domain().lstrip("@")
     style = (
         str(_email_conf.get("local_style") or os.environ.get("EMAIL_LOCAL_STYLE") or "human")
         .strip()
         .lower()
     )
+    pool = list_email_domains()
     if style in ("random", "legacy", "garbage"):
         chars = string.ascii_lowercase + string.digits
         local = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
@@ -160,7 +319,8 @@ def create_temp_email(given: str = "", family: str = "") -> str:
             chars = string.ascii_lowercase + string.digits
             local = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
             email_addr = f"{local}@{domain}"
-    print(f"[*] Catch-all email: {email_addr}")
+    rr_note = f"  rr={pool.index(domain)+1}/{len(pool)}" if len(pool) > 1 else ""
+    print(f"[*] Catch-all email: {email_addr}{rr_note}")
     return email_addr
 
 

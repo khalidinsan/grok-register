@@ -12,6 +12,7 @@ import logging
 import time
 import os
 import platform
+import re
 import secrets
 import sys
 from typing import Any
@@ -40,6 +41,62 @@ _progress_current = 0  # 1-based index within this worker
 _progress_ok = 0
 _progress_fail = 0
 _account_t0 = 0.0  # time.time() when current account started
+_phase_started: dict[str, float] = {}
+_EVENT_PREFIX = "@@GROK_EVENT@@"
+
+
+def _emit_event(category: str, event: str, **fields: Any) -> None:
+    """Emit machine-readable JSON while preserving all existing text logs."""
+    payload = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+        "category": (category or "run").lower(),
+        "event": event,
+        "worker": WORKER_ID or "",
+        "pid": os.getpid(),
+        "account": _progress_current,
+    }
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    line = _EVENT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    if run_logger is not None:
+        run_logger.info("%s", line)
+    else:
+        print(line, flush=True)
+
+
+def _coordination_call(method_names: tuple[str, ...], **kwargs: Any) -> Any:
+    """Best-effort lazy bridge to an optional farm_coordination module."""
+    try:
+        import importlib
+        coordination = importlib.import_module("farm_coordination")
+    except (ImportError, ModuleNotFoundError):
+        return None
+    except Exception as exc:
+        _emit_event("coordination", "unavailable", error=str(exc))
+        return None
+    for name in method_names:
+        fn = getattr(coordination, name, None)
+        if callable(fn):
+            try:
+                return fn(**kwargs)
+            except TypeError:
+                try:
+                    return fn(kwargs.get("category"), kwargs.get("reason", ""))
+                except Exception as exc:
+                    _emit_event("coordination", "call_failed", method=name, error=str(exc))
+                    return None
+            except Exception as exc:
+                _emit_event("coordination", "call_failed", method=name, error=str(exc))
+                return None
+    return None
+
+
+def _adaptive_cooldown(category: str, reason: str, *, severity: str = "failure") -> None:
+    _emit_event(category, "cooldown_requested", reason=reason, severity=severity)
+    _coordination_call(
+        ("adaptive_cooldown", "request_cooldown", "record_failure"),
+        category=category, reason=reason, severity=severity,
+        worker_id=WORKER_ID or "",
+    )
 
 
 def setup_run_logger() -> logging.Logger:
@@ -112,6 +169,16 @@ def _progress_tag() -> str:
 def slog(phase: str, message: str, level: str = "info") -> None:
     """Structured progress log for multi-worker readability."""
     phase_s = (phase or "run").upper().replace(" ", "_")[:14]
+    now = time.monotonic()
+    previous = _phase_started.get(phase_s)
+    if previous is None:
+        _phase_started[phase_s] = now
+        _emit_event(phase_s, "phase_start", level=level, message=message)
+    else:
+        _emit_event(
+            phase_s, "log", level=level, message=message,
+            phase_elapsed_sec=round(now - previous, 3),
+        )
     # Fixed-width phase column so lines align when grepping
     phase_col = f"{phase_s:<14}"
     line = f"[{_progress_tag()}] {phase_col} {message}"
@@ -126,10 +193,19 @@ def slog(phase: str, message: str, level: str = "info") -> None:
         print(line, flush=True)
 
 
+def _attempt_identity(index: int | None = None) -> str:
+    account_index = _progress_current if index is None else index
+    return f"w{WORKER_ID or '?'}-account-{account_index}"
+
+
 def progress_begin_account(index: int) -> None:
     global _progress_current, _account_t0
     _progress_current = index
     _account_t0 = time.time()
+    _phase_started.clear()
+    _emit_event("account", "start", account_index=index,
+                attempt_id=_attempt_identity(index),
+                event_id=f"{_attempt_identity(index)}:start")
     wtot = WORKER_TOTAL or 0
     gidx = (POOL_OFFSET + index) if POOL_TOTAL > 0 else index
     bar = "═" * 28
@@ -142,7 +218,7 @@ def progress_begin_account(index: int) -> None:
     )
 
 
-def progress_end_account(ok: bool, detail: str = "") -> None:
+def progress_end_account(ok: bool, detail: str = "", *, job_id: str = "") -> None:
     """
     Close one account attempt and bump counters.
 
@@ -154,6 +230,15 @@ def progress_end_account(ok: bool, detail: str = "") -> None:
     global _progress_ok, _progress_fail
     elapsed = (time.time() - _account_t0) if _account_t0 else 0
     elapsed_s = f"{elapsed:.0f}s" if elapsed else "?"
+    email_match = re.search(r"(?:email|alias)=([^\s]+)", detail or "", re.I)
+    email = email_match.group(1) if email_match else ""
+    attempt_id = _attempt_identity()
+    _emit_event(
+        "account", "complete", ok=ok, detail=detail,
+        account_index=_progress_current, attempt_id=attempt_id,
+        event_id=f"{attempt_id}:complete", email=email or None, job_id=job_id or None,
+        elapsed_sec=round(elapsed, 3) if elapsed else None,
+    )
     if ok:
         _progress_ok += 1
         slog(
@@ -1575,11 +1660,19 @@ return true;
 
 
 
-def fill_code_and_submit(email, dev_token, timeout=60):
+def fill_code_and_submit(email, dev_token, timeout=None):
     # Poll IMAP for OTP via email_register, then fill the code.
-    slog("OTP", f"waiting IMAP code for {email}…")
-    code = get_oai_code(dev_token, email, timeout=120)
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("GROK_OTP_TIMEOUT_SEC") or "55")
+        except (TypeError, ValueError):
+            timeout = 55.0
+    timeout = max(10.0, float(timeout))
+    slog("OTP", f"waiting IMAP code for {email} (timeout={timeout:g}s)…")
+    code = get_oai_code(dev_token, email, timeout=timeout)
     if not code:
+        _emit_event("otp", "failure", reason="timeout", timeout_sec=timeout, email=email)
+        _adaptive_cooldown("otp_timeout", f"OTP timeout after {timeout:g}s")
         raise Exception("Failed to get verification code")
     slog("OTP", f"got code={code} — filling…")
 
@@ -2984,6 +3077,17 @@ def wait_for_sso_cookie(timeout=90, no_sso_deadline=22):
             if cur and cur != last_url:
                 slog("SSO", f"url={cur[:140]}")
                 last_url = cur
+                # /sign-in after completed signup is terminal when no SSO exists;
+                # do not stack the full cookie wait behind a dead auth session.
+                if "/sign-in" in cur or "/signin" in cur:
+                    wanted_now, seen_now = _collect_grok_session_cookies()
+                    if not wanted_now.get("sso"):
+                        _emit_event("sso", "terminal_failure", reason="sign_in_without_sso", url=cur)
+                        _adaptive_cooldown("oauth_session", "terminal /sign-in without SSO")
+                        raise Exception(
+                            "No sso cookie after signup (terminal /sign-in); "
+                            f"cookies seen: {sorted(seen_now)}"
+                        )
                 # reset stuck timer on URL change
                 if "/account" not in cur or "sign-up" in cur:
                     stuck_on_account_since = None
@@ -3276,6 +3380,60 @@ def append_account_record(
         print(f"[warn] account write failed: {e}")
 
 
+def finalize_deferred_account_record(*, job_id: str, email: str, password: str,
+                                     given_name: str = "", family_name: str = "",
+                                     sso_cookie: str = "", mode: str = "google",
+                                     sso_file: str = "", status: str,
+                                     extra: dict | None = None) -> bool:
+    """Atomically append a deferred row and email inventory once per queue job."""
+    email = (email or "").strip()
+    if not email or not job_id:
+        return False
+    os.makedirs(_accounts_dir, exist_ok=True)
+    written = False
+
+    def _write() -> None:
+        nonlocal written
+        lines = []
+        try:
+            lines = open(DEFAULT_ACCOUNTS_JSONL, encoding="utf-8").read().splitlines()
+        except OSError:
+            pass
+        for line in lines:
+            try:
+                if json.loads(line).get("probe_job_id") == job_id:
+                    return
+            except (ValueError, TypeError):
+                continue
+        rec = {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "email": email, "password": password or "", "given_name": given_name or "",
+            "family_name": family_name or "", "mode": mode, "status": status,
+            "sso_file": os.path.basename(sso_file) if sso_file else "",
+            "sso_cookie": sso_cookie or "", "worker": WORKER_ID or "", "error": "",
+            "probe_status": None, "injected": False, "has_oauth": True,
+            "probe_job_id": job_id,
+        }
+        if extra:
+            rec.update({k: v for k, v in extra.items() if v is not None})
+        with open(DEFAULT_ACCOUNTS_JSONL, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # Keep append_account_record's inventory behavior in the same lock/transaction.
+        existing = set()
+        try:
+            existing = {line.split(":", 1)[0].strip().lower() for line in open(DEFAULT_EMAIL_PASS_TXT, encoding="utf-8")}
+        except OSError:
+            pass
+        if email.lower() not in existing:
+            with open(DEFAULT_EMAIL_PASS_TXT, "a", encoding="utf-8") as handle:
+                handle.write(f"{email}:{password or ''}\n")
+        written = True
+
+    _with_accounts_lock(_write)
+    return written
+
+
 def update_account_status(
     email: str,
     status: str,
@@ -3376,6 +3534,9 @@ def _sync_account_status_from_result(
             "build_email": result.get("build_email") or "",
             "build_user_id": result.get("build_user_id") or "",
             "probe_err": (str(probe.get("err") or "")[:200] if probe else ""),
+            "probe_job_id": result.get("probe_job_id"),
+            "inject_active": result.get("inject_active"),
+            "9router_id": result.get("9router_id") or "",
         },
     )
 
@@ -3879,7 +4040,9 @@ def _try_hybrid_registration() -> dict | None:
         log=lambda m: slog("HYBRID", m),
         proxy=current_proxy_url(),
         get_email=get_email_and_token,
-        get_otp=lambda tok, em, **kw: get_oai_code(tok, em, timeout=120),
+        get_otp=lambda tok, em, **kw: get_oai_code(
+            tok, em, timeout=float(os.environ.get("GROK_OTP_TIMEOUT_SEC") or "55")
+        ),
         build_profile=build_profile,
         open_signup_fn=open_signup_page,
         get_turnstile_fn=lambda: getTurnstileToken(),
@@ -3890,6 +4053,14 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     # One round: open signup -> register -> capture SSO -> write file -> push 9router.
     # Modes: browser | hybrid | google (see register_mode / GROK_REGISTER_MODE).
     reg_mode = _resolve_register_mode()
+    # Cross-process signup gate is disabled unless explicitly configured.
+    try:
+        signup_gap = float(os.environ.get("GROK_SIGNUP_GAP_SEC") or "0")
+        delay = _coordination_call(("wait_rate_gate",), category="signup", min_interval=signup_gap)
+        if delay:
+            slog("FLOW", f"global signup gate waited {float(delay):.1f}s")
+    except (TypeError, ValueError):
+        pass
     hybrid_result = None
     google_result = None
 
@@ -4161,8 +4332,9 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     try:
         conf = _load_config()
         gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
+        async_probe = _async_probe_enabled(gcli)
         off_crit = _chat_probe_off_critical(gcli)
-        if off_crit:
+        if off_crit or async_probe:
             slog("FLOW", "⑥ ACTIVATE grok.com → ⑦ OAuth PKCE  (PROBE deferred off critical)")
             tokens = convert_grok_cli_tokens(result)
             if tokens is not None:
@@ -4181,6 +4353,25 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
                         f"soft-reset after OAuth failed (non-fatal): {e}",
                         level="warn",
                     )
+                if async_probe:
+                    result["_event_worker"] = WORKER_ID or ""
+                    result["_event_account_index"] = _progress_current
+                    result["_event_attempt_id"] = _attempt_identity()
+                    job_id = _enqueue_probe_push(result, tokens)
+                    result["probe_job_id"] = job_id
+                    # Non-Google signup already has a ledger row; Google remains
+                    # claim-protected and gets its one and only row in the handler.
+                    if not defer_ledger:
+                        _sync_account_status_from_result(
+                            email, status=ACCOUNT_STATUS_OAUTH_OK, result=result
+                        )
+                    _emit_event(
+                        "probe", "queued", outcome="oauth_ok", job_id=job_id,
+                        event_id=f"{job_id}:queued", email=email,
+                        account_index=_progress_current, attempt_id=_attempt_identity(),
+                    )
+                    slog("PROBE", f"queued durable job={job_id}; registration worker released")
+                    return result
                 slog("FLOW", "⑧ PROBE → ⑨ PUSH")
                 probe_and_push_grok_cli(result, tokens)
                 result["inject_pending_probe"] = False
@@ -4244,6 +4435,13 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
             _sync_account_status_from_result(
                 email, status=acct_status, error=err, result=result
             )
+        _emit_event(
+            "oauth" if acct_status == ACCOUNT_STATUS_FAILED_OAUTH else phase.lower(),
+            "failure", error=err, ledger_status=acct_status,
+        )
+        if acct_status == ACCOUNT_STATUS_FAILED_OAUTH:
+            _coordination_call(("circuit_record",), category="oauth", success=False)
+            _adaptive_cooldown("oauth_failure", err)
         slog(phase, f"FAILED: {e}", level="error")
         slog(
             "FAIL",
@@ -4290,6 +4488,31 @@ def _oauth_gap_sec(gcli: dict | None = None) -> float:
     except (TypeError, ValueError):
         pass
     return 8.0
+
+
+def _async_probe_enabled(gcli: dict | None = None) -> bool:
+    """Opt-in only: default remains the existing synchronous probe+push path."""
+    raw = (os.environ.get("GROK_ASYNC_PROBE_PUSH") or "").strip()
+    if raw:
+        return raw.lower() in ("1", "true", "yes", "on")
+    gcli = gcli or {}
+    return bool(gcli.get("async_probe_push", False))
+
+
+def _enqueue_probe_push(result: dict, tokens: Any) -> str:
+    import hashlib
+    from probe_job_handler import make_payload
+    from probe_queue import ProbeQueue
+
+    identity = "|".join((str(result.get("email") or getattr(tokens, "email", "")),
+                         str(getattr(tokens, "user_id", "")),
+                         str(getattr(tokens, "refresh_token", ""))))
+    job_id = "probe-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    queue_path = os.environ.get("GROK_PROBE_QUEUE_PATH") or os.path.join(
+        os.path.dirname(__file__), "logs", "probe-queue", "jobs.sqlite3"
+    )
+    ProbeQueue(queue_path).enqueue(make_payload(result, tokens, job_id=job_id), job_id=job_id)
+    return job_id
 
 
 def _chat_probe_off_critical(gcli: dict | None = None) -> bool:
@@ -4839,7 +5062,13 @@ def convert_grok_cli_tokens(result: dict):
         use_pkce = eng == "camoufox"
 
     gap_sec = _oauth_gap_sec(gcli)
-    _wait_oauth_gap(gap_sec)
+    shared_delay = _coordination_call(
+        ("wait_rate_gate",), category="oauth", min_interval=gap_sec
+    )
+    if shared_delay is None:
+        _wait_oauth_gap(gap_sec)
+    elif shared_delay:
+        slog("OAUTH", f"global gate waited {float(shared_delay):.1f}s")
 
     # ── ACTIVATE + bot-hygiene settle ──────────────────────────────
     # 1) Visit grok.com with SSO (provision free tier)
@@ -4914,9 +5143,26 @@ def convert_grok_cli_tokens(result: dict):
                     )
                 )
                 if terminal:
+                    explicit_server_denied = "access denied" in err_l
+                    _emit_event(
+                        "oauth", "terminal_failure",
+                        reason="server_access_denied" if explicit_server_denied else "pkce_terminal",
+                        error=str(e),
+                    )
+                    _adaptive_cooldown(
+                        "oauth_access_denied" if explicit_server_denied else "oauth_terminal",
+                        str(e),
+                    )
+                    if explicit_server_denied:
+                        slog(
+                            "CONVERT",
+                            "PKCE server Access denied — terminal; skip device fallback",
+                            level="error",
+                        )
+                        raise RuntimeError(f"OAuth terminal server Access denied: {e}") from e
                     slog(
                         "CONVERT",
-                        "PKCE terminal deny — skip retry, go device SSO",
+                        "PKCE terminal error — skip retry, retain device fallback",
                         level="warn",
                     )
                     break
@@ -5029,6 +5275,8 @@ def convert_grok_cli_tokens(result: dict):
         pass
 
     _mark_oauth_done()
+    _coordination_call(("circuit_record",), category="oauth", success=True)
+    _emit_event("oauth", "success", outcome="oauth_ok")
     result["build_access_token"] = access
     result["build_refresh_token"] = refresh
     result["build_email"] = tok_email
@@ -5197,6 +5445,25 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
         f"grok-cli ready  email={tok_email}  user_id={tok_uid or '-'}  "
         f"isActive={mode_s}  id={result.get('9router_id') or '-'}",
     )
+
+    # Queue-handler work carries the origin attempt context and emits its own
+    # durable outcome after ledger finalization.  Mark that private context as
+    # suppressed here so this synchronous completion cannot double-report it.
+    suppress_outcome = bool(result.get("_event_attempt_id"))
+    result["_suppress_probe_complete_event"] = suppress_outcome
+    if not suppress_outcome:
+        attempt_id = str(result.get("_event_attempt_id") or _attempt_identity())
+        outcome = "usable" if inject_active else "inactive"
+        _emit_event(
+            "probe", "complete", outcome=outcome,
+            event_id=f"{attempt_id}:probe:{outcome}",
+            email=str(tok_email or email),
+            worker=str(result.get("_event_worker") or WORKER_ID or ""),
+            account_index=result.get("_event_account_index", _progress_current),
+            attempt_id=attempt_id,
+            probe_status=probe_status,
+            inject_active=inject_active,
+        )
 
 
 def convert_and_push_grok_cli(result: dict) -> None:
@@ -5488,7 +5755,8 @@ def main():
                         or result.get("apiKey")
                         or ""
                     )
-                    progress_end_account(True, f"email={result.get('email','')}")
+                    progress_end_account(True, f"email={result.get('email','')}",
+                                         job_id=str(result.get("probe_job_id") or ""))
                     account_ok = True
                     last_error = None
                     break

@@ -18,6 +18,7 @@ Keys:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import re
@@ -124,6 +125,12 @@ class WorkerState:
     last_ts: str = ""
     exit_code: Optional[int] = None
     started_at: float = 0.0
+    phase_started_at: float = 0.0
+    phase_durations: dict[str, float] = field(default_factory=dict)
+    watchdog_warned_phase: str = ""
+    outcomes: dict[str, int] = field(default_factory=lambda: {
+        name: 0 for name in ("attempted", "registered", "oauth_ok", "usable", "inactive", "hard_failed")
+    })
 
 
 @dataclass
@@ -134,6 +141,19 @@ class LogLine:
     message: str
     raw: str
     level: str = "info"  # info | warn | error
+    event: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class AccountRecord:
+    """Immutable snapshot shown in the globally ordered recent-account ledger."""
+    ts: str
+    wid: str
+    email: str
+    status: str
+    duration: Optional[float] = None
+    identity: str = ""
+    account_index: Optional[int] = None
 
 
 @dataclass
@@ -144,6 +164,11 @@ class PoolState:
     stagger: float
     workers: dict[str, WorkerState] = field(default_factory=dict)
     logs: list[LogLine] = field(default_factory=list)
+    accounts: tuple[AccountRecord, ...] = ()
+    seen_event_keys: set[str] = field(default_factory=set)
+    event_key_order: list[str] = field(default_factory=list)
+    terminal_failure_attempts: set[str] = field(default_factory=set)
+    max_event_keys: int = 2048
     max_logs: int = 800
     started_at: float = 0.0
     stopping: bool = False
@@ -182,6 +207,97 @@ class PoolState:
         )
 
 
+def progress_bar(done: int, total: int, width: int = 40, now: Optional[float] = None) -> tuple[str, bool]:
+    """Return a monotonic finite bar, or a time-based indeterminate activity pulse."""
+    width = max(1, width)
+    if total > 0:
+        filled = max(0, min(width, int(width * min(max(done, 0), total) / total)))
+        return "█" * filled + "░" * (width - filled), True
+    tick = int((time.time() if now is None else now) * 4)
+    if width == 1:
+        return ("◆" if tick % 2 == 0 else "·"), False
+    pulse_width = max(1, min(3, width - 1))
+    position = tick % (width - pulse_width + 1)
+    return "░" * position + "█" * pulse_width + "░" * (width - position - pulse_width), False
+
+
+def pass_rate(success: int, failed: int) -> Optional[float]:
+    terminal = max(0, success) + max(0, failed)
+    return (max(0, success) / terminal * 100.0) if terminal else None
+
+
+def select_log_filter(requested: Optional[str], worker_ids) -> Optional[str]:
+    if requested in (None, "", "all"):
+        return None
+    requested = str(requested)
+    return requested if requested in {str(wid) for wid in worker_ids} else None
+
+
+def log_matches_filter(log: LogLine, wid: Optional[str]) -> bool:
+    return wid is None or log.wid in (wid, "pool")
+
+
+def _event_status(log: LogLine) -> Optional[str]:
+    event = log.event or {}
+    outcome = str(event.get("outcome") or "").lower()
+    ledger = str(event.get("ledger_status") or "").lower()
+    if outcome in ("usable", "inactive", "hard_failed"):
+        return {"usable": "USABLE", "inactive": "INACTIVE", "hard_failed": "FAIL"}[outcome]
+    if ledger in ("usable", "injected"):
+        return "USABLE"
+    if ledger == "failed_probe":
+        return "INACTIVE" if int(event.get("probe_status") or 0) == 403 else "FAIL"
+    if str(event.get("category") or "").lower() == "account" and str(event.get("event") or "").lower() == "complete":
+        return "PASS" if event.get("ok") is not False else "FAIL"
+    if log.phase == "RESULT":
+        if re.search(r"\bPASS\b", log.message.upper()):
+            return "PASS"
+        if re.search(r"\bFAIL(?:ED)?\b", log.message.upper()):
+            return "FAIL"
+    return None
+
+
+def capture_account(state: PoolState, log: LogLine) -> Optional[AccountRecord]:
+    """Capture/update completion and async outcomes using stable correlation keys."""
+    status = _event_status(log)
+    if status is None:
+        return None
+    event = log.event or {}
+    worker = str(event.get("worker") or event.get("worker_id") or log.wid or "?")
+    value = event.get("account_index", event.get("index"))
+    try:
+        account_index = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        account_index = None
+    identity = str(event.get("job_id") or event.get("attempt_id") or event.get("account_id") or event.get("event_id") or "")
+    email = str(event.get("email") or "").strip()
+    if not email:
+        match = _EMAIL_IN_MSG.search(log.message or "")
+        email = match.group(1) if match else ""
+    worker_state = state.workers.get(worker)
+    if not email and worker_state:
+        email = worker_state.email
+    if not email:
+        email = "—"
+    raw_duration = event.get("elapsed_sec", event.get("duration_sec"))
+    duration = float(raw_duration) if isinstance(raw_duration, (int, float)) else None
+    match_at = None
+    for pos, old in enumerate(state.accounts):
+        if (identity and old.identity == identity) or (account_index is not None and old.account_index == account_index and old.wid == worker) or (email != "—" and old.email == email):
+            match_at = pos
+            break
+    if match_at is not None:
+        old = state.accounts[match_at]
+        record = AccountRecord(log.ts or old.ts, worker if worker != "pool" else old.wid,
+            email if email != "—" else old.email, status, duration if duration is not None else old.duration,
+            identity or old.identity, account_index if account_index is not None else old.account_index)
+        state.accounts = state.accounts[:match_at] + state.accounts[match_at + 1:] + (record,)
+    else:
+        record = AccountRecord(log.ts, worker, email, status, duration, identity, account_index)
+        state.accounts = (state.accounts + (record,))[-10:]
+    return record
+
+
 # Loose fallback when tag form drifts — still recover W# / phase / ✓✗
 _SLOG_LOOSE_RE = re.compile(
     r"^(?P<ts>\d{2}:\d{2}:\d{2})\s+"
@@ -195,6 +311,25 @@ def parse_slog_line(line: str, default_wid: str = "?") -> Optional[LogLine]:
     line = line.rstrip("\n\r")
     if not line.strip():
         return None
+    # Producer protocol is an exact prefix followed immediately by compact JSON.
+    # Keep accepting bare JSON for compatibility with older/offline emitters.
+    marker_at = line.find("@@GROK_EVENT@@")
+    event_text = line[marker_at + len("@@GROK_EVENT@@"):] if marker_at >= 0 else line
+    try:
+        event = json.loads(event_text)
+    except (TypeError, ValueError):
+        event = None
+    if isinstance(event, dict) and ("event" in event or "outcome" in event or "phase" in event):
+        phase = str(event.get("phase") or event.get("event") or "EVENT").upper()
+        message = str(event.get("message") or event.get("detail") or event.get("outcome") or "")
+        level = str(event.get("level") or "info").lower()
+        if level not in ("info", "warn", "error"):
+            level = "info"
+        return LogLine(
+            ts=str(event.get("ts") or time.strftime("%H:%M:%S")),
+            wid=str(event.get("worker") or event.get("worker_id") or event.get("wid") or default_wid),
+            phase=phase, message=message, raw=line, level=level, event=event,
+        )
     m = _SLOG_RE.match(line)
     if not m:
         # unlimited / future tag variants still carry W# + phase
@@ -303,12 +438,89 @@ def _extract_ok_fail(text: str) -> Optional[tuple[int, int]]:
     return None
 
 
-def apply_log_to_worker(state: PoolState, log: LogLine) -> None:
-    w = state.workers.get(log.wid)
+def structured_event_key(log: LogLine) -> str:
+    event = log.event or {}
+    event_id = str(event.get("event_id") or "")
+    if event_id:
+        return "event:" + event_id
+    job_id = str(event.get("job_id") or "")
+    outcome = str(event.get("outcome") or "")
+    category = str(event.get("category") or "")
+    if job_id and outcome:
+        return f"job:{job_id}:{category}:{outcome}"
+    return ""
+
+
+def accept_structured_event(state: PoolState, log: LogLine) -> bool:
+    """Bounded replay guard; unkeyed phase/log events remain distinct."""
+    key = structured_event_key(log)
+    if not key:
+        return True
+    if key in state.seen_event_keys:
+        return False
+    state.seen_event_keys.add(key)
+    state.event_key_order.append(key)
+    overflow = len(state.event_key_order) - max(1, state.max_event_keys)
+    if overflow > 0:
+        for expired in state.event_key_order[:overflow]:
+            state.seen_event_keys.discard(expired)
+        del state.event_key_order[:overflow]
+    return True
+
+
+def apply_log_to_worker(state: PoolState, log: LogLine, *, event_accepted: Optional[bool] = None) -> None:
+    if event_accepted is None:
+        event_accepted = accept_structured_event(state, log)
+    event_worker = str((log.event or {}).get("worker") or (log.event or {}).get("worker_id") or "")
+    w = state.workers.get(event_worker or log.wid)
     if not w:
-        # try numeric only
         return
     w.last_ts = log.ts or w.last_ts
+    now = time.time()
+    if log.phase and log.phase not in ("RAW", "SYS", "SCORE", "IMAP", "POOL") and log.phase != w.phase:
+        if w.phase_started_at and w.phase not in ("—", ""):
+            w.phase_durations[w.phase] = w.phase_durations.get(w.phase, 0.0) + now - w.phase_started_at
+        w.phase_started_at = now
+        w.watchdog_warned_phase = ""
+    if log.event and event_accepted:
+        producer_event = str(log.event.get("event") or "").lower()
+        category = str(log.event.get("category") or "").lower()
+        ledger_status = str(log.event.get("ledger_status") or "").lower()
+        outcome = str(log.event.get("outcome") or "").lower()
+        if not outcome:
+            if category == "account" and producer_event == "start":
+                outcome = "attempted"
+            elif category == "account" and producer_event == "complete" and log.event.get("ok"):
+                outcome = "registered"
+            elif producer_event == "success" and category == "oauth":
+                outcome = "oauth_ok"
+            elif ledger_status in ("usable", "injected"):
+                outcome = "usable"
+            elif ledger_status == "failed_probe" and int(log.event.get("probe_status") or 0) == 403:
+                outcome = "inactive"
+        if outcome in w.outcomes:
+            if outcome == "hard_failed":
+                # OAuth/phase failures may be followed by account complete false.
+                # Count only explicit structured terminal outcomes, once per attempt.
+                attempt_key = str(log.event.get("attempt_id") or log.event.get("job_id") or "")
+                if attempt_key and attempt_key in state.terminal_failure_attempts:
+                    outcome = ""
+                elif attempt_key:
+                    state.terminal_failure_attempts.add(attempt_key)
+            if outcome:
+                value = log.event.get("count")
+                w.outcomes[outcome] = int(value) if isinstance(value, int) else w.outcomes[outcome] + 1
+        counts = log.event.get("outcomes")
+        if isinstance(counts, dict):
+            for name in w.outcomes:
+                if isinstance(counts.get(name), int):
+                    w.outcomes[name] = counts[name]
+        phase_started = log.event.get("phase_started_at")
+        if isinstance(phase_started, (int, float)):
+            w.phase_started_at = float(phase_started)
+        duration = log.event.get("duration_sec")
+        if isinstance(duration, (int, float)):
+            w.phase_durations[log.phase] = float(duration)
     # Don't let noise overwrite the real pipeline phase
     if log.phase and log.phase not in ("RAW", "SYS", "SCORE", "IMAP", "POOL"):
         w.phase = log.phase
@@ -382,6 +594,13 @@ class PoolRunner:
         self.event_q = event_q
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._probe_proc: Optional[subprocess.Popen] = None
+        self._probe_cmd: list[str] = []
+        self._probe_env: dict[str, str] = {}
+        self._probe_queue_path = ""
+        self._probe_restarts = 0
+        self.probe_worker_unhealthy = False
+        self.queue_state_unknown = False
 
     def build_plan(
         self,
@@ -424,15 +643,94 @@ class PoolRunner:
 
     def start_all(self, python: str) -> None:
         self.state.started_at = time.time()
+        async_raw = str(os.environ.get("GROK_ASYNC_PROBE_PUSH") or "").lower()
+        async_enabled = async_raw in ("1", "true", "yes", "on")
+        if not async_raw:
+            try:
+                full = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+                gcli = full.get("grok_cli") if isinstance(full.get("grok_cli"), dict) else {}
+                async_enabled = bool(gcli.get("async_probe_push", False))
+            except Exception:
+                async_enabled = False
+        if async_enabled:
+            os.environ["GROK_ASYNC_PROBE_PUSH"] = "1"
+            queue_path = os.environ.get("GROK_PROBE_QUEUE_PATH") or str(ROOT / "logs" / "probe-queue" / "jobs.sqlite3")
+            env = os.environ.copy()
+            env["GROK_PROBE_QUEUE_PATH"] = queue_path
+            self._probe_queue_path = queue_path
+            self._probe_env = env
+            self._probe_cmd = [python, str(ROOT / "probe_queue.py"), "--db", queue_path,
+                               "--handler", "probe_job_handler:handle", "--terminal-handler",
+                               "probe_job_handler:finalize_stale"]
+            self._start_probe_worker()
         t = threading.Thread(target=self._spawn_loop, args=(python,), daemon=True)
         t.start()
         self._threads.append(t)
+
+    def _start_probe_worker(self) -> None:
+        self._probe_proc = spawn_worker_process(self._probe_cmd, cwd=str(ROOT),
+                                                env=self._probe_env, capture_output=True)
+        self.event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "POOL",
+                                           "async probe worker started", "", "info")))
+        thread = threading.Thread(target=self._read_probe_stdout, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+
+    def _read_probe_stdout(self) -> None:
+        proc = self._probe_proc
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:
+            log = parse_slog_line(line, default_wid="pool")
+            if log:
+                log.wid = "pool"
+                self.event_q.put(("log", log))
+        code = proc.wait()
+        if self._stop.is_set() or self.state.stopping:
+            return
+        self.event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "FAIL",
+                                           f"async probe worker exited code={code}", "", "error")))
+        if self._probe_restarts < 1:
+            self._probe_restarts += 1
+            time.sleep(1.0)
+            try:
+                self._start_probe_worker()
+            except Exception as exc:
+                self.probe_worker_unhealthy = True
+                self.event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "FAIL",
+                                                   f"async probe restart failed: {exc}", "", "error")))
+        else:
+            self.probe_worker_unhealthy = True
+            self.event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "FAIL",
+                                               "async probe worker persistently unhealthy", "", "error")))
+
+    def queue_counts(self) -> Optional[dict[str, int]]:
+        if not self._probe_queue_path:
+            return {"pending": 0, "claimed": 0, "terminal_pending": 0, "finalizing": 0}
+        try:
+            from probe_queue import ProbeQueue
+            return ProbeQueue(self._probe_queue_path).counts()
+        except Exception as exc:
+            self.queue_state_unknown = True
+            self.event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "FAIL",
+                                               f"queue state unavailable: {type(exc).__name__}", "", "error")))
+            return None
 
     def _spawn_loop(self, python: str) -> None:
         workers = list(self.state.workers.values())
         for i, w in enumerate(workers):
             if self._stop.is_set() or self.state.stopping:
                 break
+            # Adaptive concurrency is deliberately non-destructive: honor a shared
+            # cooldown before starting new work, never terminate live workers.
+            try:
+                from farm_coordination import cooldown_remaining
+                while cooldown_remaining() > 0:
+                    if self._stop.is_set() or self.state.stopping:
+                        return
+                    time.sleep(min(1.0, cooldown_remaining()))
+            except Exception:
+                pass
             self._start_one(python, w)
             if i + 1 < len(workers) and self.state.stagger > 0:
                 self.event_q.put(
@@ -467,6 +765,12 @@ class PoolRunner:
         env["GROK_POOL_OFFSET"] = str(w.offset)
         env["GROK_POOL_CONCURRENT"] = str(self.state.concurrent)
         env["GROK_PROXY_MODE"] = getattr(self.state, "proxy_mode", None) or "per_account"
+        coord_dir = Path(os.environ.get("GROK_COORD_DIR") or (ROOT / "logs" / "coordination"))
+        env.setdefault("GROK_COORD_DIR", str(coord_dir))
+        env.setdefault("GROK_COORD_STATE_PATH", str(coord_dir / "state.json"))
+        env.setdefault("GROK_COORD_LOCK_PATH", str(coord_dir / "state.lock"))
+        env.setdefault("GROK_CONFIG_PATH", str(ROOT / "config.json"))
+        env.setdefault("GROK_EVENT_FORMAT", "jsonl")
         env["PYTHONUNBUFFERED"] = "1"
         # flash-aligned proxy retry / asset-block (env wins if already set)
         env.setdefault(
@@ -630,6 +934,9 @@ class PoolRunner:
         self.state.stopping = True
         self._stop.set()
         ports: list[int] = []
+        if self._probe_proc is not None:
+            terminate_worker_tree(self._probe_proc, grace_sec=5.0)
+            self._probe_proc = None
         for w in self.state.workers.values():
             ports.append(w.debug_port)
             terminate_worker_tree(
@@ -662,7 +969,8 @@ def run_tui(args_ns: argparse.Namespace) -> int:
     try:
         from textual.app import App, ComposeResult
         from textual.binding import Binding
-        from textual.widgets import DataTable, Footer, Header, RichLog, Static
+        from textual.containers import Horizontal, Vertical
+        from textual.widgets import DataTable, Footer, Header, RichLog, Static, Tab, Tabs
         from rich.text import Text
         from rich.console import Group
     except ImportError:
@@ -805,14 +1113,6 @@ def run_tui(args_ns: argparse.Namespace) -> int:
         total, concurrent, display, args_ns.stagger_sec, proxies, proxy_mode=proxy_mode
     )
 
-    def _ascii_bar(done: int, total: int, width: int = 40) -> str:
-        if total <= 0:
-            filled = min(width, done % (width + 1))
-            return "█" * filled + "░" * (width - filled)
-        filled = int(width * min(done, total) / total)
-        filled = max(0, min(width, filled))
-        return "█" * filled + "░" * (width - filled)
-
     def _fmt_dur(sec: float) -> str:
         if not sec or sec < 0 or sec != sec:  # NaN
             return "—"
@@ -849,29 +1149,32 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             if state.stopping:
                 head.append("  STOPPING…", style="bold red")
 
-            stats = Text()
-            # done = accounts finished (created/attempted); success/failed = pass outcome
-            if tot:
-                stats.append(f"  done {done}/{tot}  ", style="bold")
-                stats.append(f"({pct:.0f}%)  ", style="dim")
-            else:
-                stats.append(f"  done {done}  ∞  ", style="bold")
-            stats.append(f"success {success} ", style="bold green")
-            stats.append(f"failed {failed}  ", style="bold red")
-            stats.append(f"alive={state.alive}/{len(state.workers)}  ", style="cyan")
-            # one-line legend so ∞ mode semantics stay obvious
-            legend = Text("  ")
-            legend.append(
-                "done=finished  success=pass  failed=not-pass",
-                style="dim",
+            stats = Text("  ")
+            pr = pass_rate(success, failed)
+            stats.append(
+                f"PASS {pr:.0f}%  " if pr is not None else "PASS —  ",
+                style="bold cyan" if pr is not None else "dim",
             )
+            if tot:
+                stats.append(f"done {done}/{tot} ({pct:.0f}%)  ", style="bold")
+            else:
+                stats.append(f"done {done} ∞  ", style="bold")
+            outcomes = {
+                name: sum(w.outcomes[name] for w in state.workers.values())
+                for name in ("usable", "inactive", "hard_failed")
+            }
+            stats.append(f"usable {outcomes['usable']}  ", style="bold green")
+            stats.append(f"inactive {outcomes['inactive']}  ", style="yellow")
+            stats.append(f"fail {failed}", style="bold red")
 
             rate_line = Text("  ")
             if rate > 0:
                 rate_line.append(f"~{rate:.1f} acc/min  ", style="bold cyan")
             else:
                 rate_line.append("acc/min …  ", style="dim")
-            if eta_sec is None:
+            if not tot:
+                rate_line.append("activity pulse · unlimited", style="dim")
+            elif eta_sec is None:
                 rate_line.append("ETA …", style="dim")
             elif eta_sec <= 0:
                 rate_line.append("ETA done", style="green")
@@ -888,11 +1191,12 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 rate_line.append(f"  left {remaining}", style="dim")
 
             bar = Text("  ")
-            bar.append(_ascii_bar(done, tot, 40), style="green" if done else "dim")
+            bar_text, determinate = progress_bar(done, tot, 40)
+            bar.append(bar_text, style="green" if determinate and done else "cyan" if not determinate else "dim")
             if tot:
                 bar.append(f"  {pct:.0f}%", style="dim")
 
-            return Group(head, stats, legend, rate_line, bar)
+            return Group(head, stats, rate_line, bar)
 
     class FarmApp(App):
         CSS = """
@@ -900,20 +1204,59 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             layout: vertical;
         }
         #summary {
-            height: 7;
+            height: 6;
             border: solid $accent;
             padding: 0 1;
-            margin: 0 0 1 0;
+        }
+        #dashboard {
+            height: 10;
+            layout: horizontal;
+        }
+        #workers-pane {
+            width: 3fr;
+            min-width: 0;
+        }
+        #recent-pane {
+            width: 2fr;
+            min-width: 0;
+        }
+        #workers, #recent {
+            height: 1fr;
         }
         #workers {
-            height: 10;
             border: solid $primary;
-            margin: 0 0 1 0;
+        }
+        #recent {
+            border: solid $secondary;
+        }
+        #log-tabs {
+            height: 3;
         }
         #log {
             height: 1fr;
+            min-height: 4;
             border: solid $surface;
             scrollbar-size: 1 1;
+        }
+        Screen.narrow #summary {
+            height: 6;
+        }
+        Screen.narrow #dashboard {
+            height: 6;
+            layout: vertical;
+        }
+        Screen.narrow #workers-pane,
+        Screen.narrow #recent-pane {
+            width: 1fr;
+            height: 1fr;
+            min-height: 4;
+        }
+        Screen.narrow #recent-pane,
+        Screen.narrow.show-recent #workers-pane {
+            display: none;
+        }
+        Screen.narrow.show-recent #recent-pane {
+            display: block;
         }
         """
 
@@ -921,6 +1264,7 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             Binding("q", "quit_stop", "Quit & stop", priority=True),
             Binding("ctrl+c", "quit_stop", "Quit", show=False, priority=True),
             Binding("a", "filter_all", "All logs"),
+            Binding("r", "toggle_recent", "Workers / Last 10"),
             Binding("p", "toggle_pause", "Pause scroll"),
             Binding("1", "filter_w('1')", "W1", show=False),
             Binding("2", "filter_w('2')", "W2", show=False),
@@ -939,10 +1283,30 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             self.pause_scroll = False
             self._exit_code = 0
 
+        def _apply_responsive_classes(self, width: int) -> None:
+            """Use stable DOM class APIs rather than version-specific resize helpers."""
+            narrow = width < 100
+            screen = self.screen
+            if narrow:
+                screen.add_class("narrow")
+            else:
+                screen.remove_class("narrow", "show-recent")
+
+        def on_resize(self, event) -> None:
+            self._apply_responsive_classes(event.size.width)
+
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             yield SummaryPanel(id="summary")
-            yield DataTable(id="workers", zebra_stripes=True)
+            with Horizontal(id="dashboard"):
+                with Vertical(id="workers-pane"):
+                    yield DataTable(id="workers", zebra_stripes=True)
+                with Vertical(id="recent-pane"):
+                    yield DataTable(id="recent", zebra_stripes=True)
+            yield Tabs(Tab("All", id="tab-all"), *(
+                Tab(f"W{wid}", id=f"tab-w-{wid}")
+                for wid in sorted(state.workers, key=lambda value: int(value) if value.isdigit() else value)
+            ), id="log-tabs", active="tab-all")
             # auto_scroll=False — we own scroll via pause_scroll + write(scroll_end=…)
             yield RichLog(
                 id="log",
@@ -954,7 +1318,10 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             )
             yield Footer()
 
+        _queue_drain_deadline: float = 0.0
+
         def on_mount(self) -> None:
+            self._apply_responsive_classes(self.size.width)
             table = self.query_one("#workers", DataTable)
             # (label, key) so update_cell keys stay stable
             table.add_columns(
@@ -986,13 +1353,18 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                     key=wid,
                 )
 
+            recent = self.query_one("#recent", DataTable)
+            recent.border_title = "Last 10 Accounts"
+            recent.add_columns("Time", "Worker", "Email", "Status", "Duration")
+            recent.cursor_type = "row"
+
             log = self.query_one("#log", RichLog)
             log.write(
                 f"[bold]Grok Farm TUI[/]  total={state.total or '∞'}  "
                 f"workers={len(state.workers)}  display={state.display}  "
                 f"stagger={state.stagger}s"
             )
-            log.write("[dim]keys: q=stop · a=all logs · 1-9=filter worker · p=pause scroll[/]")
+            log.write("[dim]keys: q=stop · r=workers/Last 10 · a=all logs · 1-9=worker · p=pause[/]")
 
             self.set_interval(0.25, self._drain_events)
             self.set_interval(1.0, self._refresh_summary)
@@ -1002,6 +1374,21 @@ def run_tui(args_ns: argparse.Namespace) -> int:
         def _refresh_summary(self) -> None:
             self.query_one("#summary", SummaryPanel).refresh()
             self._refresh_table()
+            now = time.time()
+            default_limit = float(os.environ.get("GROK_PHASE_WATCHDOG_SEC", "180") or 180)
+            for worker in state.workers.values():
+                if worker.status != "running" or not worker.phase_started_at:
+                    continue
+                key = "GROK_PHASE_WATCHDOG_" + re.sub(r"[^A-Z0-9]", "_", worker.phase.upper()) + "_SEC"
+                limit = float(os.environ.get(key, default_limit) or default_limit)
+                elapsed = now - worker.phase_started_at
+                if limit > 0 and elapsed >= limit and worker.watchdog_warned_phase != worker.phase:
+                    worker.watchdog_warned_phase = worker.phase
+                    event_q.put(("log", LogLine(
+                        ts=time.strftime("%H:%M:%S"), wid=worker.wid, phase="WATCHDOG",
+                        message=f"{worker.phase} running {elapsed:.0f}s (limit {limit:.0f}s); worker left alive",
+                        raw="", level="warn",
+                    )))
             # auto-exit when all workers finished and not stopping mid-way
             if state.started_at and not state.stopping:
                 if state.workers and all(
@@ -1011,7 +1398,25 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                     # allow a beat for final logs
                     if all(w.proc and w.proc.poll() is not None for w in state.workers.values()):
                         self._exit_code = 0 if state.fail == 0 else 1
-                        self.set_timer(1.5, self.action_quit_stop)
+                        counts = runner.queue_counts()
+                        active = -1 if counts is None else sum(counts.get(name, 0) for name in
+                            ("pending", "claimed", "terminal_pending", "finalizing"))
+                        if runner.probe_worker_unhealthy:
+                            self._exit_code = 1
+                        if active != 0:
+                            if not self._queue_drain_deadline:
+                                timeout = float(os.environ.get("GROK_ASYNC_DRAIN_TIMEOUT_SEC") or "120")
+                                self._queue_drain_deadline = now + max(0.0, timeout)
+                                event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "POOL",
+                                    ("queue state unknown" if active < 0 else f"waiting for {active} durable probe job(s)") +
+                                    f", timeout={timeout:g}s", "", "warn" if active < 0 else "info")))
+                            elif now >= self._queue_drain_deadline:
+                                event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "FAIL",
+                                    f"probe drain timeout; {active} durable job(s) remain", "", "error")))
+                                self._exit_code = 1
+                                self.action_quit_stop()
+                        else:
+                            self.set_timer(1.0, self.action_quit_stop)
 
         def _refresh_table(self) -> None:
             table = self.query_one("#workers", DataTable)
@@ -1064,6 +1469,52 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
+        def _render_log_line(self, log: LogLine) -> Text:
+            style = PHASE_STYLE.get(log.phase, "white")
+            msg_u = (log.message or "").upper()
+            if log.phase in ("OK", "DONE", "CREATED") or (log.phase == "RESULT" and "PASS" in msg_u):
+                style = "bold green"
+            elif log.level == "error" or log.phase in ("FAIL", "STOP") or (log.phase == "RESULT" and "FAIL" in msg_u):
+                style = "bold red"
+            elif log.level == "warn":
+                style = "yellow"
+            wid_s = f"W{log.wid}" if log.wid not in ("pool", "?") else log.wid
+            line = Text()
+            line.append(f"{log.ts} ", style="dim")
+            line.append(f"{wid_s:<4} ", style="bold cyan" if log.wid != "pool" else "white")
+            line.append(f"{log.phase:<12} ", style=style)
+            line.append(log.message[:140], style=style if style in ("bold green", "bold red", "yellow") or log.level != "info" else "")
+            return line
+
+        def _rerender_logs(self) -> None:
+            widget = self.query_one("#log", RichLog)
+            widget.clear()
+            for item in state.logs:
+                if log_matches_filter(item, self.filter_wid):
+                    widget.write(self._render_log_line(item), scroll_end=False)
+            if not self.pause_scroll:
+                widget.scroll_end(animate=False)
+
+        def _refresh_recent(self) -> None:
+            table = self.query_one("#recent", DataTable)
+            table.clear(columns=False)
+            for number, account in enumerate(reversed(state.accounts)):
+                status_style = {
+                    "PASS": "bold green",
+                    "USABLE": "bold green",
+                    "INACTIVE": "bold yellow",
+                    "FAIL": "bold red",
+                }.get(account.status, "bold red")
+                table.add_row(account.ts, f"W{account.wid}", account.email[:34],
+                    Text(account.status, style=status_style), _fmt_dur(account.duration or 0),
+                    key=f"recent-{number}")
+
+        def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+            tab_id = event.tab.id or "tab-all"
+            requested = tab_id[6:] if tab_id.startswith("tab-w-") else None
+            self.filter_wid = select_log_filter(requested, state.workers)
+            self._rerender_logs()
+
         def _drain_events(self) -> None:
             log_w = self.query_one("#log", RichLog)
             n = 0
@@ -1075,62 +1526,42 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                 n += 1
                 if kind == "log":
                     log: LogLine = payload
+                    event_accepted = accept_structured_event(state, log)
                     if log.wid != "pool":
-                        apply_log_to_worker(state, log)
+                        apply_log_to_worker(state, log, event_accepted=event_accepted)
                     state.logs.append(log)
                     if len(state.logs) > state.max_logs:
                         state.logs = state.logs[-state.max_logs :]
 
-                    if self.filter_wid and log.wid not in (self.filter_wid, "pool"):
-                        continue
-
-                    style = PHASE_STYLE.get(log.phase, "white")
-                    msg_u = (log.message or "").upper()
-                    # Pass = green, fail = red (never paint PASS/OK red because of "failed=0")
-                    if log.phase in ("OK", "DONE", "CREATED") or (
-                        log.phase == "RESULT" and "PASS" in msg_u
-                    ):
-                        style = "bold green"
-                    elif log.level == "error" or log.phase in ("FAIL", "STOP") or (
-                        log.phase == "RESULT" and "FAIL" in msg_u
-                    ):
-                        style = "bold red"
-                    elif log.level == "warn":
-                        style = "yellow"
-
-                    wid_s = f"W{log.wid}" if log.wid not in ("pool", "?") else log.wid
-                    line = Text()
-                    line.append(f"{log.ts} ", style="dim")
-                    line.append(f"{wid_s:<4} ", style="bold cyan" if log.wid != "pool" else "white")
-                    line.append(f"{log.phase:<12} ", style=style)
-                    # color message for pass/fail/warn so PASS is green not plain
-                    msg_style = ""
-                    if style in ("bold green", "bold red", "yellow"):
-                        msg_style = style
-                    elif log.level != "info":
-                        msg_style = style
-                    line.append(log.message[:140], style=msg_style)
-                    # scroll_end only when not paused (RichLog.auto_scroll is off)
-                    log_w.write(line, scroll_end=not self.pause_scroll)
+                    if event_accepted and capture_account(state, log):
+                        self._refresh_recent()
+                    if log_matches_filter(log, self.filter_wid):
+                        log_w.write(self._render_log_line(log), scroll_end=not self.pause_scroll)
 
                 elif kind == "worker_exit":
                     self._refresh_table()
 
         def action_filter_all(self) -> None:
             self.filter_wid = None
-            log_w = self.query_one("#log", RichLog)
-            log_w.write(
-                "[dim]filter: all workers[/]",
-                scroll_end=not self.pause_scroll,
-            )
+            self.query_one("#log-tabs", Tabs).active = "tab-all"
+            self._rerender_logs()
 
         def action_filter_w(self, wid: str) -> None:
-            if wid in state.workers:
-                self.filter_wid = wid
-                self.query_one("#log", RichLog).write(
-                    f"[dim]filter: W{wid} only (press a = all)[/]",
-                    scroll_end=not self.pause_scroll,
-                )
+            selected = select_log_filter(wid, state.workers)
+            if selected is not None:
+                self.filter_wid = selected
+                self.query_one("#log-tabs", Tabs).active = f"tab-w-{selected}"
+                self._rerender_logs()
+
+        def action_toggle_recent(self) -> None:
+            if "narrow" not in self.screen.classes:
+                return
+            self.screen.toggle_class("show-recent")
+            showing_recent = "show-recent" in self.screen.classes
+            self.notify(
+                "Dashboard: Last 10 Accounts" if showing_recent else "Dashboard: Workers",
+                timeout=1.5,
+            )
 
         def action_toggle_pause(self) -> None:
             self.pause_scroll = not self.pause_scroll

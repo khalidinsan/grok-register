@@ -24,17 +24,18 @@
         "block_assets": true
     },
     "email": {
-        "provider": "imap",
-        "domain": "yourdomain.com",
+        "provider": "khalidmailer",
+        "domain": "gumial.web.id",
         "local_style": "human",
         "imap_user": "you@gmail.com",
         "imap_pass": "abcd efgh ijkl mnop",
         "imap_host": "imap.gmail.com",
         "imap_port": 993,
-        "exzork_api_key": "",
-        "exzork_base_url": "https://mailer.exzork.me",
-        "exzork_use_subdomain": true,
-        "_comment_provider": "imap = Gmail catch-all | exzork = mailer.exzork.me (wildcard MX). Prefer env EXZORK_API_KEY over config key."
+        "khalidmailer_api_key": "",
+        "khalidmailer_base_url": "https://mailer.khalid.id",
+        "khalidmailer_use_subdomain": true,
+        "_comment_provider": "imap = Gmail catch-all | khalidmailer = mailer.khalid.id. Prefer env KHALIDMAILER_API_KEY.",
+        "_comment_domain": "ONE key only. Single: \"gumial.web.id\". Multi RR: [\"a.com\",\"b.com\"] or \"a.com,b.com\". Env: EMAIL_DOMAIN. Wildcard subdomain needs * MX → mailer.khalid.id."
     },
     "proxy": "",
     "browser_proxy": "",

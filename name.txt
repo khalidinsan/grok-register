@@ -127,4 +127,209 @@ Andika|Perkasa
 Yudo|Margono
 Agus|Subiyanto
 Hadi|Tjahjanto
-Prabowo|Oni
+
+# Pimpinan kementerian / lembaga negara
+Maruarar|Sirait
+Natalius|Pigai
+Widiyanti|Putri Wardhana
+Rini|Widyantini
+Dudy|Purwagandhi
+Rosan|Perkasa Roeslani
+Yassierli|Yassierli
+Arifatul|Choiri Fauzi
+Atip|Latipulhayat
+Iftitah|Sulaiman Suryanagara
+Ribka|Halim
+Nezar|Patria
+Febrian|Alphyanto Ruddyard
+Anis|Matta
+Arrmanatha|Nasir
+Ossy|Dermawan
+Dyana|Adam
+Taufik|Hidayat
+Giring|Ganesha
+Ni Luh|Puspa
+Isyana|Bagoes Oka
+Veronica|Tan
+Fajar|Riza Ul Haq
+Juri|Ardiantoro
+Otto|Hasibuan
+Muhammad|Mardiono
+Budiman|Sudjatmiko
+Velix|Wanggai
+
+# Pimpinan lembaga penegak hukum / keamanan / regulator
+Setyo|Budiyanto
+Fitroh|Rohcahyanto
+Johannis|Tanak
+Nurul|Ghufron
+Nawawi|Pomolango
+Sunarto|Sunarto
+Suharto|Suharto
+Amzulian|Rifai
+Yudian|Wahyudi
+Muhammad|Yusuf Ateh
+Budi|Waseso
+Suharyanto|Suharyanto
+Dwikorita|Karnawati
+Basuki|Hadimuljono
+M Herindra|Herindra
+Mochammad|Afifuddin
+Betty|Epsilon Idroos
+Idham|Holik
+August|Mellaz
+Rahmat|Bagja
+Lolly|Suhenty
+Puadi|Puadi
+Totok|Hariyono
+Herwyn|Malonda
+
+# DPR, DPD, MPR, dan pimpinan komisi
+Adies|Kadir
+Cucun|Ahmad Syamsurijal
+Sari|Yuliati
+Bambang|Pacul
+Habiburokhman|Habiburokhman
+Anggia|Ermarini
+Utut|Adianto
+Dede|Yusuf
+Herman|Khaeron
+Lasarus|Lasarus
+Mukhamad|Misbakhun
+Bob|Hasan
+Meutya|Viada Hafid
+Dito|Ganinduto
+Ace|Hasan Syadzily
+Saleh|Partaonan Daulay
+Melly|Goeslaw
+Rieke|Diah Pitaloka
+Eko|Hendro Purnomo
+Hidayat|Nur Wahid
+Lestari|Moerdijat
+Eddy|Soekarno
+Edhie|Baskoro Yudhoyono
+Ahmad|Doli Kurnia
+Aria|Bima
+Mardani|Ali Sera
+Hinca|Panjaitan
+Yasonna|Laoly
+LaNyalla|Mattalitti
+Sultan|Najamudin
+Nono|Sampono
+Tamsil|Linrung
+
+# Gubernur / wakil gubernur Indonesia
+Pramono|Anung
+Rano|Karno
+Sherly|Tjoanda
+Sarbin|Sehe
+Muhidin|Muhidin
+Hasnuryadi|Sulaiman
+Emil|Dardak
+Surya|Surya
+Mualem|Muzakir Manaf
+Fadhlullah|Fadhlullah
+Ansar|Ahmad
+Nyanyang|Hariss Pratamura
+Mahyeldi|Ansharullah
+Vasko|Ruseimy
+Herman|Deru
+Cik Ujang|Cik Ujang
+Al Haris|Al Haris
+Abdullah|Sani
+Rohidin|Mersyah
+Rosjonsyah|Syahili
+Rahmat|Mirzani Djausal
+Jihan|Nurlela
+Rudy|Masud
+Seno|Aji
+Fatmawati|Rusdi
+Rudy|Kamasaan
+Sitti|Rohmi Djalilah
+Lalu|Iqbal
+Agustiar|Sabran
+Edy|Pratowo
+Ria|Norsan
+Krisantus|Kurniawan
+Dominggus|Mandacan
+Mohamad|Lakap
+John|Tabi
+Ones|Pahabol
+Benhur|Tomi Mano
+Constant|Karma
+Mathius|Fakhiri
+Aryoko|Rumaropen
+Apolo|Safanpo
+Paskalis|Imadawa
+
+# Wali kota / bupati dan pejabat daerah dikenal
+Eri|Cahyadi
+Armuji|Armuji
+Muhammad|Farhan
+Erwin|Erwin
+Wahyu|Hidayat
+Ali|Muthohirin
+Fajri|Harahap
+Agustina|Wilujeng
+Iswar|Aminuddin
+Respati|Ardi
+Astrid|Widayani
+Maulana|Maulana
+Diza|Aljosha Hazrin
+Ramadhan|Pomanto
+Syamsu|Rizal
+Andri|Setiawan Hamami
+Saiful|Hadi
+Hendrar|Prihadi
+Hevearita|Rahayu
+Mardani|Maming
+Achmad|Fauzi Wongsojudo
+Hanindhito|Pramana
+Muhammad|Fawait
+Sugirah|Sugirah
+Lalu|Pathul Bahri
+Najmul|Akhhyar
+Muhammad|Adil
+Alfedri|Alfedri
+Hengki|Kurniawan
+Dadang|Supriatna
+Aep|Syaepuloh
+Cellica|Nurrachadiana
+Nina|Agustina
+Lucky|Hakim
+
+# Mantan pejabat nasional / tokoh pemerintahan
+Boediono|Boediono
+Try|Sutrisno
+Hamzah|Haz
+Budiono|Darsono
+M Jusuf|Kalla
+Aburizal|Bakrie
+Hatta|Rajasa
+Chairul|Tanjung
+Rizal|Ramli
+Susi|Pudjiastuti
+Ignasius|Jonan
+Arcandra|Tahar
+Rini|Soemarno
+Sofyan|Djalil
+Bambang|Brodjonegoro
+Chatib|Basri
+Darmin|Nasution
+Mari|Pangestu
+Nadiem|Makarim
+Muhadjir|Effendy
+Fachrul|Razi
+Lukman|Hakim Saifuddin
+Yaqut|Cholil Qoumas
+Tjahjo|Kumolo
+Gamawan|Fauzi
+Terawan|Agus Putranto
+Budi|Karya Sumadi
+Johnny|Plate
+Rudiantara|Rudiantara
+Edhy|Prabowo
+Sandiaga|Salahuddin Uno
+Wishnutama|Kusubandio
+Triawan|Munaf
+Bambang|Susantono
