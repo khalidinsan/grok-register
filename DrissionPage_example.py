@@ -1660,13 +1660,28 @@ return true;
 
 
 
+def _otp_timeout_sec() -> float:
+    """OTP wait: env GROK_OTP_TIMEOUT_SEC > farm.otp_timeout_sec > 55."""
+    raw = (os.environ.get("GROK_OTP_TIMEOUT_SEC") or "").strip()
+    if raw:
+        try:
+            return max(10.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        conf = _load_config()
+        farm = conf.get("farm") if isinstance(conf.get("farm"), dict) else {}
+        if farm.get("otp_timeout_sec") is not None:
+            return max(10.0, float(farm.get("otp_timeout_sec")))
+    except Exception:
+        pass
+    return 55.0
+
+
 def fill_code_and_submit(email, dev_token, timeout=None):
     # Poll IMAP for OTP via email_register, then fill the code.
     if timeout is None:
-        try:
-            timeout = float(os.environ.get("GROK_OTP_TIMEOUT_SEC") or "55")
-        except (TypeError, ValueError):
-            timeout = 55.0
+        timeout = _otp_timeout_sec()
     timeout = max(10.0, float(timeout))
     slog("OTP", f"waiting IMAP code for {email} (timeout={timeout:g}s)…")
     code = get_oai_code(dev_token, email, timeout=timeout)
@@ -4041,7 +4056,7 @@ def _try_hybrid_registration() -> dict | None:
         proxy=current_proxy_url(),
         get_email=get_email_and_token,
         get_otp=lambda tok, em, **kw: get_oai_code(
-            tok, em, timeout=float(os.environ.get("GROK_OTP_TIMEOUT_SEC") or "55")
+            tok, em, timeout=_otp_timeout_sec()
         ),
         build_profile=build_profile,
         open_signup_fn=open_signup_page,
@@ -4055,8 +4070,16 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     reg_mode = _resolve_register_mode()
     # Cross-process signup gate is disabled unless explicitly configured.
     try:
-        signup_gap = float(os.environ.get("GROK_SIGNUP_GAP_SEC") or "0")
-        delay = _coordination_call(("wait_rate_gate",), category="signup", min_interval=signup_gap)
+        signup_gap_raw = (os.environ.get("GROK_SIGNUP_GAP_SEC") or "").strip()
+        if signup_gap_raw:
+            signup_gap = float(signup_gap_raw)
+        else:
+            conf = _load_config()
+            farm = conf.get("farm") if isinstance(conf.get("farm"), dict) else {}
+            signup_gap = float(farm.get("signup_gap_sec") or 0)
+        delay = _coordination_call(
+            ("wait_rate_gate",), category="signup", min_interval=max(0.0, signup_gap)
+        )
         if delay:
             slog("FLOW", f"global signup gate waited {float(delay):.1f}s")
     except (TypeError, ValueError):
@@ -4508,9 +4531,18 @@ def _enqueue_probe_push(result: dict, tokens: Any) -> str:
                          str(getattr(tokens, "user_id", "")),
                          str(getattr(tokens, "refresh_token", ""))))
     job_id = "probe-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    queue_path = os.environ.get("GROK_PROBE_QUEUE_PATH") or os.path.join(
-        os.path.dirname(__file__), "logs", "probe-queue", "jobs.sqlite3"
-    )
+    queue_path = (os.environ.get("GROK_PROBE_QUEUE_PATH") or "").strip()
+    if not queue_path:
+        try:
+            conf = _load_config()
+            gcli = conf.get("grok_cli") if isinstance(conf.get("grok_cli"), dict) else {}
+            queue_path = str(gcli.get("probe_queue_path") or "").strip()
+        except Exception:
+            queue_path = ""
+    if not queue_path:
+        queue_path = os.path.join(
+            os.path.dirname(__file__), "logs", "probe-queue", "jobs.sqlite3"
+        )
     ProbeQueue(queue_path).enqueue(make_payload(result, tokens, job_id=job_id), job_id=job_id)
     return job_id
 

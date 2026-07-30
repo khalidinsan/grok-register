@@ -3,6 +3,7 @@
         "count": 10
     },
     "register_mode": "browser",
+    "_comment_register_mode": "browser | hybrid | google. Env: GROK_REGISTER_MODE.",
     "google": {
         "accounts_file": "accounts/google_pass.txt"
     },
@@ -21,7 +22,9 @@
         "proxy_check_workers": 10,
         "proxy_retries": 3,
         "proxy_fallback_direct": true,
-        "block_assets": true
+        "block_assets": true,
+        "_comment_stagger": "Seconds between starting each worker process (startup only).",
+        "_comment_proxy_mode": "per_account = rotate proxy per account | per_worker = sticky proxy per worker."
     },
     "email": {
         "provider": "khalidmailer",
@@ -48,6 +51,14 @@
         "password": "Nfarm!a7#GrokBuild26",
         "_comment_password": "Fixed password for ALL farmed accounts (not random). Override with env GROK_ACCOUNT_PASSWORD. Saved to accounts/email_pass.txt + accounts/accounts.jsonl"
     },
+    "farm": {
+        "otp_timeout_sec": 55,
+        "signup_gap_sec": 0,
+        "phase_watchdog_sec": 180,
+        "_comment_otp_timeout": "IMAP/khalidmailer OTP wait (default 55). Env: GROK_OTP_TIMEOUT_SEC. Fast fail > hang 120s.",
+        "_comment_signup_gap": "Global min seconds between signup submits across workers (0 = off). Env: GROK_SIGNUP_GAP_SEC.",
+        "_comment_phase_watchdog": "Warn if a phase stalls this long (worker left alive). Env: GROK_PHASE_WATCHDOG_SEC. Per-phase: GROK_PHASE_WATCHDOG_<PHASE>_SEC."
+    },
     "grok_cli": {
         "enabled": true,
         "base_url": "https://ai.khalid.id",
@@ -60,13 +71,21 @@
         "_comment_oauth_referrer": "grok-build = Grok Build / 9router grok-cli (default). cli-proxy-api = free CLI proxy style (grok-sgb). Different JWT claims / product surface.",
         "activate_grok_com": true,
         "activate_timeout_sec": 45,
-        "_comment_activate": "Visit grok.com with SSO before OAuth (replaces idle bot-hygiene sleep). Reduces later 402/403. Env: GROK_ACTIVATE_GROK_COM=0 to disable.",
-        "post_signup_settle_sec": 12,
-        "_comment_settle": "Bot-hygiene idle AFTER activate_grok_com (default 12s). Set 0 to skip. Env path: convert_grok_cli_tokens.",
+        "_comment_activate": "Visit grok.com with SSO before OAuth (event-driven readiness). Prefer this over fixed settle sleep. Env: GROK_ACTIVATE_GROK_COM=0 to disable.",
+        "post_signup_settle_sec": 0,
+        "_comment_settle": "Legacy fixed idle AFTER activate_grok_com. Recommended 0 (activate already waits for UI). Old default was 12. Env path: convert_grok_cli_tokens.",
         "oauth_gap_sec": 8,
+        "_comment_oauth_gap": "Min seconds between OAuth mints (per-worker; cross-worker when coordination is active). Env: GROK_OAUTH_GAP_SEC.",
         "chat_probe_off_critical": true,
+        "_comment_chat_probe_off_critical": "Soft-reset browser before HTTP probe so browser is not held during probe. Env: GROK_CHAT_PROBE_OFF_CRITICAL.",
+        "async_probe_push": false,
+        "_comment_async_probe_push": "false = probe+push on registration worker (default). true = enqueue durable SQLite job after OAuth; farm_tui starts probe worker. Env: GROK_ASYNC_PROBE_PUSH=1.",
+        "probe_queue_path": "",
+        "_comment_probe_queue_path": "SQLite path for async probe jobs. Empty = logs/probe-queue/jobs.sqlite3. Env: GROK_PROBE_QUEUE_PATH.",
+        "async_drain_timeout_sec": 120,
+        "_comment_async_drain_timeout": "On farm finish, wait this long for pending/claimed probe jobs before exit. Env: GROK_ASYNC_DRAIN_TIMEOUT_SEC.",
         "inject_policy": "usable",
-        "_comment_inject_policy": "usable: probe chat — 2xx inject ON, 402/403 inject OFF, 400 skip. all: always inject ON if tokens.",
+        "_comment_inject_policy": "usable: probe chat — 2xx inject ON (usable), 402/403 inject OFF (inactive/re-probe), 400 skip. all: always inject ON if tokens.",
         "jwt_reject_bot_flag": false,
         "jwt_enforce_referrer": true,
         "chat_probe_model": "grok-4.5",

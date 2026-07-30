@@ -654,7 +654,16 @@ class PoolRunner:
                 async_enabled = False
         if async_enabled:
             os.environ["GROK_ASYNC_PROBE_PUSH"] = "1"
-            queue_path = os.environ.get("GROK_PROBE_QUEUE_PATH") or str(ROOT / "logs" / "probe-queue" / "jobs.sqlite3")
+            queue_path = (os.environ.get("GROK_PROBE_QUEUE_PATH") or "").strip()
+            if not queue_path:
+                try:
+                    full = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+                    gcli = full.get("grok_cli") if isinstance(full.get("grok_cli"), dict) else {}
+                    queue_path = str(gcli.get("probe_queue_path") or "").strip()
+                except Exception:
+                    queue_path = ""
+            if not queue_path:
+                queue_path = str(ROOT / "logs" / "probe-queue" / "jobs.sqlite3")
             env = os.environ.copy()
             env["GROK_PROBE_QUEUE_PATH"] = queue_path
             self._probe_queue_path = queue_path
@@ -1375,7 +1384,14 @@ def run_tui(args_ns: argparse.Namespace) -> int:
             self.query_one("#summary", SummaryPanel).refresh()
             self._refresh_table()
             now = time.time()
-            default_limit = float(os.environ.get("GROK_PHASE_WATCHDOG_SEC", "180") or 180)
+            default_limit = float(os.environ.get("GROK_PHASE_WATCHDOG_SEC", "") or 0)
+            if default_limit <= 0:
+                try:
+                    full = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+                    farm = full.get("farm") if isinstance(full.get("farm"), dict) else {}
+                    default_limit = float(farm.get("phase_watchdog_sec") or 180)
+                except Exception:
+                    default_limit = 180.0
             for worker in state.workers.values():
                 if worker.status != "running" or not worker.phase_started_at:
                     continue
@@ -1405,7 +1421,16 @@ def run_tui(args_ns: argparse.Namespace) -> int:
                             self._exit_code = 1
                         if active != 0:
                             if not self._queue_drain_deadline:
-                                timeout = float(os.environ.get("GROK_ASYNC_DRAIN_TIMEOUT_SEC") or "120")
+                                drain_raw = (os.environ.get("GROK_ASYNC_DRAIN_TIMEOUT_SEC") or "").strip()
+                                if drain_raw:
+                                    timeout = float(drain_raw)
+                                else:
+                                    try:
+                                        full = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+                                        gcli = full.get("grok_cli") if isinstance(full.get("grok_cli"), dict) else {}
+                                        timeout = float(gcli.get("async_drain_timeout_sec") or 120)
+                                    except Exception:
+                                        timeout = 120.0
                                 self._queue_drain_deadline = now + max(0.0, timeout)
                                 event_q.put(("log", LogLine(time.strftime("%H:%M:%S"), "pool", "POOL",
                                     ("queue state unknown" if active < 0 else f"waiting for {active} durable probe job(s)") +
