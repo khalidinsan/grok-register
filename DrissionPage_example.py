@@ -621,6 +621,8 @@ page = None
 # Playwright owns Chromium when using native proxy auth (grok-farm style).
 # DrissionPage attaches via CDP existing_only — no local bridge required.
 _pw = None  # Playwright instance
+_camoufox_loop = None  # Camoufox session event loop (hybrid v2 raw calls)
+_camoufox_raw_page = None  # raw Playwright Page (Camoufox)
 _pw_context = None  # BrowserContext (persistent) or Browser
 
 # Display mode (flash-aligned):
@@ -1128,6 +1130,10 @@ def start_browser():
             page = adapter.latest_tab if adapter else sess.page
             _chrome_temp_dir = ""
             _chrome_debug_port = 0
+            # Expose the session event loop for hybrid v2 (raw Playwright calls)
+            global _camoufox_loop, _camoufox_raw_page
+            _camoufox_loop = sess.extra.get("loop")
+            _camoufox_raw_page = sess.extra.get("raw_page")
             ab = sess.extra.get("asset_block")
             slog(
                 "BROWSER",
@@ -4038,8 +4044,6 @@ def _try_hybrid_registration() -> dict | None:
     Hybrid path: short browser harvest (castle/cookies/next-action) + protocol HTTP.
     Returns result dict on success, None on failure (caller falls back to browser).
     """
-    from hybrid.register import register_one_hybrid
-
     global page, browser
     # Ensure browser is up (main loop usually already started it)
     if page is None or browser is None:
@@ -4048,6 +4052,37 @@ def _try_hybrid_registration() -> dict | None:
         except Exception as e:
             slog("HYBRID", f"browser start failed: {e}", level="warn")
             return None
+
+    # hybrid_v2: config "hybrid_v2": true or env GROK_HYBRID_V2=1 →
+    # REST /api/auth/* flow (current xAI architecture). Default stays v1
+    # (gRPC-web) for compatibility; v2 is opt-in until proven.
+    use_v2 = False
+    try:
+        from hybrid.register import resolve_hybrid_v2
+
+        use_v2 = resolve_hybrid_v2()
+    except Exception:
+        use_v2 = (os.environ.get("GROK_HYBRID_V2") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    if use_v2:
+        from hybrid.register_v2 import register_one_hybrid_v2
+
+        return register_one_hybrid_v2(
+            page=page,
+            log=lambda m: slog("HYBRID2", m),
+            proxy=current_proxy_url(),
+            get_email=get_email_and_token,
+            get_otp=lambda tok, em, **kw: get_oai_code(
+                tok, em, timeout=_otp_timeout_sec()
+            ),
+            build_profile=build_profile,
+        )
+
+    from hybrid.register import register_one_hybrid
 
     return register_one_hybrid(
         page=page,
@@ -5345,7 +5380,7 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
 
     inject_policy = _gcli_inject_policy(gcli)
     probe_model = str(
-        gcli.get("chat_probe_model") or gcli.get("smoke_model") or "grok-4.5"
+        gcli.get("chat_probe_model") or gcli.get("smoke_model") or "grok-4.6"
     ).strip()
 
     access = getattr(tokens, "access_token", "") or result.get("build_access_token") or ""

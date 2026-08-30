@@ -63,6 +63,31 @@ def resolve_register_mode(config: Optional[dict] = None) -> str:
     return "browser"
 
 
+def resolve_hybrid_v2(config: Optional[dict] = None) -> bool:
+    """Return True when hybrid should use the v2 REST flow.
+
+    Priority: env GROK_HYBRID_V2 → config hybrid_v2 → false (v1 default).
+    """
+    env = (os.environ.get("GROK_HYBRID_V2") or "").strip().lower()
+    if env:
+        return env in ("1", "true", "yes", "on")
+    conf = config
+    if conf is None:
+        try:
+            cfg_path = ROOT / "config.json"
+            if cfg_path.is_file():
+                conf = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            conf = {}
+    conf = conf or {}
+    v2 = conf.get("hybrid_v2")
+    if isinstance(v2, bool):
+        return v2
+    if isinstance(v2, str):
+        return v2.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 def load_next_action_from_capture() -> str:
     """Optional offline capture of next-action hash under capture_out/rpc/."""
     rpc = ROOT / "capture_out" / "rpc"

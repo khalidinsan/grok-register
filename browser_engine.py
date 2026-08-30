@@ -36,8 +36,10 @@ from proxy_util import mask_proxy, playwright_proxy_dict
 # All accepted display tokens after normalization
 DISPLAY_MODES = ("headed", "offscreen", "headless", "virtual")
 
-# Flash asset-block: never touch these origins (CF / Turnstile / xAI / Grok)
-_ASSET_BLOCK_KEEP_HOSTS = (
+# Flash asset-block: never touch these origins (CF / Turnstile / xAI / Grok).
+# Critical hosts are exempt from EVERY abort — Turnstile + auth must stay 100% intact.
+_ASSET_BLOCK_CRITICAL_HOSTS = (
+    "challenges.cloudflare.com",
     "challenges.cloudflare",
     "cloudflare.com",
     "turnstile",
@@ -45,9 +47,93 @@ _ASSET_BLOCK_KEEP_HOSTS = (
     "accounts.x.ai",
     "auth.x.ai",
     "x.ai",
+)
+
+# Product UI hosts: scripts/XHR must pass (activate grok.com needs the DOM),
+# but fonts/media/images on them are pure quota waste.
+_ASSET_BLOCK_UI_HOSTS = (
     "grok.com",
     "grok.x.ai",
+    "grokusercontent.com",
 )
+
+# Third-party junk — never needed for signup/SSO/OAuth/Turnstile. Abort ALL resource types.
+_ASSET_BLOCK_DROP_HOSTS = (
+    "cookielaw.org",
+    "onetrust.com",
+    "js.stripe.com",
+    "ublockorigin.pages.dev",
+    "ublockorigin.github.io",
+    "pgl.yoyo.org",
+    "curbengh.github.io",
+    "malware-filter.pages.dev",
+    "malware-filter.gitlab.io",
+    "publicsuffix.org",
+    # analytics beacons — never needed for signup/activation, ~0.8 MB/acct
+    "googletagmanager.com",
+    "google-analytics.com",
+    "cloudflareinsights.com",
+)
+
+# Heavy resource types: useless for the farm flow anywhere outside critical hosts.
+_ASSET_BLOCK_HEAVY_TYPES = ("media", "font", "image")
+
+
+def asset_block_rejects(url: str, resource_type: str) -> bool:
+    """Single decision point for the asset-block route (Camoufox + Chromium).
+
+    Order of precedence:
+      1. critical hosts (Turnstile / auth / CF) → never abort
+      2. drop hosts (cookie banners, trackers, adblock filter lists) → always abort
+      3. heavy types (media/font/image) → abort everywhere else
+      4. everything else → pass (scripts/XHR needed for signup UI + activation)
+    """
+    u = (url or "").lower()
+    rt = (resource_type or "").lower()
+    if not u:
+        return False
+    if any(h in u for h in _ASSET_BLOCK_CRITICAL_HOSTS):
+        return False
+    if any(h in u for h in _ASSET_BLOCK_DROP_HOSTS):
+        return True
+    if rt in _ASSET_BLOCK_HEAVY_TYPES:
+        return True
+    if any(h in u for h in _ASSET_BLOCK_UI_HOSTS):
+        return False
+    return False
+
+
+def _response_uncacheable(resp: Any) -> bool:
+    """True if a response must NOT be cached (auth-bound / volatile)."""
+    try:
+        cc = (resp.headers.get("cache-control") or "").lower()
+        vary = (resp.headers.get("vary") or "").lower()
+        if "no-store" in cc or "no-cache" in cc or "private" in cc:
+            return True
+        if "cookie" in vary:
+            return True
+        if resp.headers.get("set-cookie"):
+            return True
+    except Exception:
+        return True  # uncertain → don't cache
+    return False
+
+
+def _cache_ttl(resp: Any) -> float:
+    """TTL from Cache-Control max-age, clamped; immutable assets get 30d."""
+    import re as _re
+
+    try:
+        cc = (resp.headers.get("cache-control") or "").lower()
+        m = _re.search(r"max-age=(\d+)", cc)
+        if m:
+            secs = int(m.group(1))
+            if "immutable" in cc:
+                return min(secs, 30 * 24 * 3600)
+            return max(60.0, min(float(secs), 30 * 24 * 3600))
+    except Exception:
+        pass
+    return 30 * 24 * 3600  # hashed _next/static files are immutable by convention
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -82,17 +168,13 @@ def install_asset_block(
     if not enabled or page is None:
         return False
 
-    keep = _ASSET_BLOCK_KEEP_HOSTS
-
     def _should_abort(request: Any) -> bool:
         try:
             rtype = (getattr(request, "resource_type", None) or "").lower()
             url = (getattr(request, "url", None) or "").lower()
         except Exception:
             return False
-        if any(h in url for h in keep):
-            return False
-        return rtype in ("media", "font")
+        return asset_block_rejects(url, rtype)
 
     if is_async:
 
@@ -730,6 +812,7 @@ def launch_camoufox_session(
     """
     try:
         from camoufox.async_api import AsyncCamoufox
+        from camoufox import DefaultAddons
     except ImportError as e:
         raise RuntimeError(
             "camoufox not installed. Run: pip install 'camoufox[geoip]' && python -m camoufox fetch"
@@ -769,6 +852,9 @@ def launch_camoufox_session(
         "locale": "en-US",
         "geoip": use_geoip,
         "block_webrtc": True,
+        # uBlock Origin auto-downloads ~20 MB of filter lists per fresh profile
+        # (hard reset per account) and serves no purpose for the signup flow.
+        "exclude_addons": [DefaultAddons.UBO],
     }
     if proxy_cfg:
         kwargs["proxy"] = proxy_cfg
@@ -783,18 +869,68 @@ def launch_camoufox_session(
         page.set_default_timeout(60000)
         # install route inside same loop as Camoufox page
         blocked = False
+        from asset_cache import AssetCache, _should_cache
+
+        # Kill-switch: GROK_ASSET_CACHE=0 disables the disk cache entirely.
+        use_asset_cache = (os.environ.get("GROK_ASSET_CACHE") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        _asset_cache = AssetCache() if use_asset_cache else None
+
+        # API flow audit: GROK_API_AUDIT=1 records every non-static request to
+        # logs/api_flow.jsonl (used for the direct-HTTP endpoint map).
+        try:
+            from api_audit import audit_enabled, record_request as _record_request
+            _audit_on = audit_enabled()
+        except Exception:
+            _record_request = None  # type: ignore
+            _audit_on = False
+
+        # Body-level audit (GROK_API_AUDIT=2): POST payloads of auth endpoints.
+        try:
+            from api_audit_bodies import bodies_enabled, record_body as _record_body
+            _audit_bodies_on = bodies_enabled()
+        except Exception:
+            _record_body = None  # type: ignore
+            _audit_bodies_on = False
+
         if _env_bool("GROK_BLOCK_ASSETS", True):
 
             async def _block_heavy(route):
                 try:
-                    rtype = (route.request.resource_type or "").lower()
-                    url = (route.request.url or "").lower()
-                    if any(h in url for h in _ASSET_BLOCK_KEEP_HOSTS):
-                        await route.continue_()
-                        return
-                    if rtype in ("media", "font"):
+                    req = route.request
+                    rtype = (req.resource_type or "").lower()
+                    url = (req.url or "").lower()
+
+                    # body-level audit (GROK_API_AUDIT=2): capture POST payloads
+                    if _audit_bodies_on:
+                        try:
+                            pd = req.post_data or ""
+                            _record_body(req.url, req.method, pd, req.headers)
+                        except Exception:
+                            pass
+
+                    # 0) disk cache hit → fulfill from disk, no proxy bytes.
+                    #    Only for cacheable static assets; never for auth/dynamic.
+                    if _asset_cache is not None and _should_cache(url, rtype, req.method):
+                        cached = _asset_cache.get(url)
+                        if cached is not None:
+                            await route.fulfill(
+                                body=_asset_cache.body(url),
+                                headers=dict(cached.get("headers") or {}),
+                                status=200,
+                            )
+                            return
+
+                    # 1) asset block policy
+                    if asset_block_rejects(url, rtype):
                         await route.abort()
                         return
+
+                    # 2) everything else passes through unchanged
                     await route.continue_()
                 except Exception:
                     try:
@@ -802,11 +938,53 @@ def launch_camoufox_session(
                     except Exception:
                         pass
 
+            async def _harvest_store(url: str, resp: Any) -> None:
+                """Background body read → disk cache (never blocks navigation)."""
+                try:
+                    if resp.status != 200 or _response_uncacheable(resp):
+                        return
+                    body = await resp.body()
+                    if body and _asset_cache is not None:
+                        _asset_cache.put(url, body, dict(resp.headers), ttl=_cache_ttl(resp))
+                except Exception:
+                    pass
+
+            def _on_response(resp: Any) -> None:
+                try:
+                    if _audit_on:
+                        _record_request(resp.request.url, resp.request.method, resp.request.resource_type, resp.status)
+                    if _asset_cache is None:
+                        return
+                    req = resp.request
+                    url = (req.url or "").lower()
+                    rtype = (req.resource_type or "").lower()
+                    if _should_cache(url, rtype, req.method):
+                        # schedule on the same loop; errors are contained in _harvest_store
+                        asyncio.ensure_future(_harvest_store(url, resp))
+                except Exception:
+                    pass
+
             try:
+                page.on("response", _on_response)
                 await page.route("**/*", _block_heavy)
                 blocked = True
             except Exception as e:
                 print(f"[browser] asset-block route warn: {e}", flush=True)
+        else:
+            # No asset-block route; still record API flow + harvest cacheable assets.
+            def _on_response_noblock(resp: Any) -> None:
+                try:
+                    if _audit_on:
+                        _record_request(resp.request.url, resp.request.method, resp.request.resource_type, resp.status)
+                    req = resp.request
+                    url = (req.url or "").lower()
+                    rtype = (req.resource_type or "").lower()
+                    if _asset_cache is not None and _should_cache(url, rtype, req.method):
+                        asyncio.ensure_future(_harvest_store(url, resp))
+                except Exception:
+                    pass
+
+            page.on("response", _on_response_noblock)
         return manager, browser, page, blocked
 
     try:
@@ -844,6 +1022,7 @@ def launch_camoufox_session(
     session.page = adapter.latest_tab
     session.extra["browser_adapter"] = adapter
     session.extra["raw_page"] = page
+    session.extra["loop"] = loop
     return session
 
 

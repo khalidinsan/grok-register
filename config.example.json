@@ -88,9 +88,9 @@
         "_comment_inject_policy": "usable: probe chat — 2xx inject ON (usable), 402/403 inject OFF (inactive/re-probe), 400 skip. all: always inject ON if tokens.",
         "jwt_reject_bot_flag": false,
         "jwt_enforce_referrer": true,
-        "chat_probe_model": "grok-4.5",
+        "chat_probe_model": "grok-4.6",
         "smoke_bot_flag": true,
-        "smoke_model": "grok-4.5",
+        "smoke_model": "grok-4.6",
         "smoke_timeout_sec": 45
     },
     "grok2api": {
