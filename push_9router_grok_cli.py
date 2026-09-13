@@ -157,6 +157,29 @@ def probe_status_to_9router_flags(probe_status: int, probe_err: str = "") -> Dic
     }
 
 
+def degraded_account_flags(digits: Any = None) -> Dict[str, Any]:
+    """9router fields for an account that is reachable but answers `print 407`
+    with the wrong digits.
+
+    Deliberately separate from probe_status_to_9router_flags: the account
+    returned HTTP 200, so the ordinary soft-fail mapping (test_status
+    "unavailable") would mark it re-probe eligible — and the reachability
+    re-probe passes on a degraded account, silently re-enabling it. The
+    "degraded_account" status and PSD flag are hard-blocked in 9router
+    (isGrokCliHardBlocked) and excluded from re-probe (isGrokCliReprobeCandidate).
+    """
+    return {
+        "test_status": "degraded_account",
+        "error_code": None,
+        "last_error_type": "degraded_account",
+        "psd": {
+            "degradedAccount": True,
+            "degradedProbeDigits": digits,
+            "farmInjectOff": True,
+        },
+    }
+
+
 def _build_payload(
     tokens: BuildTokens,
     *,

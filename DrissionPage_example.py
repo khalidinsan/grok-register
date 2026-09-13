@@ -5425,6 +5425,48 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
                 f"latency_ms={usable_info.get('latency_ms')}  "
                 f"reply={str(usable_info.get('reply') or '')[:40]}",
             )
+
+            # Quality gate: an account can be reachable ("READY") yet degraded —
+            # it answers `print 407` with "202" and burns 3-5x the reasoning
+            # tokens. Never inject such an account as active.
+            if gcli.get("quality_probe_enabled", True) is not False:
+                from chat_usable import probe_account_quality
+
+                quality = probe_account_quality(
+                    access,
+                    email=tok_email,
+                    model=probe_model,
+                    proxy=px,
+                    timeout=float(gcli.get("smoke_timeout_sec") or 45),
+                )
+                result["quality_probe"] = quality
+                if quality.get("ok"):
+                    slog(
+                        "PROBE",
+                        f"QUALITY OK  print {quality.get('digits')}  "
+                        f"reply={str(quality.get('reply') or '')[:32]}",
+                    )
+                elif quality.get("degraded"):
+                    inject_active = False
+                    probe_status = 200
+                    probe_err = (
+                        f"degraded account: print 407 -> {quality.get('digits')}"
+                    )
+                    slog(
+                        "PROBE",
+                        f"DEGRADED  print 407 -> {quality.get('digits')}  "
+                        f"→ inject 9router OFF (not usable for agent work)",
+                        level="error",
+                    )
+                else:
+                    # Inconclusive (timeout / non-200 / no digits). Do not call
+                    # the account bad on a failed probe.
+                    slog(
+                        "PROBE",
+                        f"QUALITY INCONCLUSIVE  status={quality.get('status')}  "
+                        f"err={str(quality.get('err') or '')[:60]}  (keeping USABLE)",
+                        level="warn",
+                    )
         elif probe_status == 400:
             # Only hard-block: invalid token / bad request
             slog(
@@ -5452,11 +5494,18 @@ def probe_and_push_grok_cli(result: dict, tokens) -> None:
     from push_9router_grok_cli import (
         push_build_tokens_to_9router,
         probe_status_to_9router_flags,
+        degraded_account_flags,
     )
 
     off_flags: dict = {}
+    quality_probe = result.get("quality_probe") or {}
     if not inject_active:
-        off_flags = probe_status_to_9router_flags(probe_status, probe_err)
+        if quality_probe.get("degraded"):
+            # Reachable but wrong digits: must NOT look re-probe eligible, or the
+            # reachability reprobe would silently re-enable it.
+            off_flags = degraded_account_flags(quality_probe.get("digits"))
+        else:
+            off_flags = probe_status_to_9router_flags(probe_status, probe_err)
     inject_test_status = (
         "active" if inject_active else str(off_flags.get("test_status") or "unavailable")
     )

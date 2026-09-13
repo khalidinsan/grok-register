@@ -1766,7 +1766,7 @@ async def process_one(
         tok_obj = tokens.get("_obj")
 
         # 4) Probe
-        model = str(gcli.get("chat_probe_model") or "grok-4.5")
+        model = str(gcli.get("chat_probe_model") or "grok-4.6")
         _log(f"  probe model={model}")
         probe = probe_chat_usable(
             access, email=tokens.get("email") or cred.email, model=model, timeout=45
@@ -1788,6 +1788,39 @@ async def process_one(
             return result
 
         _log(f"  USABLE reply={str(probe.get('reply') or '')[:40]!r}")
+
+        # 4b) Quality gate — reachable is not the same as usable. A degraded
+        # account answers `print 407` with "202" while still returning 200 here.
+        if gcli.get("quality_probe_enabled", True) is not False:
+            from chat_usable import probe_account_quality
+
+            quality = probe_account_quality(
+                access, email=tokens.get("email") or cred.email, model=model, timeout=45
+            )
+            result["quality_probe"] = quality
+            if quality.get("degraded"):
+                result["error"] = (
+                    f"degraded account: print 407 -> {quality.get('digits')}"
+                )
+                result["status"] = "failed_quality"
+                _log(f"  DEGRADED print 407 -> {quality.get('digits')!r} — not injecting")
+                update_account_status(
+                    cred.email,
+                    "failed_quality",
+                    password=cred.password,
+                    error=result["error"],
+                    probe_status=200,
+                    has_oauth=True,
+                    injected=False,
+                )
+                return result
+            if quality.get("ok"):
+                _log(f"  QUALITY OK print {quality.get('digits')}")
+            else:
+                _log(
+                    "  QUALITY INCONCLUSIVE "
+                    f"status={quality.get('status')} err={str(quality.get('err') or '')[:50]}"
+                )
 
         # 5) Inject
         if not inject or gcli.get("enabled") is False:

@@ -18,7 +18,138 @@ CHAT_URL = "https://cli-chat-proxy.grok.com/v1/responses"
 CLI_UA = "grok-shell/0.2.99 (linux; x86_64)"
 CLI_ID = "grok-shell"
 CLI_VER = "0.2.99"
-DEFAULT_MODEL = "grok-4.5"
+DEFAULT_MODEL = "grok-4.6"
+
+# ── Account-quality probe ───────────────────────────────────────────────────
+# Degraded accounts answer `print 407` with "202" — deterministically, every
+# time. Verified 2026-09-13 over 108 farmed accounts at effort=xhigh:
+#   407 -> 407   11 accounts  (always emit a reasoning output item)
+#   407 -> 202   93 accounts  (never emit a reasoning item)
+# A wrong digit here is therefore an account defect, not sampling noise. Nearby
+# numbers and arithmetic answer correctly on both cohorts, and nothing on the
+# backend distinguishes them (/user, /billing, /models, /settings and 25 other
+# endpoints are byte-identical; JWT claims match; system_fingerprint matches).
+QUALITY_PROBE_NUMBER = "407"
+QUALITY_PROBE_EFFORT = "xhigh"
+
+
+def _first_int(text: Any) -> Optional[str]:
+    """First integer run in a reply.
+
+    NOT every digit squashed together: a healthy account can leak a trailing
+    system-prompt fragment ("407\\n\\confidence{100}"), which concatenation would
+    turn into "407100" and misread as a wrong answer.
+    """
+    import re
+
+    m = re.search(r"\d+", str(text or ""))
+    return m.group(0) if m else None
+
+
+def probe_account_quality(
+    access_token: str,
+    *,
+    email: str = "",
+    model: str = DEFAULT_MODEL,
+    proxy: str = "",
+    timeout: float = 60.0,
+    confirm: bool = True,
+) -> Dict[str, Any]:
+    """Probe one token for the 407 degradation.
+
+    Returns a dict with:
+      ok       — True when the account echoed 407
+      degraded — True only when upstream answered 200 with a reproducibly wrong
+                 number. Transport errors / non-200 never set this.
+      digits   — the first integer seen
+      status   — HTTP status (0 on transport failure)
+      err      — error detail, when any
+
+    `confirm=True` re-probes once before declaring degradation, so a single odd
+    reply can never mark a healthy account.
+    """
+    token = (access_token or "").strip()
+    email = (email or "").strip()
+    model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    out: Dict[str, Any] = {
+        "ok": False,
+        "degraded": False,
+        "digits": None,
+        "status": 0,
+        "email": email,
+        "model": model,
+        "reply": None,
+        "err": None,
+    }
+    if not token:
+        out["err"] = "empty access_token"
+        return out
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": CLI_UA,
+        "x-xai-token-auth": "xai-grok-cli",
+        "x-grok-client-identifier": CLI_ID,
+        "x-grok-client-version": CLI_VER,
+        "x-grok-client-mode": "headless",
+        "x-grok-session-id": str(uuid.uuid4()),
+        "x-grok-req-id": str(uuid.uuid4()),
+        "x-grok-model-override": model,
+    }
+    if email:
+        headers["x-email"] = email
+
+    def once() -> tuple:
+        """One probe turn -> (status, digits, reply_text, err)."""
+        body = {
+            "model": model,
+            "stream": False,
+            "store": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": f"print {QUALITY_PROBE_NUMBER}",
+                }
+            ],
+            "reasoning": {"summary": "concise", "effort": QUALITY_PROBE_EFFORT},
+        }
+        try:
+            r = requests.post(
+                CHAT_URL, headers=headers, json=body, timeout=timeout, proxies=proxies
+            )
+        except Exception as e:
+            return 0, None, None, f"{type(e).__name__}: {e}"
+        if r.status_code != 200:
+            return r.status_code, None, None, r.text[:200]
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+        text = _extract_text(data) or ""
+        return r.status_code, _first_int(text), text[:120], None
+
+    status, digits, reply, err = once()
+    out.update({"status": status, "digits": digits, "reply": reply, "err": err})
+    if status != 200:
+        return out
+    if digits == QUALITY_PROBE_NUMBER:
+        out["ok"] = True
+        return out
+
+    # Wrong digits on a 200 — confirm on a second, independent turn.
+    if confirm and digits:
+        status2, digits2, reply2, err2 = once()
+        out["status"] = status2 or status
+        out["reply"] = reply2 or reply
+        out["err"] = err2 or err
+        if status2 == 200 and digits2 == digits:
+            out["degraded"] = True
+    return out
 
 
 def _extract_text(body: Any) -> Optional[str]:

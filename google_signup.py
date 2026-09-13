@@ -45,6 +45,7 @@ SKIP_STATUSES = frozenset(
         "failed_login",
         "failed_oauth",
         "failed_probe",
+        "failed_quality",
         "failed_push",
         "usable",
         "injected",
