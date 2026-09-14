@@ -17,3 +17,15 @@ name.txt.bak
 proxy.txt
 *.proxy.txt
 proxy.good.txt
+
+# Scratch captures from debugging runs. These hold LIVE credentials
+# (Google SID/HSID/__Secure-1PSID, xAI cf_clearance, Stripe cookies) and
+# OAuth device codes, so they must never be committed — this repo is public.
+.tmp_*
+.tmp_debug_*
+
+# OS / editor junk
+.DS_Store
+
+# Stray output from a mistyped command (e.g. `top > 0`)
+/0

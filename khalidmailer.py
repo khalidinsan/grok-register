@@ -158,7 +158,6 @@ def _request(
     headers = {
         "Accept": "application/json",
         "X-API-Key": key,
-        "Authorization": f"Bearer {key}",
         "User-Agent": "grok-register-khalidmailer/1.0",
     }
     if body is not None:

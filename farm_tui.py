@@ -89,7 +89,7 @@ PHASE_STYLE = {
     "SETTLE": "dim yellow",
     "SSO": "green",
     "CONVERT": "green",
-    # Bot-flag live probe (cli-chat-proxy grok-4.5) — high visibility
+    # Bot-flag live probe (cli-chat-proxy grok-4.6) — high visibility
     "SMOKE": "bold bright_cyan",
     "PROBE": "bold bright_cyan",
     "SETTLE": "dim yellow",
